@@ -121,6 +121,11 @@ pub fn diagnostics_payload(art: &LspCompiledArtifact) -> String {
             // in the last good document; in that case, walk backwards line by
             // line to the nearest position that does resolve.
             if locations.len() < MAX_LOCATIONS {
+                log::info!(
+                    "errorOverlay: success_doc={} src={}",
+                    success_doc.is_some(),
+                    src.is_some()
+                );
                 if let Some((doc, (source, cursor, line, _))) =
                     success_doc.as_ref().zip(src.as_ref())
                 {
@@ -149,6 +154,10 @@ pub fn diagnostics_payload(art: &LspCompiledArtifact) -> String {
                                 .rev()
                                 .find_map(try_line)
                         });
+                    log::info!(
+                        "errorOverlay: resolve line {line}: success_doc={} pos={pos:?}",
+                        success_doc.is_some()
+                    );
                     let page_size = |page: usize| {
                         let TypstDocument::Paged(paged) = doc else {
                             return None;
@@ -203,12 +212,17 @@ pub const ERROR_OVERLAY_JS: &str = r#"
   let lastData = null;
   let lastApplied = 0;
   let lastPageCount = 0;
+  let lastScrollSig = null;
   const render = (data) => {
     lastData = data;
     clear();
     lastApplied = 0;
     lastPageCount = findPages().length;
-    if (data.ok) return;
+    if (data.ok) {
+      lastScrollSig = null;
+      return;
+    }
+    let firstMark = null;
     const panel = document.createElement("div");
     panel.id = PANEL_ID;
     panel.style.cssText =
@@ -239,6 +253,7 @@ pub const ERROR_OVERLAY_JS: &str = r#"
           rect.setAttribute("pointer-events", "none");
           page.appendChild(rect);
           lastApplied += 1;
+          if (!firstMark) firstMark = rect;
         } else {
           const r = page.getBoundingClientRect();
           const h = Math.max(r.height * 0.025, 8);
@@ -255,7 +270,20 @@ pub const ERROR_OVERLAY_JS: &str = r#"
           div.style.height = h + "px";
           document.body.appendChild(div);
           lastApplied += 1;
+          if (!firstMark) firstMark = div;
         }
+      } catch (e) {
+        console.warn("tinymist error overlay:", e);
+      }
+    }
+    // Bring the highlight into view once per distinct error, so the user
+    // sees where the failure is even when it is off-screen or behind the
+    // message panel.
+    const sig = JSON.stringify([data.messages, data.locations]);
+    if (firstMark && sig !== lastScrollSig) {
+      lastScrollSig = sig;
+      try {
+        firstMark.scrollIntoView({ block: "center", behavior: "smooth" });
       } catch (e) {
         console.warn("tinymist error overlay:", e);
       }
