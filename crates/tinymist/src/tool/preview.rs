@@ -2,7 +2,8 @@
 
 pub use compile::{PreviewCompileView, ProjectPreviewHandler};
 pub use error_overlay::{
-    cursor_overlay, diagnostics_payload, DiagRx, DiagTx, OverlayPayload, ERROR_OVERLAY_JS,
+    cursor_overlay, diagnostics_payload, BlockExtent, DiagRx, DiagTx, OverlayPayload,
+    ERROR_OVERLAY_JS,
 };
 pub use http::{make_http_server, HttpServer};
 

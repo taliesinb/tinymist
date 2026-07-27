@@ -82,6 +82,9 @@ pub struct ServerState {
     pub implicit_position: Option<LspPosition>,
     /// The last position scrolled to by `preview.followCursor`.
     pub followed_position: Option<(ImmutPath, LspPosition)>,
+    /// The last paragraph extent indicated by `preview.cursorIndicator`.
+    #[cfg(feature = "preview")]
+    pub followed_block: Option<crate::tool::preview::BlockExtent>,
     /// The client ever focused implicitly by activities.
     pub ever_focusing_by_activities: bool,
     /// The client ever sent manual focusing request.
@@ -180,6 +183,8 @@ impl ServerState {
             focusing: None,
             implicit_position: None,
             followed_position: None,
+            #[cfg(feature = "preview")]
+            followed_block: None,
             formatter,
             editor_actor: None,
             dep_tx,
@@ -484,21 +489,17 @@ impl ServerState {
                 return;
             }
 
-            match self.infer_pos() {
-                Ok(req) => {
-                    log::info!("followCursor: scrolling to {position:?}");
-                    self.followed_position = position;
-                    let _ = self.preview.scroll_all(req);
-                }
-                Err(err) => log::info!("followCursor: no inferred position: {err:?}"),
-            }
+            self.followed_position = position.clone();
 
-            // Update the cursor indicator on the preview overlay.
             if self.config.preview.cursor_indicator {
+                // Resolve the paragraph containing the cursor. The preview
+                // only updates — highlight and scroll — when that paragraph
+                // changes; a cursor that does not resolve (e.g. on a `#let`
+                // binding) clears the highlight and never scrolls.
                 let primary = &mut self.project.compiler.primary;
                 if let Some(diag_tx) = self.project.preview.diag_tx(&primary.id) {
                     let graph = primary.snapshot();
-                    let cursor = self
+                    let block = self
                         .focusing
                         .as_ref()
                         .zip(self.implicit_position)
@@ -511,7 +512,24 @@ impl ServerState {
                                 pos,
                             )
                         });
-                    diag_tx.send_modify(|state| state.cursor = cursor);
+                    if block != self.followed_block {
+                        let scroll = block.is_some();
+                        self.followed_block = block.clone();
+                        diag_tx.send_modify(|state| state.cursor = block);
+                        if scroll {
+                            if let Ok(req) = self.infer_pos() {
+                                let _ = self.preview.scroll_all(req);
+                            }
+                        }
+                    }
+                }
+            } else {
+                match self.infer_pos() {
+                    Ok(req) => {
+                        log::info!("followCursor: scrolling to {position:?}");
+                        let _ = self.preview.scroll_all(req);
+                    }
+                    Err(err) => log::info!("followCursor: no inferred position: {err:?}"),
                 }
             }
         }

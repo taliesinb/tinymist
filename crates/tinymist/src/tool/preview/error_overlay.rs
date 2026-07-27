@@ -17,7 +17,7 @@ use tinymist_project::{LspCompiledArtifact, LspWorld};
 use tinymist_query::jump_from_cursor;
 use typst::diag::Severity;
 use typst::introspection::PagedPosition;
-use typst::syntax::{LinkedNode, Source};
+use typst::syntax::{LinkedNode, Source, SyntaxKind};
 use typst::World;
 use typst_shim::syntax::LinkedNodeExt;
 
@@ -60,27 +60,19 @@ pub struct OverlayPayload {
     pub messages: Vec<String>,
     /// The resolved error locations.
     pub locations: Vec<OverlayLocation>,
-    /// The editor's cursor position.
-    pub cursor: Option<CursorOverlay>,
-}
-
-/// The cursor indicator payload.
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CursorOverlay {
-    /// The exact cursor location.
-    point: OverlayLocation,
-    /// The vertical extent of the enclosing top-level block (e.g. the
-    /// paragraph containing the cursor).
-    block: Option<BlockExtent>,
+    /// The extent of the paragraph-level block containing the editor's
+    /// cursor, if it resolves.
+    pub cursor: Option<BlockExtent>,
 }
 
 /// The vertical extent of a block on a page.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BlockExtent {
     /// The 1-based page number.
     page: usize,
+    /// The left x coordinate of the block's content, in pt.
+    x0: f64,
     /// The top y coordinate, in pt.
     y0: f64,
     /// The bottom y coordinate, in pt.
@@ -155,14 +147,16 @@ fn location_of(doc: &TypstDocument, pos: PagedPosition) -> Option<OverlayLocatio
     })
 }
 
-/// Resolves the editor's cursor position onto a rendered document, together
-/// with the extent of its enclosing top-level block.
+/// Resolves the paragraph-level block containing the editor's cursor onto a
+/// rendered document. Only cursors sitting on textual content resolve; a
+/// cursor on e.g. a `#let` binding yields `None` (no highlight) rather than
+/// an approximate position.
 pub fn cursor_overlay(
     world: &LspWorld,
     doc: &TypstDocument,
     path: &Path,
     pos: LspPosition,
-) -> Option<CursorOverlay> {
+) -> Option<BlockExtent> {
     // Prefer the main file's id: `id_for_path` may mint a fresh
     // workspace-package id whose spans would never match the compiled
     // document's, and the focused file is the main file when the preview
@@ -178,57 +172,89 @@ pub fn cursor_overlay(
     let cursor = source
         .lines()
         .line_column_to_byte(pos.line as usize, pos.character as usize)?;
-    let point = resolve_location(doc, &source, cursor, pos.line as usize)?;
 
-    // Find the enclosing top-level block: the ancestor whose parent is the
-    // root markup node.
-    let block = (|| {
-        let root = LinkedNode::new(source.root());
-        let leaf = root.leaf_at_compat(cursor)?;
-        let mut node = leaf;
-        while let Some(parent) = node.parent() {
-            if parent.parent().is_none() {
-                break;
-            }
-            node = parent.clone();
+    let root = LinkedNode::new(source.root());
+    let leaf = root.leaf_at_compat(cursor)?;
+    if !matches!(leaf.kind(), SyntaxKind::Text | SyntaxKind::MathText) {
+        return None;
+    }
+    let point = jump_from_cursor(doc, &source, cursor).into_iter().next()?;
+    let point = location_of(doc, point)?;
+
+    // Find the ancestor that is a direct child of the root markup node.
+    let mut node = leaf;
+    while let Some(parent) = node.parent() {
+        if parent.parent().is_none() {
+            break;
         }
-        let range = node.range();
-        let text = source.text().get(range.clone())?;
+        node = parent.clone();
+    }
 
-        // Probe in-text positions near both ends of the block.
-        let probe = |cur: usize| jump_from_cursor(doc, &source, cur).into_iter().next();
-        let start = text
-            .char_indices()
-            .filter(|(_, ch)| ch.is_alphanumeric())
-            .take(24)
-            .find_map(|(off, ch)| probe(range.start + off + ch.len_utf8()))?;
-        let end = text
-            .char_indices()
-            .rev()
-            .filter(|(_, ch)| ch.is_alphanumeric())
-            .take(24)
-            .find_map(|(off, ch)| probe(range.start + off + ch.len_utf8()))?;
+    // Expand to the enclosing paragraph: standalone blocks (headings, list
+    // items) stand for themselves, otherwise take the contiguous run of
+    // siblings delimited by paragraph breaks or standalone blocks.
+    let standalone = |kind: SyntaxKind| {
+        matches!(
+            kind,
+            SyntaxKind::Heading | SyntaxKind::ListItem | SyntaxKind::EnumItem | SyntaxKind::TermItem
+        )
+    };
+    let range = if standalone(node.kind()) {
+        node.range()
+    } else {
+        let boundary =
+            |n: &LinkedNode| n.kind() == SyntaxKind::Parbreak || standalone(n.kind());
+        let children: Vec<LinkedNode> = root.children().collect();
+        let idx = children
+            .iter()
+            .position(|child| child.offset() == node.offset())?;
+        let mut lo = idx;
+        while lo > 0 && !boundary(&children[lo - 1]) {
+            lo -= 1;
+        }
+        let mut hi = idx;
+        while hi + 1 < children.len() && !boundary(&children[hi + 1]) {
+            hi += 1;
+        }
+        children[lo].range().start..children[hi].range().end
+    };
 
-        let start = location_of(doc, start)?;
-        let end = location_of(doc, end)?;
-        // If the block spans pages, clip it to the cursor's page.
-        let (y0, y1) = match (start.page == point.page, end.page == point.page) {
-            (true, true) => (start.y, end.y),
-            (true, false) => (start.y, start.page_height),
-            (false, true) => (0.0, end.y),
-            (false, false) => (0.0, point.page_height),
-        };
-        Some(BlockExtent {
-            page: point.page,
-            y0: (y0 - 4.0).max(0.0),
-            // The resolved positions are element origins; pad one text line.
-            y1: (y1 + 14.0).min(point.page_height),
-            page_width: point.page_width,
-            page_height: point.page_height,
-        })
-    })();
+    // Resolve the extent by probing textual positions near both ends of the
+    // paragraph; `jump_from_cursor` only accepts text leaves, so non-text
+    // probes are simply skipped.
+    let text = source.text().get(range.clone())?;
+    let probe = |cur: usize| jump_from_cursor(doc, &source, cur).into_iter().next();
+    let start = text
+        .char_indices()
+        .filter(|(_, ch)| ch.is_alphanumeric())
+        .take(40)
+        .find_map(|(off, ch)| probe(range.start + off + ch.len_utf8()))?;
+    let end = text
+        .char_indices()
+        .rev()
+        .filter(|(_, ch)| ch.is_alphanumeric())
+        .take(40)
+        .find_map(|(off, ch)| probe(range.start + off + ch.len_utf8()))?;
 
-    Some(CursorOverlay { point, block })
+    let start = location_of(doc, start)?;
+    let end = location_of(doc, end)?;
+    // If the paragraph spans pages, clip it to the cursor's page.
+    let (y0, y1) = match (start.page == point.page, end.page == point.page) {
+        (true, true) => (start.y, end.y),
+        (true, false) => (start.y, start.page_height),
+        (false, true) => (0.0, end.y),
+        (false, false) => (0.0, point.page_height),
+    };
+    Some(BlockExtent {
+        page: point.page,
+        x0: start.x.min(end.x),
+        // The resolved positions are text baselines; pad upward past the
+        // ascent and downward past the descent.
+        y0: (y0 - 12.0).max(0.0),
+        y1: (y1 + 6.0).min(point.page_height),
+        page_width: point.page_width,
+        page_height: point.page_height,
+    })
 }
 
 /// Renders the diagnostics of a compiled artifact as an overlay payload. The
@@ -326,101 +352,28 @@ pub const ERROR_OVERLAY_JS: &str = r#"
     if (!pages.length) pages = document.querySelectorAll(".typst-page");
     return pages;
   };
-  const CURSOR_ID = "tinymist-cursor-mark";
-  const BLOCK_ID = "tinymist-cursor-block";
   let lastData = null;
   let lastApplied = 0;
   let lastPageCount = 0;
   let lastScrollSig = null;
-  // The cursor marker and block highlight are persistent singletons that are
-  // moved (with a CSS transition) rather than recreated, so they glide to the
-  // new position as the editor cursor moves.
-  const updateCursor = (pages, cur) => {
-    const gEl = (id) => document.getElementById(id);
-    if (!cur) {
-      if (gEl(CURSOR_ID)) gEl(CURSOR_ID).remove();
-      if (gEl(BLOCK_ID)) gEl(BLOCK_ID).remove();
-      return;
-    }
-    const loc = cur.point;
-    const page = pages[loc.page - 1];
+  // Highlight the paragraph containing the editor's cursor: a soft tint and
+  // a left accent bar over its vertical extent.
+  // Page groups use pt coordinates with the origin at the page's top-left,
+  // so server-resolved positions can be used directly.
+  const drawCursorBlock = (pages, b) => {
+    const page = pages[b.page - 1];
     if (!page || !(page instanceof SVGGraphicsElement)) return;
-    const bbox = page.getBBox();
-    const k = bbox.height / loc.pageHeight; // svg units per pt
-
-    // Block highlight: a soft tint plus a left accent bar.
-    if (cur.block) {
-      const b = cur.block;
-      const bpage = pages[b.page - 1] || page;
-      let blockG = gEl(BLOCK_ID);
-      if (blockG && blockG.parentNode !== bpage) {
-        blockG.remove();
-        blockG = null;
-      }
-      if (!blockG) {
-        blockG = document.createElementNS(SVG_NS, "g");
-        blockG.setAttribute("id", BLOCK_ID);
-        blockG.setAttribute("pointer-events", "none");
-        const tint = document.createElementNS(SVG_NS, "rect");
-        tint.setAttribute("fill", "rgba(64,156,255,0.06)");
-        const bar = document.createElementNS(SVG_NS, "rect");
-        bar.setAttribute("fill", "rgba(64,156,255,0.55)");
-        for (const el of [tint, bar]) {
-          el.style.transition = "y 0.2s ease, height 0.2s ease";
-          blockG.appendChild(el);
-        }
-        bpage.appendChild(blockG);
-      }
-      const bb = bpage.getBBox();
-      const bk = bb.height / b.pageHeight;
-      const [tint, bar] = blockG.children;
-      const y = bb.y + b.y0 * bk;
-      const h = Math.max((b.y1 - b.y0) * bk, 8);
-      tint.setAttribute("x", bb.x);
-      tint.setAttribute("width", bb.width);
-      tint.setAttribute("y", y);
-      tint.setAttribute("height", h);
-      bar.setAttribute("x", bb.x);
-      bar.setAttribute("width", Math.max(3 * bk, 3));
-      bar.setAttribute("y", y);
-      bar.setAttribute("height", h);
-    } else if (gEl(BLOCK_ID)) {
-      gEl(BLOCK_ID).remove();
-    }
-
-    // Crosshair marker: a ring with ticks, moved via an animated transform.
-    let mark = gEl(CURSOR_ID);
-    if (mark && mark.parentNode !== page) {
-      mark.remove();
-      mark = null;
-    }
-    if (!mark) {
-      mark = document.createElementNS(SVG_NS, "g");
-      mark.setAttribute("id", CURSOR_ID);
-      mark.setAttribute("pointer-events", "none");
-      const shapes = [
-        ["circle", { r: 6, fill: "none", stroke: "rgba(64,156,255,0.9)", "stroke-width": 1.5 }],
-        ["circle", { r: 1.6, fill: "rgba(64,156,255,0.9)" }],
-        ["line", { x1: -12, x2: -7, y1: 0, y2: 0 }],
-        ["line", { x1: 7, x2: 12, y1: 0, y2: 0 }],
-        ["line", { y1: -12, y2: -7, x1: 0, x2: 0 }],
-        ["line", { y1: 7, y2: 12, x1: 0, x2: 0 }],
-      ];
-      for (const [tag, attrs] of shapes) {
-        const el = document.createElementNS(SVG_NS, tag);
-        for (const [key, value] of Object.entries(attrs)) el.setAttribute(key, value);
-        if (tag === "line") {
-          el.setAttribute("stroke", "rgba(64,156,255,0.9)");
-          el.setAttribute("stroke-width", 1.5);
-        }
-        mark.appendChild(el);
-      }
-      mark.style.transition = "transform 0.25s ease";
-      page.appendChild(mark);
-    }
-    const x = bbox.x + (loc.x / loc.pageWidth) * bbox.width;
-    const y = bbox.y + (loc.y / loc.pageHeight) * bbox.height + 6 * k;
-    mark.style.transform = `translate(${x}px, ${y}px) scale(${Math.max(k, 0.5)})`;
+    const bar = document.createElementNS(SVG_NS, "rect");
+    bar.setAttribute("class", OVERLAY_CLASS);
+    bar.setAttribute("x", Math.max(b.x0 - 10, 0));
+    bar.setAttribute("width", 3.5);
+    bar.setAttribute("y", b.y0);
+    bar.setAttribute("height", Math.max(b.y1 - b.y0, 8));
+    bar.setAttribute("rx", 1.75);
+    bar.setAttribute("fill", "rgba(64,156,255,0.65)");
+    bar.setAttribute("pointer-events", "none");
+    page.appendChild(bar);
+    lastApplied += 1;
   };
   const render = (data) => {
     lastData = data;
@@ -428,10 +381,12 @@ pub const ERROR_OVERLAY_JS: &str = r#"
     lastApplied = 0;
     const pages = findPages();
     lastPageCount = pages.length;
-    try {
-      updateCursor(pages, data.cursor);
-    } catch (e) {
-      console.warn("tinymist overlay:", e);
+    if (data.cursor) {
+      try {
+        drawCursorBlock(pages, data.cursor);
+      } catch (e) {
+        console.warn("tinymist overlay:", e);
+      }
     }
     if (data.ok) {
       lastScrollSig = null;
@@ -453,13 +408,12 @@ pub const ERROR_OVERLAY_JS: &str = r#"
       if (!page) continue;
       try {
         if (page instanceof SVGGraphicsElement) {
-          const bbox = page.getBBox();
-          const h = Math.max(bbox.height * 0.025, 8);
+          const h = 16;
           const rect = document.createElementNS(SVG_NS, "rect");
           rect.setAttribute("class", OVERLAY_CLASS);
-          rect.setAttribute("x", bbox.x);
-          rect.setAttribute("y", bbox.y + (loc.y / loc.pageHeight) * bbox.height - h / 2);
-          rect.setAttribute("width", bbox.width);
+          rect.setAttribute("x", 0);
+          rect.setAttribute("y", loc.y - 12);
+          rect.setAttribute("width", loc.pageWidth);
           rect.setAttribute("height", h);
           rect.setAttribute("fill", "rgba(229,83,75,0.25)");
           rect.setAttribute("stroke", "rgba(229,83,75,0.9)");
@@ -510,13 +464,8 @@ pub const ERROR_OVERLAY_JS: &str = r#"
   let reapplyTimer = null;
   const ensure = () => {
     if (!lastData) return;
-    const els = document.querySelectorAll(
-      "." + OVERLAY_CLASS + ", #" + CURSOR_ID + ", #" + BLOCK_ID
-    );
-    const ours = (el) =>
-      el.id === CURSOR_ID ||
-      el.id === BLOCK_ID ||
-      (el.classList && el.classList.contains(OVERLAY_CLASS));
+    const els = document.querySelectorAll("." + OVERLAY_CLASS);
+    const ours = (el) => el.classList && el.classList.contains(OVERLAY_CLASS);
     els.forEach((el) => {
       // Move below-content elements back to the top of the paint order, but
       // never leapfrog our own elements (that would churn forever).
@@ -524,14 +473,12 @@ pub const ERROR_OVERLAY_JS: &str = r#"
       while (sib && ours(sib)) sib = sib.nextSibling;
       if (el.parentNode && sib) el.parentNode.appendChild(el);
     });
-    const errMarks = document.querySelectorAll("." + OVERLAY_CLASS).length;
+    const want =
+      (lastData.ok ? 0 : (lastData.locations || []).length) +
+      (lastData.cursor ? 1 : 0);
     const wiped =
-      errMarks < lastApplied ||
-      (!lastData.ok && !document.getElementById(PANEL_ID)) ||
-      (lastData.cursor && !document.getElementById(CURSOR_ID));
-    const morePages =
-      lastApplied < (lastData.locations || []).length &&
-      findPages().length !== lastPageCount;
+      els.length < lastApplied || (!lastData.ok && !document.getElementById(PANEL_ID));
+    const morePages = lastApplied < want && findPages().length !== lastPageCount;
     if (!wiped && !morePages) return;
     if (reapplyTimer) clearTimeout(reapplyTimer);
     reapplyTimer = setTimeout(() => render(lastData), 150);
