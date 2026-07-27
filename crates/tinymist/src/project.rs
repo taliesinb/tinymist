@@ -793,7 +793,12 @@ impl CompileHandler<LspCompilerFeat, ProjectInsStateExt> for CompileHandlerImpl 
         #[cfg(feature = "preview")]
         if let Some(inner) = self.preview.get(art.id()) {
             if let Some(diag_tx) = self.preview.diag_tx(art.id()) {
-                let _ = diag_tx.send(crate::tool::preview::diagnostics_payload(art));
+                let payload = crate::tool::preview::diagnostics_payload(art);
+                diag_tx.send_modify(|state| {
+                    state.ok = payload.ok;
+                    state.messages = payload.messages;
+                    state.locations = payload.locations;
+                });
             }
             let art = art.clone();
             inner.notify_compile(Arc::new(crate::tool::preview::PreviewCompileView { art }));

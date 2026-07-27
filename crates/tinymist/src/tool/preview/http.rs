@@ -35,7 +35,8 @@ pub async fn make_http_server(
     type Server = hyper_util::server::conn::auto::Builder<hyper_util::rt::TokioExecutor>;
     type Body = http_body_util::combinators::UnsyncBoxBody<Bytes, std::convert::Infallible>;
 
-    fn sse_frame(payload: &str) -> Result<Frame<Bytes>, std::convert::Infallible> {
+    fn sse_frame(payload: &super::OverlayPayload) -> Result<Frame<Bytes>, std::convert::Infallible> {
+        let payload = serde_json::to_string(payload).unwrap_or_default();
         Ok(Frame::data(Bytes::from(format!("data: {payload}\n\n"))))
     }
 

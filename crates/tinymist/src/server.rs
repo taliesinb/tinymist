@@ -492,6 +492,28 @@ impl ServerState {
                 }
                 Err(err) => log::info!("followCursor: no inferred position: {err:?}"),
             }
+
+            // Update the cursor indicator on the preview overlay.
+            if self.config.preview.cursor_indicator {
+                let primary = &mut self.project.compiler.primary;
+                if let Some(diag_tx) = self.project.preview.diag_tx(&primary.id) {
+                    let graph = primary.snapshot();
+                    let cursor = self
+                        .focusing
+                        .as_ref()
+                        .zip(self.implicit_position)
+                        .zip(primary.latest_success_doc.as_ref())
+                        .and_then(|((path, pos), doc)| {
+                            crate::tool::preview::cursor_overlay(
+                                &graph.snap.world,
+                                doc,
+                                path,
+                                pos,
+                            )
+                        });
+                    diag_tx.send_modify(|state| state.cursor = cursor);
+                }
+            }
         }
     }
 }

@@ -1118,6 +1118,11 @@ pub struct PreviewFeat {
     /// messages are shown in a floating panel at the bottom of the page.
     #[serde(default, deserialize_with = "deserialize_null_default")]
     pub error_overlay: bool,
+    /// Whether to indicate the editor's cursor position on the preview with a
+    /// persistent marker and a highlight of the enclosing block. Requires
+    /// `preview.followCursor`.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub cursor_indicator: bool,
 }
 
 /// The lint features.
@@ -1555,6 +1560,7 @@ mod tests {
         test_good_config("preview.background.args");
         test_good_config("preview.followCursor");
         test_good_config("preview.errorOverlay");
+        test_good_config("preview.cursorIndicator");
         test_good_config("preview.refresh");
         test_good_config("preview.partialRendering");
         #[cfg(feature = "preview")]

@@ -110,11 +110,9 @@ fn jump_from_cursor_(
     // The case `leaf_at_compat` will match: `Hello|`
     // FIXME: The case `leaf_at_compat` will not match: `|Hello`
     let node = LinkedNode::new(source.root()).leaf_at_compat(cursor)?;
-    // todo: When we click on a label or some math operators, we seems likely also
-    // be able to jump to some place.
-    if !matches!(node.kind(), SyntaxKind::Text | SyntaxKind::MathText) {
-        return None;
-    };
+    // Text nodes can be matched exactly; any other leaf still carries a span
+    // in the file, which the closest-glyph fallback below can resolve to a
+    // nearby position.
 
     let span = node.span();
     let offset = cursor.saturating_sub(node.offset());

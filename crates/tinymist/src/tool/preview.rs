@@ -2,7 +2,7 @@
 
 pub use compile::{PreviewCompileView, ProjectPreviewHandler};
 pub use error_overlay::{
-    diagnostics_payload, initial_diagnostics_payload, DiagRx, DiagTx, ERROR_OVERLAY_JS,
+    cursor_overlay, diagnostics_payload, DiagRx, DiagTx, OverlayPayload, ERROR_OVERLAY_JS,
 };
 pub use http::{make_http_server, HttpServer};
 
@@ -389,8 +389,9 @@ pub struct PreviewState {
     pub(crate) watchers: ProjectPreviewState,
     /// Whether to send show document requests with customized notification.
     pub customized_show_document: bool,
-    /// Whether to overlay compile errors on the preview.
-    pub error_overlay: bool,
+    /// Whether the overlay channel (error overlay and/or cursor indicator) is
+    /// enabled.
+    pub overlay_enabled: bool,
 }
 
 impl PreviewState {
@@ -417,7 +418,7 @@ impl PreviewState {
             preview_tx,
             watchers,
             customized_show_document: config.customized_show_document,
-            error_overlay: config.preview.error_overlay,
+            overlay_enabled: config.preview.error_overlay || config.preview.cursor_indicator,
         }
     }
 
@@ -449,8 +450,8 @@ impl PreviewState {
         is_primary: bool,
         is_background: bool,
     ) -> SchedulableResponse<StartPreviewResponse> {
-        let diag_rx = self.error_overlay.then(|| {
-            let (diag_tx, diag_rx) = tokio::sync::watch::channel(initial_diagnostics_payload());
+        let diag_rx = self.overlay_enabled.then(|| {
+            let (diag_tx, diag_rx) = tokio::sync::watch::channel(OverlayPayload::default());
             self.watchers.register_diag(&project_id, diag_tx);
             diag_rx
         });
