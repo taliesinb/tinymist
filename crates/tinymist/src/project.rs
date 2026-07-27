@@ -415,6 +415,9 @@ pub struct ProjectPreviewState {
     /// The inner state.
     #[cfg(feature = "preview")]
     pub(crate) inner: Arc<Mutex<FxHashMap<ProjectInsId, Arc<tinymist_preview::CompileWatcher>>>>,
+    /// The diagnostics channels for previews with the error overlay enabled.
+    #[cfg(feature = "preview")]
+    pub(crate) diag: Arc<Mutex<FxHashMap<ProjectInsId, crate::tool::preview::DiagTx>>>,
 }
 
 #[cfg(feature = "preview")]
@@ -440,7 +443,19 @@ impl ProjectPreviewState {
     /// Unregisters a compile watcher.
     #[must_use]
     pub fn unregister(&self, task_id: &ProjectInsId) -> bool {
+        self.diag.lock().remove(task_id);
         self.inner.lock().remove(task_id).is_some()
+    }
+
+    /// Registers a diagnostics channel for the error overlay.
+    pub fn register_diag(&self, id: &ProjectInsId, tx: crate::tool::preview::DiagTx) {
+        self.diag.lock().insert(id.clone(), tx);
+    }
+
+    /// Gets the diagnostics channel of a project, if any.
+    #[must_use]
+    pub fn diag_tx(&self, id: &ProjectInsId) -> Option<crate::tool::preview::DiagTx> {
+        self.diag.lock().get(id).cloned()
     }
 
     /// Gets a compile watcher.
@@ -777,6 +792,9 @@ impl CompileHandler<LspCompilerFeat, ProjectInsStateExt> for CompileHandlerImpl 
 
         #[cfg(feature = "preview")]
         if let Some(inner) = self.preview.get(art.id()) {
+            if let Some(diag_tx) = self.preview.diag_tx(art.id()) {
+                let _ = diag_tx.send(crate::tool::preview::diagnostics_payload(art));
+            }
             let art = art.clone();
             inner.notify_compile(Arc::new(crate::tool::preview::PreviewCompileView { art }));
         } else {

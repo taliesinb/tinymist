@@ -27,10 +27,17 @@ pub async fn make_http_server(
     frontend_html: String,
     static_file_addr: String,
     websocket_tx: mpsc::UnboundedSender<HyperWebsocket>,
+    diag_rx: Option<super::DiagRx>,
 ) -> HttpServer {
-    use http_body_util::Full;
-    use hyper::body::{Bytes, Incoming};
+    use futures::StreamExt;
+    use http_body_util::{Full, StreamBody};
+    use hyper::body::{Bytes, Frame, Incoming};
     type Server = hyper_util::server::conn::auto::Builder<hyper_util::rt::TokioExecutor>;
+    type Body = http_body_util::combinators::UnsyncBoxBody<Bytes, std::convert::Infallible>;
+
+    fn sse_frame(payload: &str) -> Result<Frame<Bytes>, std::convert::Infallible> {
+        Ok(Frame::data(Bytes::from(format!("data: {payload}\n\n"))))
+    }
 
     let listener = tokio::net::TcpListener::bind(&static_file_addr)
         .await
@@ -43,10 +50,12 @@ pub async fn make_http_server(
         let frontend_html = frontend_html.clone();
         let websocket_tx = websocket_tx.clone();
         let static_file_addr = static_file_addr.clone();
+        let diag_rx = diag_rx.clone();
         service_fn(move |mut req: hyper::Request<Incoming>| {
             let frontend_html = frontend_html.clone();
             let websocket_tx = websocket_tx.clone();
             let static_file_addr = static_file_addr.clone();
+            let diag_rx = diag_rx.clone();
             async move {
                 // When a user visits a website in a browser, that website can try to connect to
                 // our http / websocket server on `127.0.0.1` which may leak sensitive
@@ -86,12 +95,29 @@ pub async fn make_http_server(
                     let _ = websocket_tx.send(websocket);
 
                     // Return the response so the spawned future can continue.
-                    Ok(response)
+                    Ok(response.map(|b| Body::new(b)))
                 } else if req.uri().path() == "/" {
                     // log::debug!("Serve frontend: {mode:?}");
                     let res = hyper::Response::builder()
                         .header(hyper::header::CONTENT_TYPE, "text/html")
-                        .body(Full::<Bytes>::from(frontend_html))
+                        .body(Body::new(Full::<Bytes>::from(frontend_html)))
+                        .unwrap();
+                    Ok(res)
+                } else if req.uri().path() == "/dev/diagnostics" && diag_rx.is_some() {
+                    // Stream diagnostics updates as server-sent events.
+                    let rx = diag_rx.unwrap();
+                    let init = rx.borrow().clone();
+                    let stream = futures::stream::once(async move { sse_frame(&init) }).chain(
+                        futures::stream::unfold(rx, |mut rx| async move {
+                            rx.changed().await.ok()?;
+                            let payload = rx.borrow_and_update().clone();
+                            Some((sse_frame(&payload), rx))
+                        }),
+                    );
+                    let res = hyper::Response::builder()
+                        .header(hyper::header::CONTENT_TYPE, "text/event-stream")
+                        .header(hyper::header::CACHE_CONTROL, "no-cache")
+                        .body(Body::new(StreamBody::new(stream)))
                         .unwrap();
                     Ok(res)
                 } else {
@@ -99,7 +125,7 @@ pub async fn make_http_server(
                     let res = hyper::Response::builder()
                         .status(hyper::StatusCode::FOUND)
                         .header(hyper::header::LOCATION, "/")
-                        .body(Full::<Bytes>::default())
+                        .body(Body::new(Full::<Bytes>::default()))
                         .unwrap();
                     Ok(res)
                 }

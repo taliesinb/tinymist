@@ -1,9 +1,13 @@
 //! Document preview tool for Typst
 
 pub use compile::{PreviewCompileView, ProjectPreviewHandler};
+pub use error_overlay::{
+    diagnostics_payload, initial_diagnostics_payload, DiagRx, DiagTx, ERROR_OVERLAY_JS,
+};
 pub use http::{make_http_server, HttpServer};
 
 mod compile;
+mod error_overlay;
 mod http;
 
 use std::{collections::HashMap, path::Path, sync::Arc};
@@ -385,6 +389,8 @@ pub struct PreviewState {
     pub(crate) watchers: ProjectPreviewState,
     /// Whether to send show document requests with customized notification.
     pub customized_show_document: bool,
+    /// Whether to overlay compile errors on the preview.
+    pub error_overlay: bool,
 }
 
 impl PreviewState {
@@ -411,6 +417,7 @@ impl PreviewState {
             preview_tx,
             watchers,
             customized_show_document: config.customized_show_document,
+            error_overlay: config.preview.error_overlay,
         }
     }
 
@@ -427,6 +434,7 @@ impl PreviewState {
                 .log_error_with(|| format!("failed to send kill request({:?})", watcher.task_id()));
         }
         watchers.clear();
+        self.watchers.diag.lock().clear();
     }
 }
 
@@ -441,6 +449,12 @@ impl PreviewState {
         is_primary: bool,
         is_background: bool,
     ) -> SchedulableResponse<StartPreviewResponse> {
+        let diag_rx = self.error_overlay.then(|| {
+            let (diag_tx, diag_rx) = tokio::sync::watch::channel(initial_diagnostics_payload());
+            self.watchers.register_diag(&project_id, diag_tx);
+            diag_rx
+        });
+
         let compile_handler = Arc::new(ProjectPreviewHandler {
             project_id,
             client: Box::new(self.client.clone().to_untyped()),
@@ -532,14 +546,23 @@ impl PreviewState {
                 args.preview.page_title.as_deref(),
                 args.compile.input.as_deref(),
             );
-            let frontend_html = frontend_html(
+            let mut frontend_html = frontend_html(
                 TYPST_PREVIEW_HTML,
                 args.preview.preview_mode,
                 "/",
                 &page_title,
             );
+            if diag_rx.is_some() {
+                let script = format!("<script>{ERROR_OVERLAY_JS}</script>");
+                if frontend_html.contains("</body>") {
+                    frontend_html = frontend_html.replace("</body>", &format!("{script}</body>"));
+                } else {
+                    frontend_html.push_str(&script);
+                }
+            }
 
-            let srv = make_http_server(frontend_html, args.data_plane_host, websocket_tx).await;
+            let srv =
+                make_http_server(frontend_html, args.data_plane_host, websocket_tx, diag_rx).await;
             let addr = srv.addr;
             log::info!(
                 target: crate::PREVIEW_COMPAT_LOG_TARGET,

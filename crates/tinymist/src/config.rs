@@ -1112,6 +1112,12 @@ pub struct PreviewFeat {
     #[cfg(feature = "preview")]
     #[serde(default, deserialize_with = "deserialize_null_default")]
     pub invert_colors: PreviewInvertColors,
+    /// Whether to overlay compile errors on the preview. When the compilation
+    /// fails, the preview keeps showing the last successful render; with this
+    /// enabled, the error locations are highlighted on it and the error
+    /// messages are shown in a floating panel at the bottom of the page.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub error_overlay: bool,
 }
 
 /// The lint features.
@@ -1548,6 +1554,7 @@ mod tests {
         test_good_config("preview.background.enabled");
         test_good_config("preview.background.args");
         test_good_config("preview.followCursor");
+        test_good_config("preview.errorOverlay");
         test_good_config("preview.refresh");
         test_good_config("preview.partialRendering");
         #[cfg(feature = "preview")]
