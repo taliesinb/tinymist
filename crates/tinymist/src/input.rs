@@ -186,6 +186,19 @@ impl ServerState {
 
         let task = self.resolve_task_or(path);
 
+        // Skip the interrupt if the primary entry is unchanged. An
+        // entry-change interrupt is not cheap: it forgets the last success
+        // document and forces a recompilation, and implicit focus may request
+        // the current entry frequently (e.g. on every code action request).
+        let unchanged = task.inputs.is_none()
+            && task
+                .entry
+                .as_ref()
+                .is_some_and(|entry| *entry == self.project.compiler.primary.verse.entry_state());
+        if unchanged {
+            return Ok(false);
+        }
+
         log::info!("the task of the primary is changing to {task:?}");
 
         let id = self.project.primary_id().clone();

@@ -556,6 +556,7 @@ impl<F: CompilerFeat + Send + Sync + 'static, Ext: Default + 'static> ProjectCom
             }
             Interrupt::ChangeTask(id, change) => {
                 let proj = Self::find_project(&mut self.primary, &mut self.dedicates, &id);
+                let prev_entry = proj.verse.entry_state();
                 proj.verse.increment_revision(|verse| {
                     if let Some(inputs) = change.inputs.clone() {
                         verse.set_inputs(inputs);
@@ -584,8 +585,11 @@ impl<F: CompilerFeat + Send + Sync + 'static, Ext: Default + 'static> ProjectCom
                         });
                     }
 
-                    // Forget the document state of previous entry.
-                    proj.latest_success_doc = None;
+                    // Forget the document state of previous entry, unless the
+                    // entry is actually unchanged.
+                    if entry != prev_entry {
+                        proj.latest_success_doc = None;
+                    }
                 }
 
                 proj.reason.merge(reason_by_entry_change());

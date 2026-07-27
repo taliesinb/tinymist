@@ -289,19 +289,29 @@ pub const ERROR_OVERLAY_JS: &str = r#"
       }
     }
   };
-  // The renderer may draw (or redraw) the document after the diagnostics
-  // arrive, dropping our highlights; re-apply them when the DOM settles.
+  // The renderer may redraw the document at any time (incremental renders,
+  // scrolls, follow-cursor jumps), which either removes our highlights or
+  // paints content after them — and in SVG, later siblings paint on top.
+  // Keep the highlights last in paint order and re-apply them when wiped.
   let reapplyTimer = null;
-  new MutationObserver(() => {
+  const ensure = () => {
     if (!lastData || lastData.ok) return;
+    const els = document.querySelectorAll("." + OVERLAY_CLASS);
+    els.forEach((el) => {
+      if (el.parentNode && el.nextSibling) el.parentNode.appendChild(el);
+    });
     const want = (lastData.locations || []).length;
-    const have = document.querySelectorAll("." + OVERLAY_CLASS).length;
-    const wiped = have < lastApplied;
+    const wiped = els.length < lastApplied || !document.getElementById(PANEL_ID);
     const morePages = lastApplied < want && findPages().length !== lastPageCount;
     if (!wiped && !morePages) return;
     if (reapplyTimer) clearTimeout(reapplyTimer);
     reapplyTimer = setTimeout(() => render(lastData), 150);
-  }).observe(document.documentElement, { childList: true, subtree: true });
+  };
+  new MutationObserver(ensure).observe(document.documentElement, {
+    childList: true,
+    subtree: true,
+  });
+  setInterval(ensure, 1000);
 
   const connect = () => {
     const es = new EventSource("/dev/diagnostics");
