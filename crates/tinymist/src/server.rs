@@ -80,6 +80,8 @@ pub struct ServerState {
     pub focusing: Option<ImmutPath>,
     /// The client focusing position.
     pub implicit_position: Option<LspPosition>,
+    /// The last position scrolled to by `preview.followCursor`.
+    pub followed_position: Option<(ImmutPath, LspPosition)>,
     /// The client ever focused implicitly by activities.
     pub ever_focusing_by_activities: bool,
     /// The client ever sent manual focusing request.
@@ -177,6 +179,7 @@ impl ServerState {
             pinning_by_browsing_preview: false,
             focusing: None,
             implicit_position: None,
+            followed_position: None,
             formatter,
             editor_actor: None,
             dep_tx,
@@ -464,6 +467,32 @@ impl ServerState {
                 character: focus_location.character,
             },
         ))
+    }
+
+    /// Scrolls all preview panels to the implicit (inferred) cursor position,
+    /// if the `preview.followCursor` configuration is enabled and the position
+    /// changed since the last scroll.
+    pub(crate) fn follow_cursor(&mut self) {
+        #[cfg(feature = "preview")]
+        {
+            if !self.config.preview.follow_cursor {
+                return;
+            }
+
+            let position = self.focusing.clone().zip(self.implicit_position);
+            if position.is_none() || position == self.followed_position {
+                return;
+            }
+
+            match self.infer_pos() {
+                Ok(req) => {
+                    log::info!("followCursor: scrolling to {position:?}");
+                    self.followed_position = position;
+                    let _ = self.preview.scroll_all(req);
+                }
+                Err(err) => log::info!("followCursor: no inferred position: {err:?}"),
+            }
+        }
     }
 }
 

@@ -139,6 +139,10 @@ impl ServerState {
         let path = as_path(params.text_document);
         let range = params.range;
         let context = params.context;
+        self.implicit_focus_entry(|| Some(path.as_path().into()), 'a');
+
+        self.implicit_position = Some(range.start);
+        self.follow_cursor();
         run_query!(self.CodeAction(path, range, context))
     }
 
@@ -157,6 +161,7 @@ impl ServerState {
             .and_then(|c| c.chars().next());
 
         self.implicit_position = Some(position);
+        self.follow_cursor();
         run_query!(self.Completion(path, position, explicit, trigger_character))
     }
 
@@ -164,6 +169,7 @@ impl ServerState {
         let (path, position) = as_path_pos(params.text_document_position_params);
 
         self.implicit_position = Some(position);
+        self.follow_cursor();
         run_query!(self.SignatureHelp(path, position))
     }
 

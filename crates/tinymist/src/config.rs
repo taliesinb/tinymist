@@ -1102,6 +1102,12 @@ pub struct PreviewFeat {
     /// Whether to enable partial rendering.
     #[serde(default, deserialize_with = "deserialize_null_default")]
     pub partial_rendering: bool,
+    /// Whether to scroll previews to the cursor position implied by ordinary
+    /// editor requests (code actions, completions, signature helps). This
+    /// provides editor-to-preview scroll synchronization for editors that
+    /// cannot send `tinymist.scrollPreview` commands, e.g. Zed and Helix.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub follow_cursor: bool,
     /// Invert colors for the preview.
     #[cfg(feature = "preview")]
     #[serde(default, deserialize_with = "deserialize_null_default")]
@@ -1541,6 +1547,7 @@ mod tests {
         test_good_config("preview.background");
         test_good_config("preview.background.enabled");
         test_good_config("preview.background.args");
+        test_good_config("preview.followCursor");
         test_good_config("preview.refresh");
         test_good_config("preview.partialRendering");
         #[cfg(feature = "preview")]

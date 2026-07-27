@@ -240,8 +240,8 @@ impl ServerState {
         }
         // didOpen
         match site {
-            // foldingRange, hover, semanticTokens
-            'f' | 'h' | 't' => {
+            // foldingRange, hover, semanticTokens, codeAction
+            'f' | 'h' | 't' | 'a' => {
                 self.ever_focusing_by_activities = true;
             }
             // didOpen
