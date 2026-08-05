@@ -67,9 +67,11 @@ pub fn module_docs(ctx: &mut LocalContext, entry_point: FileId) -> StrResult<Pac
 
     crate::log_debug_ct!("module_uses: {module_uses:#?}",);
 
+    // Serial: the parallel version can deadlock when the docs cache lock is
+    // held across nested rayon tasks (observed hanging on cetz).
     defs.children.extend(
         extras
-            .into_par_iter()
+            .into_iter()
             .map(|extra| enrich_def_docs_parallel(shared.clone(), docs_cache.clone(), extra))
             .collect::<Vec<_>>(),
     );
@@ -87,7 +89,7 @@ fn enrich_def_docs_parallel(
 ) -> DefInfo {
     head.children = head
         .children
-        .into_par_iter()
+        .into_iter()
         .map(|child| enrich_def_docs_parallel(shared.clone(), docs_cache.clone(), child))
         .collect();
 
