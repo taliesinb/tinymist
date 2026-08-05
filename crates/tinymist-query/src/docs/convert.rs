@@ -24,6 +24,53 @@ pub(crate) fn convert_docs(
     content: &DocText,
     source_fid: Option<FileId>,
 ) -> StrResult<EcoString> {
+    // Doc comments may use markup helpers defined by the package's own docs
+    // tooling (e.g. fletcher's `#param[..]`), which are not importable from
+    // the source file. Retry with inert stubs for unknown variables so such
+    // docs degrade gracefully instead of failing wholesale.
+    let mut stubs: Vec<String> = Vec::new();
+    loop {
+        match convert_docs_once(ctx, content, source_fid, &stubs) {
+            Ok(converted) => return Ok(converted),
+            Err(err) => {
+                let mut found_new = false;
+                for name in extract_unknown_variables(&err) {
+                    if !stubs.contains(&name) {
+                        stubs.push(name);
+                        found_new = true;
+                    }
+                }
+                if !found_new || stubs.len() > 32 {
+                    return Err(err);
+                }
+            }
+        }
+    }
+}
+
+/// Extracts identifiers from `unknown variable: <name>` diagnostics.
+fn extract_unknown_variables(err: &str) -> Vec<String> {
+    const NEEDLE: &str = "unknown variable: ";
+    let mut names = Vec::new();
+    for (idx, _) in err.match_indices(NEEDLE) {
+        let rest = &err[idx + NEEDLE.len()..];
+        let name: String = rest
+            .chars()
+            .take_while(|ch| ch.is_alphanumeric() || matches!(ch, '-' | '_'))
+            .collect();
+        if !name.is_empty() && !name.starts_with(|ch: char| ch.is_ascii_digit()) {
+            names.push(name);
+        }
+    }
+    names
+}
+
+fn convert_docs_once(
+    ctx: &SharedContext,
+    content: &DocText,
+    source_fid: Option<FileId>,
+    stubs: &[String],
+) -> StrResult<EcoString> {
     let mut entry = ctx.world().entry_state();
     let import_context = source_fid.map(|fid| {
         let root = ctx.world().vfs().resolve_root(fid).ok().flatten();
@@ -61,7 +108,19 @@ pub(crate) fn convert_docs(
         inputs: None,
     });
 
-    let content = prepare_docs_content(content);
+    let mut content = prepare_docs_content(content);
+    if !stubs.is_empty() {
+        let mut prelude = String::new();
+        for name in stubs {
+            // Render call arguments inline (e.g. `#param[edge][shift]` ->
+            // "edge.shift"); ignore named arguments, repr non-content ones.
+            prelude.push_str(&format!(
+                "#let {name} = (..args) => strong(args.pos().map(v => \
+                 if type(v) == content {{ v }} else {{ raw(repr(v)) }}).join([.]))\n"
+            ));
+        }
+        content = format!("{prelude}{content}");
+    }
 
     // todo: bad performance: content.to_owned()
     w.map_shadow_by_id(w.main(), Bytes::from_string(content))?;

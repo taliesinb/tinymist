@@ -114,6 +114,10 @@ impl DocsChecker<'_> {
         match converted {
             Ok(converted) => Ok(converted),
             Err(err) => {
+                // Keep only the first line of the error: the full rendering
+                // includes multi-line source frames with absolute local paths,
+                // which are noise in generated docs.
+                let err = err.lines().next().unwrap_or_default().to_owned();
                 let err = err.replace("`", "\\`");
                 let max_consecutive_backticks = docs
                     .chars()
