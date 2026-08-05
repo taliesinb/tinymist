@@ -349,6 +349,9 @@ async fn export_docs_bundle(ctx: &PackageDocsContext) -> Result<()> {
     let graph = WorldComputeGraph::from_world(verse.snapshot());
     let artifact = CompiledArtifact::from_graph_without_doc(graph);
     if artifact.has_errors() {
+        for diag in artifact.diagnostics() {
+            eprintln!("{:?}: {} ({:?})", diag.severity, diag.message, diag.span.id());
+        }
         bail!("generated package docs failed to compile");
     }
 
