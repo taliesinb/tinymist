@@ -232,6 +232,24 @@ impl ServerState {
             return Ok(false);
         }
 
+        // Sticky main: keep the current main file when focusing one of its
+        // dependencies (e.g. an imported library). Editing the dependency
+        // still recompiles and refreshes the preview of the main document.
+        if self.config.preview.sticky_main {
+            let is_dependency = new_entry.as_deref().is_some_and(|path| {
+                self.project
+                    .compiler
+                    .primary
+                    .depended_paths()
+                    .iter()
+                    .any(|dep| dep.as_ref() == path)
+            });
+            if is_dependency {
+                log::debug!("stickyMain: keeping main file, {new_entry:?} is a dependency");
+                return Ok(false);
+            }
+        }
+
         self.change_main_file(new_entry)
     }
 

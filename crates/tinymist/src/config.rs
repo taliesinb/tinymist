@@ -1123,6 +1123,13 @@ pub struct PreviewFeat {
     /// `preview.followCursor`.
     #[serde(default, deserialize_with = "deserialize_null_default")]
     pub cursor_indicator: bool,
+    /// Whether to keep the current main file when the editor focuses a file
+    /// that the main file (transitively) depends on, e.g. an imported library.
+    /// Editing such a file still recompiles and refreshes the preview of the
+    /// main document; only focusing an unrelated root document retargets the
+    /// preview.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub sticky_main: bool,
 }
 
 /// The lint features.
@@ -1561,6 +1568,7 @@ mod tests {
         test_good_config("preview.followCursor");
         test_good_config("preview.errorOverlay");
         test_good_config("preview.cursorIndicator");
+        test_good_config("preview.stickyMain");
         test_good_config("preview.refresh");
         test_good_config("preview.partialRendering");
         #[cfg(feature = "preview")]

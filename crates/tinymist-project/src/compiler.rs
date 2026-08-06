@@ -807,6 +807,11 @@ pub struct ProjectInsState<F: CompilerFeat, Ext> {
 }
 
 impl<F: CompilerFeat, Ext: 'static> ProjectInsState<F, Ext> {
+    /// Returns the file dependencies of the latest compilation.
+    pub fn depended_paths(&self) -> &EcoVec<ImmutPath> {
+        &self.deps
+    }
+
     /// Gets a snapshot of the project.
     pub fn snapshot(&mut self) -> Arc<WorldComputeGraph<F>> {
         match self.cached_snapshot.as_ref() {
