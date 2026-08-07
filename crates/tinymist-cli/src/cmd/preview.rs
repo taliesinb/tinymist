@@ -45,7 +45,7 @@ pub async fn preview_main(args: PreviewCliArgs) -> Result<()> {
     let verse = args.compile.resolve()?;
     let previewer = PreviewBuilder::new(config);
 
-    let (service, handle) = {
+    let (service, handle, diag_rx) = {
         let preview_state = ProjectPreviewState::default();
         let opts = ProjectOpts {
             handle: Some(handle),
@@ -71,12 +71,19 @@ pub async fn preview_main(args: PreviewCliArgs) -> Result<()> {
             tinymist_std::bail!("failed to register preview");
         }
 
+        // The error overlay: compile diagnostics are pushed to the frontend
+        // over an SSE channel and shown on the last successful render.
+        let (diag_tx, diag_rx) = tokio::sync::watch::channel(
+            tinymist::tool::preview::OverlayPayload::default(),
+        );
+        preview_state.register_diag(&id, diag_tx);
+
         let handle: Arc<ProjectPreviewHandler> = Arc::new(ProjectPreviewHandler {
             project_id: id,
             client: Box::new(intr_tx),
         });
 
-        (service, handle)
+        (service, handle, diag_rx)
     };
 
     let (lsp_tx, mut lsp_rx) = ControlPlaneTx::new(true);
@@ -171,24 +178,42 @@ pub async fn preview_main(args: PreviewCliArgs) -> Result<()> {
         args.preview.page_title.as_deref(),
         args.compile.input.as_deref(),
     );
-    let frontend_html = frontend_html(
+    let mut frontend_html = frontend_html(
         TYPST_PREVIEW_HTML,
         args.preview.preview_mode,
         "/",
         &page_title,
     );
+    let script = format!(
+        "<script>{}</script>",
+        tinymist::tool::preview::ERROR_OVERLAY_JS
+    );
+    if frontend_html.contains("</body>") {
+        frontend_html = frontend_html.replace("</body>", &format!("{script}</body>"));
+    } else {
+        frontend_html.push_str(&script);
+    }
 
     let static_server = if let Some(static_file_host) = static_file_host {
         log::warn!(
             "--static-file-host is deprecated, which will be removed in the future. Use --data-plane-host instead."
         );
         let html = frontend_html.clone();
-        Some(make_http_server(html, static_file_host, websocket_tx.clone(), None).await)
+        Some(
+            make_http_server(
+                html,
+                static_file_host,
+                websocket_tx.clone(),
+                Some(diag_rx.clone()),
+            )
+            .await,
+        )
     } else {
         None
     };
 
-    let srv = make_http_server(frontend_html, args.data_plane_host, websocket_tx, None).await;
+    let srv =
+        make_http_server(frontend_html, args.data_plane_host, websocket_tx, Some(diag_rx)).await;
     log::info!(
         target: PREVIEW_COMPAT_LOG_TARGET,
         "Data plane server listening on: {}",
