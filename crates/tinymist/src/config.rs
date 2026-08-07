@@ -52,6 +52,7 @@ const CONFIG_ITEMS: &[&str] = &[
     "customizedShowDocument",
     "development",
     "delegateFsRequests",
+    "compileDebounce",
     "exportPdf",
     "exportTarget",
     "fontPaths",
@@ -96,6 +97,11 @@ pub struct Config {
     pub customized_show_document: bool,
     /// Whether the configuration can have a default entry path.
     pub has_default_entry_path: bool,
+    /// Debounce interval in milliseconds for compiles triggered by in-memory
+    /// edits (typing). While typing, at most one compile is started per
+    /// interval; saving a file or changing the entry compiles immediately.
+    /// `0` (the default) disables debouncing.
+    pub compile_debounce: u64,
     /// Whether to notify the status to the editor.
     pub notify_status: bool,
     /// Whether to remove HTML from markup content in responses.
@@ -389,6 +395,7 @@ impl Config {
         assign_config!(completion.trigger_suggest_and_parameter_hints := "triggerSuggestAndParameterHints"?: bool);
         assign_config!(customized_show_document := "customizedShowDocument"?: bool);
         assign_config!(entry_resolver.project_resolution := "projectResolution"?: ProjectResolutionKind);
+        assign_config!(compile_debounce := "compileDebounce"?: u64);
         assign_config!(export_pdf := "exportPdf"?: TaskWhen);
         assign_config!(export_target := "exportTarget"?: ExportTarget);
         assign_config!(font_paths := "fontPaths"?: Vec<_>);
@@ -1569,6 +1576,7 @@ mod tests {
         test_good_config("preview.errorOverlay");
         test_good_config("preview.cursorIndicator");
         test_good_config("preview.stickyMain");
+        test_good_config("compileDebounce");
         test_good_config("preview.refresh");
         test_good_config("preview.partialRendering");
         #[cfg(feature = "preview")]

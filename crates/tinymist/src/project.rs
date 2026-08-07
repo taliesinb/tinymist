@@ -167,6 +167,7 @@ impl ServerState {
             #[cfg(feature = "preview")]
             preview,
             is_standalone: false,
+            compile_debounce: std::time::Duration::from_millis(config.compile_debounce),
             #[cfg(feature = "export")]
             export: export.clone(),
             editor_tx: editor_tx.clone(),
@@ -267,6 +268,9 @@ pub struct ProjectInsStateExt {
     pub emitted_reasons: CompileSignal,
     /// The compiling since the last compilation.
     pub compiling_since: Option<tinymist_std::time::Time>,
+    /// The deadline before which memory-edit (typing) compiles are held
+    /// back. See `Config::compile_debounce`.
+    pub debounce_deadline: Option<tinymist_std::time::Time>,
     /// The last compilation.
     pub last_compilation: Option<LspCompiledArtifact>,
 }
@@ -482,6 +486,9 @@ pub struct CompileHandlerImpl {
     pub(crate) editor_tx: EditorSender,
     /// The client used to send events back to the server itself or the clients.
     pub(crate) client: Arc<dyn ProjectClient>,
+    /// Debounce interval for compiles triggered by in-memory edits (typing).
+    /// Zero disables debouncing. See `Config::compile_debounce`.
+    pub compile_debounce: std::time::Duration,
     /// The status revision map, used to track the status of the projects.
     pub(crate) status_revision: Mutex<FxHashMap<ProjectInsId, usize>>,
     /// The notified revision map, used to track the notified revisions of the
@@ -630,6 +637,45 @@ impl CompileHandler<LspCompilerFeat, ProjectInsStateExt> for CompileHandlerImpl 
                 }
 
                 continue;
+            }
+
+            // Debounce compiles triggered purely by in-memory edits (typing):
+            // hold them back until the deadline, compiling at most once per
+            // interval. Saves (fs events) and entry changes compile
+            // immediately.
+            if !self.compile_debounce.is_zero() {
+                const MEM_ONLY: CompileSignal = CompileSignal {
+                    by_mem_events: true,
+                    by_fs_events: false,
+                    by_entry_update: false,
+                };
+                let mem_only = !reason.exclude(MEM_ONLY).any();
+                if !mem_only {
+                    s.ext.debounce_deadline = None;
+                } else {
+                    match s.ext.debounce_deadline {
+                        Some(deadline) => {
+                            let now = tinymist_std::time::now();
+                            if now < deadline {
+                                // A wake-up poke is already scheduled.
+                                continue;
+                            }
+                            s.ext.debounce_deadline = None;
+                        }
+                        None => {
+                            s.ext.debounce_deadline =
+                                Some(tinymist_std::time::now() + self.compile_debounce);
+                            let client = self.client.clone();
+                            let poke_id = s.id.clone();
+                            let delay = self.compile_debounce;
+                            std::thread::spawn(move || {
+                                std::thread::sleep(delay);
+                                client.interrupt(LspInterrupt::Poke(poke_id));
+                            });
+                            continue;
+                        }
+                    }
+                }
             }
 
             const VFS_SUB: CompileSignal = CompileSignal {

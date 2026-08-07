@@ -261,6 +261,9 @@ pub enum Interrupt<F: CompilerFeat> {
     Fs(FilesystemEvent),
     /// Save a file.
     Save(ImmutPath),
+    /// Re-checks the compile reasons without changing any state. Used to
+    /// wake the compiler up when a debounce deadline elapses.
+    Poke(ProjectInsId),
 }
 
 impl<F: CompilerFeat> fmt::Debug for Interrupt<F> {
@@ -277,6 +280,7 @@ impl<F: CompilerFeat> fmt::Debug for Interrupt<F> {
             Interrupt::Memory(..) => write!(f, "Memory(..)"),
             Interrupt::Fs(..) => write!(f, "Fs(..)"),
             Interrupt::Save(path) => write!(f, "Save({path:?})"),
+            Interrupt::Poke(id) => write!(f, "Poke({id:?})"),
         }
     }
 }
@@ -671,6 +675,10 @@ impl<F: CompilerFeat + Send + Sync + 'static, Ext: Default + 'static> ProjectCom
                 let err = self.dep_tx.send(event);
                 log_send_error("dep_tx", err);
             }
+            // The wake-up itself does nothing; `process` re-runs
+            // `on_any_compile_reason` afterwards, which sees the elapsed
+            // debounce deadline and compiles.
+            Interrupt::Poke(_) => {}
             Interrupt::Save(event) => {
                 let changes = std::iter::repeat_n(&event, 1 + self.dedicates.len());
                 let proj = std::iter::once(&mut self.primary).chain(self.dedicates.iter_mut());
