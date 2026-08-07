@@ -82,6 +82,7 @@ where
         preview: opts.preview,
         is_standalone: true,
         compile_debounce: std::time::Duration::from_millis(opts.config.compile_debounce),
+        last_edit: Arc::default(),
         #[cfg(feature = "export")]
         export: crate::task::ExportTask::new(handle, Some(editor_tx.clone()), opts.config.export()),
         editor_tx,

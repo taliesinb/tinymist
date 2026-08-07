@@ -76,18 +76,24 @@ impl ServerState {
             .get_mut(&path)
             .ok_or_else(|| error_once!("file missing", path: path.display()))?;
 
+        let mut last_edit_pos = None;
         for change in content {
             let replacement = change.text;
             match change.range {
                 Some(lsp_range) => {
                     let range = to_typst_range(lsp_range, position_encoding, source)
                         .expect("invalid range");
+                    last_edit_pos = Some(range.start);
                     source.edit(range, &replacement);
                 }
                 None => {
+                    last_edit_pos = None;
                     source.replace(&replacement);
                 }
             }
+        }
+        if let Some(offset) = last_edit_pos {
+            *self.project.last_edit.lock() = Some((path.clone(), offset));
         }
 
         let snapshot = FileResult::Ok(Bytes::from_string(source.text().to_owned())).into();

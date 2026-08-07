@@ -259,7 +259,15 @@ pub fn cursor_overlay(
 
 /// Renders the diagnostics of a compiled artifact as an overlay payload. The
 /// `cursor` field is left empty; it is merged separately.
-pub fn diagnostics_payload(art: &LspCompiledArtifact) -> OverlayPayload {
+///
+/// `last_edit` is the byte position of the most recent in-memory edit; when
+/// no diagnostic resolves to a document position (e.g. an error raised during
+/// deferred layout-time evaluation, whose call trace never reaches the
+/// document), the edit that broke the compile is highlighted instead.
+pub fn diagnostics_payload(
+    art: &LspCompiledArtifact,
+    last_edit: Option<(&Path, usize)>,
+) -> OverlayPayload {
     let ok = art.doc.is_some();
 
     let mut messages = vec![];
@@ -376,6 +384,29 @@ pub fn diagnostics_payload(art: &LspCompiledArtifact) -> OverlayPayload {
         }
         if truncated > 0 {
             messages.push(format!("… and {truncated} more error(s)"));
+        }
+
+        // No diagnostic resolved onto the render: fall back to the site of
+        // the last edit, which is what most likely broke the compile.
+        if locations.is_empty() {
+            let fallback = || {
+                let doc = success_doc.as_ref()?;
+                let (path, offset) = last_edit?;
+                let main = world.main();
+                let main_path = world.path_for_id(main).ok().and_then(|p| p.to_err().ok());
+                let id = if main_path.as_deref() == Some(path) {
+                    main
+                } else {
+                    world.id_for_path(path)?
+                };
+                let source = world.source(id).ok()?;
+                let cursor = offset.min(source.text().len());
+                let line = source.lines().byte_to_line(cursor)?;
+                resolve_location(doc, &source, cursor, line)
+            };
+            if let Some(loc) = fallback() {
+                locations.push(loc);
+            }
         }
     }
 

@@ -168,6 +168,7 @@ impl ServerState {
             preview,
             is_standalone: false,
             compile_debounce: std::time::Duration::from_millis(config.compile_debounce),
+            last_edit: Arc::default(),
             #[cfg(feature = "export")]
             export: export.clone(),
             editor_tx: editor_tx.clone(),
@@ -253,6 +254,7 @@ impl ServerState {
             stats: CompilerQueryStats::default(),
             #[cfg(feature = "export")]
             export: handle.export.clone(),
+            last_edit: handle.last_edit.clone(),
         }
     }
 }
@@ -341,6 +343,9 @@ pub struct ProjectState {
     /// The export task.
     #[cfg(feature = "export")]
     pub export: crate::task::ExportTask,
+    /// The byte position of the most recent in-memory edit, used by the
+    /// preview error overlay as a highlight fallback.
+    pub last_edit: Arc<Mutex<Option<(ImmutPath, usize)>>>,
 }
 
 impl ProjectState {
@@ -489,6 +494,9 @@ pub struct CompileHandlerImpl {
     /// Debounce interval for compiles triggered by in-memory edits (typing).
     /// Zero disables debouncing. See `Config::compile_debounce`.
     pub compile_debounce: std::time::Duration,
+    /// The byte position of the most recent in-memory edit, shared with
+    /// [`ProjectState::last_edit`].
+    pub last_edit: Arc<Mutex<Option<(ImmutPath, usize)>>>,
     /// The status revision map, used to track the status of the projects.
     pub(crate) status_revision: Mutex<FxHashMap<ProjectInsId, usize>>,
     /// The notified revision map, used to track the notified revisions of the
@@ -839,7 +847,11 @@ impl CompileHandler<LspCompilerFeat, ProjectInsStateExt> for CompileHandlerImpl 
         #[cfg(feature = "preview")]
         if let Some(inner) = self.preview.get(art.id()) {
             if let Some(diag_tx) = self.preview.diag_tx(art.id()) {
-                let payload = crate::tool::preview::diagnostics_payload(art);
+                let last_edit = self.last_edit.lock().clone();
+                let payload = crate::tool::preview::diagnostics_payload(
+                    art,
+                    last_edit.as_ref().map(|(path, offset)| (path.as_ref(), *offset)),
+                );
                 diag_tx.send_modify(|state| {
                     state.ok = payload.ok;
                     state.messages = payload.messages;
