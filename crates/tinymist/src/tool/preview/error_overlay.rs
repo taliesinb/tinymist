@@ -274,35 +274,76 @@ pub fn diagnostics_payload(art: &LspCompiledArtifact) -> OverlayPayload {
             .diagnostics()
             .filter(|diag| diag.severity == Severity::Error);
         for diag in errors {
-            // Resolve the source location of the diagnostic, for both the
-            // message and the overlay position.
-            let src = diag.span.id().and_then(|id| {
+            // Resolves a span to (source, byte offset, line, column).
+            let locate = |id: Option<typst::syntax::FileId>,
+                          range_of: &dyn Fn(&Source) -> Option<std::ops::Range<usize>>| {
+                let id = id?;
                 let source = world.source(id).ok()?;
-                let range = typst_shim::syntax::source_range(&source, diag.span)?;
+                let range = range_of(&source)?;
                 let line = source.lines().byte_to_line(range.start)?;
                 let column = source.lines().byte_to_column(range.start)?;
                 Some((source, range.start, line, column))
+            };
+            let format_at = |id: Option<typst::syntax::FileId>,
+                             src: Option<&(Source, usize, usize, usize)>| {
+                id.zip(src)
+                    .map(|(id, (_, _, line, column))| {
+                        format!(
+                            " ({}:{}:{})",
+                            id.vpath().get_with_slash(),
+                            line + 1,
+                            column + 1
+                        )
+                    })
+                    .unwrap_or_default()
+            };
+
+            // The source location of the diagnostic itself.
+            let src = locate(diag.span.id(), &|source| {
+                typst_shim::syntax::source_range(source, diag.span)
             });
+            // The trace frames, innermost first; the last one points at the
+            // document-level code that triggered the failing call.
+            let trace: Vec<_> = diag
+                .trace
+                .iter()
+                .map(|point| {
+                    let span = point.span;
+                    (
+                        point,
+                        locate(span.id(), &|source| {
+                            typst_shim::syntax::source_range(source, span)
+                        }),
+                    )
+                })
+                .collect();
 
             if lines >= MAX_MESSAGE_LINES {
                 truncated += 1;
                 continue;
             }
-            let at = diag
-                .span
-                .id()
-                .zip(src.as_ref())
-                .map(|(id, (_, _, line, column))| {
-                    format!(
-                        " ({}:{}:{})",
-                        id.vpath().get_with_slash(),
-                        line + 1,
-                        column + 1
-                    )
-                })
-                .unwrap_or_default();
+            let at = format_at(diag.span.id(), src.as_ref());
             messages.push(format!("error: {}{at}", diag.message));
             lines += 1;
+            // Show the trace outermost first (document-level code) down to
+            // the innermost frame (nearest the error). At most 4 frames: the
+            // outer 3 and the innermost, eliding the middle.
+            let total = trace.len();
+            for (idx, (point, point_src)) in trace.iter().rev().enumerate() {
+                if lines >= MAX_MESSAGE_LINES {
+                    break;
+                }
+                if total > 4 && (3..total - 1).contains(&idx) {
+                    if idx == 3 {
+                        messages.push(format!("  … {} more frame(s) …", total - 4));
+                        lines += 1;
+                    }
+                    continue;
+                }
+                let at = format_at(point.span.id(), point_src.as_ref());
+                messages.push(format!("  {}{at}", point.v));
+                lines += 1;
+            }
             for hint in diag.hints.iter() {
                 if lines >= MAX_MESSAGE_LINES {
                     break;
@@ -312,11 +353,22 @@ pub fn diagnostics_payload(art: &LspCompiledArtifact) -> OverlayPayload {
             }
 
             // Resolve the error position against the last successful render.
+            // Prefer the outermost trace frame: for an error inside a called
+            // function (often in a library file), it points at the code in
+            // the document itself, which is what the render can highlight.
             if locations.len() < MAX_LOCATIONS {
-                if let Some((doc, (source, cursor, line, _))) =
-                    success_doc.as_ref().zip(src.as_ref())
-                {
-                    if let Some(loc) = resolve_location(doc, source, *cursor, *line) {
+                if let Some(doc) = success_doc.as_ref() {
+                    let candidates = trace
+                        .iter()
+                        .rev()
+                        .filter_map(|(_, src)| src.as_ref())
+                        .chain(src.as_ref());
+                    let loc = candidates
+                        .into_iter()
+                        .find_map(|(source, cursor, line, _)| {
+                            resolve_location(doc, source, *cursor, *line)
+                        });
+                    if let Some(loc) = loc {
                         locations.push(loc);
                     }
                 }
