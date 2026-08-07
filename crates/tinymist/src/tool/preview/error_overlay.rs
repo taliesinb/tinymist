@@ -44,6 +44,11 @@ pub struct OverlayLocation {
     x: f64,
     /// The y coordinate on the page, in pt.
     y: f64,
+    /// An optional end y coordinate, in pt. When present, the highlight is a
+    /// band from `y` to `y_end` (bracketing a region that could not be
+    /// resolved exactly, e.g. a code block that generates a figure) instead
+    /// of a single line.
+    y_end: Option<f64>,
     /// The page width, in pt.
     page_width: f64,
     /// The page height, in pt.
@@ -120,15 +125,32 @@ fn resolve_location(
                 jump_from_cursor(doc, source, cursor).into_iter().next()
             })
     };
-    let pos = jump_from_cursor(doc, source, cursor)
-        .into_iter()
-        .next()
-        .or_else(|| {
-            (line.saturating_sub(MAX_ANCHOR_WALK_BACK)..=line)
-                .rev()
-                .find_map(try_line)
-        })?;
-    location_of(doc, pos)
+    // An exact resolution highlights that line alone.
+    if let Some(pos) = jump_from_cursor(doc, source, cursor).into_iter().next() {
+        return location_of(doc, pos);
+    }
+
+    // Otherwise bracket the unresolvable region (e.g. a code block that
+    // generates a figure) between the nearest resolvable anchors above and
+    // below, and highlight the whole band between them.
+    let above = (line.saturating_sub(MAX_ANCHOR_WALK_BACK)..=line)
+        .rev()
+        .find_map(try_line);
+    let below = ((line + 1)..=(line + MAX_ANCHOR_WALK_BACK)).find_map(try_line);
+    match (above, below) {
+        (Some(above), below) => {
+            let loc = location_of(doc, above)?;
+            let end = below
+                .and_then(|below| location_of(doc, below))
+                .filter(|end| end.page == loc.page && end.y > loc.y);
+            Some(OverlayLocation {
+                y_end: end.map(|end| end.y),
+                ..loc
+            })
+        }
+        (None, Some(below)) => location_of(doc, below),
+        (None, None) => None,
+    }
 }
 
 /// Converts a document position into an overlay location with page geometry.
@@ -142,6 +164,7 @@ fn location_of(doc: &TypstDocument, pos: PagedPosition) -> Option<OverlayLocatio
         page,
         x: pos.point.x.to_pt(),
         y: pos.point.y.to_pt(),
+        y_end: None,
         page_width: size.x.to_pt(),
         page_height: size.y.to_pt(),
     })
@@ -491,11 +514,13 @@ pub const ERROR_OVERLAY_JS: &str = r#"
       if (!page) continue;
       try {
         if (page instanceof SVGGraphicsElement) {
-          const h = 16;
+          const y0 = loc.y - 12;
+          const y1 = loc.yEnd != null ? loc.yEnd - 12 : loc.y + 4;
+          const h = Math.max(y1 - y0, 8);
           const rect = document.createElementNS(SVG_NS, "rect");
           rect.setAttribute("class", OVERLAY_CLASS);
           rect.setAttribute("x", 0);
-          rect.setAttribute("y", loc.y - 12);
+          rect.setAttribute("y", y0);
           rect.setAttribute("width", loc.pageWidth);
           rect.setAttribute("height", h);
           rect.setAttribute("fill", "rgba(229,83,75,0.25)");
@@ -507,7 +532,8 @@ pub const ERROR_OVERLAY_JS: &str = r#"
           if (!firstMark) firstMark = rect;
         } else {
           const r = page.getBoundingClientRect();
-          const h = Math.max(r.height * 0.025, 8);
+          const span = loc.yEnd != null ? (loc.yEnd - loc.y) / loc.pageHeight : 0.02;
+          const h = Math.max(r.height * Math.max(span, 0.02), 8);
           const div = document.createElement("div");
           div.className = OVERLAY_CLASS;
           div.style.cssText =
@@ -516,7 +542,7 @@ pub const ERROR_OVERLAY_JS: &str = r#"
             "box-sizing:border-box";
           div.style.left = r.left + window.scrollX + "px";
           div.style.top =
-            r.top + window.scrollY + (loc.y / loc.pageHeight) * r.height - h / 2 + "px";
+            r.top + window.scrollY + ((loc.y - 12) / loc.pageHeight) * r.height + "px";
           div.style.width = r.width + "px";
           div.style.height = h + "px";
           document.body.appendChild(div);
