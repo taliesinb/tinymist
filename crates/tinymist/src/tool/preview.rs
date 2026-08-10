@@ -553,13 +553,43 @@ impl PreviewState {
     ) -> SchedulableResponse<StartPreviewResponse> {
         let annot: Option<Arc<dyn AnnotationServer>> = self.overlay_enabled.then(|| {
             Arc::new(LspAnnotationServer {
-                last_art,
+                last_art: last_art.clone(),
                 client: self.client.clone(),
                 watchers: self.watchers.clone(),
                 project_id: project_id.clone(),
                 position_encoding: self.position_encoding,
             }) as Arc<dyn AnnotationServer>
         });
+        // The sidecar is not a compile dependency, so edits made to it by
+        // external tools (e.g. an agent flipping `completed`) trigger no
+        // compile; poll its mtime and push refreshed pins over SSE.
+        if annot.is_some() {
+            let watchers = self.watchers.clone();
+            let poll_id = project_id.clone();
+            let poll_art = last_art.clone();
+            self.client.handle.spawn(async move {
+                let mut last_mtime = None;
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    let Some(diag_tx) = watchers.diag_tx(&poll_id) else {
+                        break;
+                    };
+                    let Some(art) = poll_art.lock().clone() else {
+                        continue;
+                    };
+                    let Some(path) = annotations::sidecar_path(&art) else {
+                        continue;
+                    };
+                    let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+                    if mtime == last_mtime {
+                        continue;
+                    }
+                    last_mtime = mtime;
+                    let pins = annotations::annotation_pins(&art);
+                    diag_tx.send_modify(|state| state.annotations = pins);
+                }
+            });
+        }
         let diag_rx = self.overlay_enabled.then(|| {
             let (diag_tx, diag_rx) = tokio::sync::watch::channel(OverlayPayload::default());
             self.watchers.register_diag(&project_id, diag_tx);
@@ -770,25 +800,40 @@ impl LspAnnotationServer {
         std::fs::write(&edit.sidecar, &edit.sidecar_content)
             .map_err(|e| format!("failed to write {}: {e}", edit.sidecar.display()))?;
 
-        let text_edit = lsp_types::TextEdit {
-            range: edit.range,
-            new_text: edit.new_text.clone(),
-        };
-        let mut changes = std::collections::HashMap::new();
-        changes.insert(edit.uri.clone(), vec![text_edit]);
-        let params = lsp_types::ApplyWorkspaceEditParams {
-            label: Some(format!("typst annotation {}", edit.id)),
-            edit: lsp_types::WorkspaceEdit {
-                changes: Some(changes),
-                ..Default::default()
-            },
-        };
-        self.client
-            .send_lsp_request::<lsp_types::request::ApplyWorkspaceEdit>(params, |_, resp| {
-                if let Some(err) = resp.error {
-                    log::error!("annotation workspace edit failed: {err:?}");
-                }
-            });
+        if let Some(content) = &edit.disk_content {
+            // Write the label straight to disk so external watchers (e.g.
+            // agents) see it immediately. For a clean editor buffer this is
+            // the whole edit (the editor reloads silently); for a dirty one
+            // it is a best-effort patch that the buffer's next save
+            // overwrites.
+            std::fs::write(&edit.path, content)
+                .map_err(|e| format!("failed to write {}: {e}", edit.path.display()))?;
+            log::info!("annotation {} written to disk: {}", edit.id, edit.path.display());
+        }
+        if edit.buffer_edit {
+            // Unsaved editor changes exist: the authoritative edit goes
+            // through the editor buffer, where it lands undoably and
+            // reaches disk on the next save.
+            let text_edit = lsp_types::TextEdit {
+                range: edit.range,
+                new_text: edit.new_text.clone(),
+            };
+            let mut changes = std::collections::HashMap::new();
+            changes.insert(edit.uri.clone(), vec![text_edit]);
+            let params = lsp_types::ApplyWorkspaceEditParams {
+                label: Some(format!("typst annotation {}", edit.id)),
+                edit: lsp_types::WorkspaceEdit {
+                    changes: Some(changes),
+                    ..Default::default()
+                },
+            };
+            self.client
+                .send_lsp_request::<lsp_types::request::ApplyWorkspaceEdit>(params, |_, resp| {
+                    if let Some(err) = resp.error {
+                        log::error!("annotation workspace edit failed: {err:?}");
+                    }
+                });
+        }
 
         // The sidecar usually isn't a compile dependency, so its change alone
         // wouldn't refresh the pins; the label edit comes back from the

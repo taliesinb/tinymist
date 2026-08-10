@@ -32,6 +32,9 @@ pub struct AnnotationRecord {
     pub text: String,
     /// Creation time, in seconds since the unix epoch.
     pub created: u64,
+    /// Whether the annotation has been addressed. Agents flip this to true
+    /// in the sidecar; completed annotations render grayed out.
+    pub completed: bool,
 }
 
 /// An annotation resolved onto the rendered document, sent to the frontend.
@@ -44,6 +47,8 @@ pub struct AnnotationPin {
     pub text: String,
     /// Creation time, in seconds since the unix epoch.
     pub created: u64,
+    /// Whether the annotation has been addressed.
+    pub completed: bool,
     /// The 1-based page number.
     pub page: usize,
     /// The x coordinate of the anchor, in pt.
@@ -75,14 +80,27 @@ pub struct AnnotateRequest {
     pub text: String,
 }
 
-/// The edits needed to create or delete an annotation. The source edit must
-/// go through the editor (workspace edit); the sidecar is written on disk.
+/// The edits needed to create or delete an annotation. When the target file
+/// has no unsaved editor changes (its disk content matches the compiled
+/// source), `disk_content` carries the new file content to write directly on
+/// disk — so external watchers see the label immediately; otherwise the edit
+/// must go through the editor as a workspace edit. The sidecar is always
+/// written on disk.
 #[derive(Debug, Clone)]
 pub struct AnnotationEdit {
     /// The annotation id.
     pub id: String,
     /// The uri of the source file to edit.
     pub uri: Url,
+    /// The path of the source file to edit.
+    pub path: PathBuf,
+    /// The new full content of the source file, when it can be written on
+    /// disk directly.
+    pub disk_content: Option<String>,
+    /// Whether the edit must (also) go through the editor buffer. False only
+    /// when the file was clean and the disk write alone suffices (the editor
+    /// reloads clean buffers silently).
+    pub buffer_edit: bool,
     /// The range to replace in the source file (empty range = insertion).
     pub range: lsp_types::Range,
     /// The replacement text.
@@ -91,6 +109,106 @@ pub struct AnnotationEdit {
     pub sidecar: PathBuf,
     /// The new full content of the sidecar file.
     pub sidecar_content: String,
+}
+
+/// Computes the new on-disk content carrying the edit, and whether the edit
+/// must additionally go through the editor buffer.
+///
+/// A clean file (disk identical to the compiled source) is spliced exactly
+/// and needs no buffer edit — the editor reloads clean buffers silently. A
+/// dirty file still gets a best-effort patch, anchored on the text around
+/// the edit site, so external watchers of the disk see the label
+/// immediately; the buffer edit remains the authoritative copy and its next
+/// save overwrites the patch.
+fn disk_edit(
+    path: &std::path::Path,
+    source_text: &str,
+    range: std::ops::Range<usize>,
+    insert: &str,
+) -> (Option<String>, bool) {
+    let Ok(disk) = std::fs::read_to_string(path) else {
+        return (None, true);
+    };
+    if disk == source_text {
+        let mut content = disk;
+        content.replace_range(range, insert);
+        return (Some(content), false);
+    }
+    (best_effort_patch(&disk, source_text, range, insert), true)
+}
+
+/// Applies the edit to a diverged disk content by re-locating the edit site.
+/// Deletions locate the removed text itself (the label, unique by
+/// construction); insertions anchor on up to 48 bytes of context ending at
+/// the insertion point, retrying with shorter context when the exact window
+/// was disturbed by unsaved edits. Gives up (returns `None`) rather than
+/// patching an ambiguous location.
+fn best_effort_patch(
+    disk: &str,
+    source_text: &str,
+    range: std::ops::Range<usize>,
+    insert: &str,
+) -> Option<String> {
+    if insert.is_empty() {
+        let needle = source_text.get(range)?;
+        let mut hits = disk.match_indices(needle);
+        let (at, _) = hits.next()?;
+        if hits.next().is_some() {
+            return None;
+        }
+        let mut content = disk.to_owned();
+        content.replace_range(at..at + needle.len(), "");
+        return Some(content);
+    }
+    // Anchor on context before the insertion point, then on context after
+    // it (for when the unsaved edits sit just before the click site).
+    // Shorter windows are retried when a longer one was disturbed by the
+    // unsaved edits; an ambiguous match is never patched.
+    for ctx_len in [48usize, 24, 12] {
+        let mut start = range.start.saturating_sub(ctx_len);
+        while !source_text.is_char_boundary(start) {
+            start += 1;
+        }
+        let Some(ctx) = source_text.get(start..range.start) else {
+            continue;
+        };
+        if ctx.len() < 4 {
+            continue;
+        }
+        let mut hits = disk.match_indices(ctx);
+        let Some((at, _)) = hits.next() else {
+            continue;
+        };
+        if hits.next().is_some() {
+            break;
+        }
+        let mut content = disk.to_owned();
+        content.insert_str(at + ctx.len(), insert);
+        return Some(content);
+    }
+    for ctx_len in [48usize, 24, 12] {
+        let mut end = (range.end + ctx_len).min(source_text.len());
+        while !source_text.is_char_boundary(end) {
+            end -= 1;
+        }
+        let Some(ctx) = source_text.get(range.end..end) else {
+            continue;
+        };
+        if ctx.len() < 4 {
+            continue;
+        }
+        let mut hits = disk.match_indices(ctx);
+        let Some((at, _)) = hits.next() else {
+            continue;
+        };
+        if hits.next().is_some() {
+            break;
+        }
+        let mut content = disk.to_owned();
+        content.insert_str(at, insert);
+        return Some(content);
+    }
+    None
 }
 
 /// The server-side annotation API exposed to the preview http server.
@@ -167,11 +285,14 @@ pub fn parse_records(content: &str) -> Vec<AnnotationRecord> {
         let created = read_field(block, "created")
             .and_then(|rest| rest.split(',').next())
             .and_then(|num| num.trim().parse::<u64>().ok());
+        let completed = read_field(block, "completed")
+            .is_some_and(|rest| rest.trim_start().starts_with("true"));
         if let (Some((id, _)), Some((text, _)), Some(created)) = (id, text, created) {
             records.push(AnnotationRecord {
                 id: unescape(id),
                 text: unescape(text),
                 created,
+                completed,
             });
         }
     }
@@ -181,10 +302,11 @@ pub fn parse_records(content: &str) -> Vec<AnnotationRecord> {
 /// Formats one annotation record as a sidecar entry.
 pub fn format_record(rec: &AnnotationRecord) -> String {
     format!(
-        "#metadata((\n  id: \"{}\",\n  text: \"{}\",\n  created: {},\n)) <{}-note>\n",
+        "#metadata((\n  id: \"{}\",\n  text: \"{}\",\n  created: {},\n  completed: {},\n)) <{}-note>\n",
         escape(&rec.id),
         escape(&rec.text),
         rec.created,
+        rec.completed,
         rec.id,
     )
 }
@@ -234,6 +356,7 @@ pub fn annotation_pins(art: &LspCompiledArtifact) -> Vec<AnnotationPin> {
                 id: rec.id.clone(),
                 text: rec.text.clone(),
                 created: rec.created,
+                completed: rec.completed,
                 page: page_no,
                 x: pos.point.x.to_pt(),
                 y: pos.point.y.to_pt(),
@@ -332,13 +455,19 @@ pub fn prepare_annotate(
         id: fresh_id(&records, req.id.as_deref()),
         text: req.text.clone(),
         created: now_epoch(),
+        completed: false,
     };
     let sidecar_content = format!("{content}{}", format_record(&rec));
 
+    let new_text = format!("<{}>", rec.id);
+    let (disk_content, buffer_edit) = disk_edit(&path, source.text(), at..at, &new_text);
     Ok(AnnotationEdit {
         uri,
+        disk_content,
+        buffer_edit,
+        path: path.to_path_buf(),
         range: lsp_types::Range::new(as_lsp(pos), as_lsp(pos)),
-        new_text: format!("<{}>", rec.id),
+        new_text,
         id: rec.id,
         sidecar,
         sidecar_content,
@@ -381,9 +510,13 @@ pub fn prepare_delete(
     let start = to_lsp_position(at, encoding, &source);
     let end = to_lsp_position(at + needle.len(), encoding, &source);
 
+    let (disk_content, buffer_edit) = disk_edit(&path, source.text(), at..at + needle.len(), "");
     Ok(AnnotationEdit {
         id: id.to_owned(),
         uri,
+        disk_content,
+        buffer_edit,
+        path: path.to_path_buf(),
         range: lsp_types::Range::new(as_lsp(start), as_lsp(end)),
         new_text: String::new(),
         sidecar,

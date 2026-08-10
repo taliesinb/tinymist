@@ -627,7 +627,8 @@ pub const ERROR_OVERLAY_JS: &str = r#"
     const meta = document.createElement("div");
     meta.style.cssText = "color:#999;font-size:11px;margin-bottom:6px";
     const when = pin.created ? new Date(pin.created * 1000).toLocaleString() : "";
-    meta.textContent = pin.id + (when ? " · " + when : "");
+    meta.textContent =
+      pin.id + (when ? " · " + when : "") + (pin.completed ? " · completed" : "");
     const del = document.createElement("button");
     del.textContent = "Delete";
     del.style.cssText =
@@ -708,19 +709,23 @@ pub const ERROR_OVERLAY_JS: &str = r#"
       g.style.cursor = "pointer";
       const cx = pin.pageWidth - 16;
       const cy = pin.y - 4;
+      const done = !!pin.completed;
       const line = document.createElementNS(SVG_NS, "line");
       line.setAttribute("x1", pin.x);
       line.setAttribute("y1", pin.y - 4);
       line.setAttribute("x2", cx - 8);
       line.setAttribute("y2", cy);
-      line.setAttribute("stroke", "rgba(245,166,35,0.35)");
+      line.setAttribute(
+        "stroke",
+        done ? "rgba(150,150,150,0.35)" : "rgba(245,166,35,0.35)",
+      );
       line.setAttribute("stroke-dasharray", "2,2");
       const c = document.createElementNS(SVG_NS, "circle");
       c.setAttribute("cx", cx);
       c.setAttribute("cy", cy);
       c.setAttribute("r", 8);
-      c.setAttribute("fill", "rgb(245,166,35)");
-      c.setAttribute("stroke", "rgb(138,90,0)");
+      c.setAttribute("fill", done ? "rgb(150,150,150)" : "rgb(245,166,35)");
+      c.setAttribute("stroke", done ? "rgb(90,90,90)" : "rgb(138,90,0)");
       c.setAttribute("stroke-width", "0.8");
       const t = document.createElementNS(SVG_NS, "text");
       t.setAttribute("x", cx);
