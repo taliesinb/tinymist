@@ -553,10 +553,39 @@ pub const ERROR_OVERLAY_JS: &str = r#"
   // --- annotations: comments anchored to <a-XXXX> labels ---
   // A floating HTML box (compose or view) lives outside the svg so renderer
   // redraws can't wipe it while the user is typing.
+  // While Alt is held, the preview becomes an annotation surface: text
+  // caret, and the renderer's hover-highlight and click-splash are muted by
+  // disabling pointer events inside the document svg.
+  const ALT_STYLE_ID = "tinymist-alt-mode";
+  const setAltMode = (on) => {
+    let style = document.getElementById(ALT_STYLE_ID);
+    if (on && !style) {
+      style = document.createElement("style");
+      style.id = ALT_STYLE_ID;
+      style.textContent =
+        "svg.typst-doc, svg.typst-doc * { cursor: text !important; }\n" +
+        "svg.typst-doc * { pointer-events: none !important; }";
+      document.head.appendChild(style);
+    } else if (!on && style) {
+      style.remove();
+    }
+  };
+  window.addEventListener("keydown", (e) => {
+    if (e.key === "Alt") setAltMode(true);
+  });
+  window.addEventListener("keyup", (e) => {
+    if (e.key === "Alt") setAltMode(false);
+  });
+  window.addEventListener("blur", () => setAltMode(false));
   const ANNOT_BOX_ID = "tinymist-annot-box";
+  let annotEscHandler = null;
   const closeAnnotBox = () => {
     const box = document.getElementById(ANNOT_BOX_ID);
     if (box) box.remove();
+    if (annotEscHandler) {
+      document.removeEventListener("keydown", annotEscHandler, true);
+      annotEscHandler = null;
+    }
   };
   const annotBox = (clientX, clientY) => {
     closeAnnotBox();
@@ -568,6 +597,18 @@ pub const ERROR_OVERLAY_JS: &str = r#"
       "font:13px/1.4 system-ui,sans-serif;box-shadow:0 4px 16px rgba(0,0,0,0.4)";
     box.style.left = Math.max(Math.min(clientX, window.innerWidth - 280), 4) + "px";
     box.style.top = Math.max(Math.min(clientY + 8, window.innerHeight - 170), 4) + "px";
+    // Keep keystrokes inside the box: the preview binds document-level
+    // shortcuts (h/j/k scrolling etc.) that must not fire while typing.
+    for (const type of ["keydown", "keyup", "keypress"]) {
+      box.addEventListener(type, (e) => e.stopPropagation());
+    }
+    annotEscHandler = (e) => {
+      if (e.key === "Escape") {
+        e.stopPropagation();
+        closeAnnotBox();
+      }
+    };
+    document.addEventListener("keydown", annotEscHandler, true);
     document.body.appendChild(box);
     return box;
   };
@@ -606,19 +647,16 @@ pub const ERROR_OVERLAY_JS: &str = r#"
   };
   const composeAnnot = (pageNo, px, py, clientX, clientY) => {
     const box = annotBox(clientX, clientY);
+    // The whole box is the text field; save/cancel float in its bottom-left.
+    box.style.padding = "0";
     const ta = document.createElement("textarea");
     ta.rows = 3;
-    ta.placeholder = "Comment…";
+    ta.placeholder = "Comment…  (⇧⏎ save · esc cancel)";
     ta.style.cssText =
-      "width:100%;box-sizing:border-box;background:#1e1e1e;color:#eee;" +
-      "border:1px solid #555;border-radius:4px;padding:4px;" +
-      "font:13px/1.4 system-ui,sans-serif;margin-bottom:6px";
-    const save = document.createElement("button");
-    save.textContent = "Save";
-    save.style.cssText =
-      "background:#2a4a2a;color:#b4ffb4;border:1px solid #3a3;border-radius:4px;" +
-      "padding:2px 10px;cursor:pointer";
-    save.onclick = () => {
+      "display:block;width:100%;box-sizing:border-box;background:transparent;" +
+      "color:#eee;border:none;outline:none;resize:none;" +
+      "padding:8px 8px 24px;font:13px/1.4 system-ui,sans-serif";
+    const doSave = () => {
       const text = ta.value.trim();
       if (text) {
         // Stamp a short random id (16 bits of entropy); the server falls
@@ -630,13 +668,32 @@ pub const ERROR_OVERLAY_JS: &str = r#"
       }
       closeAnnotBox();
     };
+    ta.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && e.shiftKey) {
+        e.preventDefault();
+        doSave();
+      } else if (e.key === "Escape") {
+        closeAnnotBox();
+      }
+    });
+    const strip = document.createElement("div");
+    strip.style.cssText =
+      "position:absolute;left:8px;bottom:5px;display:flex;gap:10px;" +
+      "font:12px system-ui,sans-serif";
+    const save = document.createElement("button");
+    save.textContent = "save";
+    save.style.cssText =
+      "background:none;border:none;padding:0;cursor:pointer;" +
+      "color:rgb(123,216,143);font:inherit";
+    save.onclick = doSave;
     const cancel = document.createElement("button");
-    cancel.textContent = "Cancel";
+    cancel.textContent = "cancel";
     cancel.style.cssText =
-      "background:#333;color:#ddd;border:1px solid #555;border-radius:4px;" +
-      "padding:2px 10px;cursor:pointer;margin-left:8px";
+      "background:none;border:none;padding:0;cursor:pointer;" +
+      "color:rgb(150,150,150);font:inherit";
     cancel.onclick = closeAnnotBox;
-    box.append(ta, save, cancel);
+    strip.append(save, cancel);
+    box.append(ta, strip);
     ta.focus();
   };
   const drawAnnotations = (pages, list) => {
@@ -684,12 +741,29 @@ pub const ERROR_OVERLAY_JS: &str = r#"
     "click",
     (ev) => {
       if (!ev.altKey) return;
-      const el =
+      const pages = Array.from(findPages());
+      let el =
         ev.target && ev.target.closest
           ? ev.target.closest("g.typst-page, .typst-page")
           : null;
+      if (!(el instanceof SVGGraphicsElement)) {
+        // Alt-mode disables pointer events inside the svg, so the click
+        // target is the svg root; find the page geometrically. The page
+        // group's bbox only covers rendered content, so test the click in
+        // page-local coordinates against the declared page size instead.
+        el =
+          pages.find((page) => {
+            const pageCtm = page.getScreenCTM && page.getScreenCTM();
+            if (!pageCtm) return false;
+            const p = new DOMPoint(ev.clientX, ev.clientY).matrixTransform(
+              pageCtm.inverse(),
+            );
+            const w = parseFloat((page.dataset || {}).pageWidth || "0");
+            const h = parseFloat((page.dataset || {}).pageHeight || "0");
+            return w > 0 && h > 0 && p.x >= 0 && p.x <= w && p.y >= 0 && p.y <= h;
+          }) || null;
+      }
       if (!(el instanceof SVGGraphicsElement)) return;
-      const pages = Array.from(findPages());
       const pageNo = pages.indexOf(el) + 1;
       const ctm = el.getScreenCTM();
       if (!pageNo || !ctm) return;
