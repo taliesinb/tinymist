@@ -267,12 +267,34 @@ impl ServerState {
         }
 
         let args = self.config.preview.background.args.clone();
-        let args = args.unwrap_or_else(|| {
+        let mut args = args.unwrap_or_else(|| {
             vec![
                 "--data-plane-host=127.0.0.1:23635".to_string(),
                 "--invert-colors=auto".to_string(),
             ]
         });
+
+        let root = self.config.entry_resolver.root(None);
+
+        // `--data-plane-host=HOST:auto` binds a stable per-project port derived
+        // from the workspace root, so multiple editor windows each get their
+        // own preview server and a project's URL survives editor restarts. If
+        // the derived port is taken (e.g. the same project open in two
+        // windows), fall back to an OS-assigned port.
+        for arg in args.iter_mut() {
+            let Some(host) = arg.strip_prefix("--data-plane-host=") else {
+                continue;
+            };
+            let Some(host_base) = host.strip_suffix(":auto") else {
+                continue;
+            };
+            let port = root
+                .as_deref()
+                .map(derive_preview_port)
+                .filter(|port| std::net::TcpListener::bind((host_base, *port)).is_ok())
+                .unwrap_or(0);
+            *arg = format!("--data-plane-host={host_base}:{port}");
+        }
 
         let res = self.start_preview(args, PreviewKind::Background);
 
@@ -288,8 +310,16 @@ impl ServerState {
             tokio::pin!(fut);
             let () = fut.as_mut().await;
 
-            if let Some(Err(e)) = fut.as_mut().take_output() {
-                log::error!("failed to start background preview: {e:?}");
+            match fut.as_mut().take_output() {
+                Some(Err(e)) => {
+                    log::error!("failed to start background preview: {e:?}");
+                }
+                Some(Ok(resp)) => {
+                    if let (Some(root), Some(addr)) = (root, resp.static_server_addr.as_deref()) {
+                        write_preview_addr_file(&root, addr);
+                    }
+                }
+                None => {}
             }
         });
     }
@@ -377,6 +407,35 @@ impl ServerState {
         } else {
             Err(internal_error("entry file must be provided"))
         }
+    }
+}
+
+/// Derives a stable preview port in 23700..24000 from the workspace root, so
+/// each project maps to the same port across editor restarts.
+fn derive_preview_port(root: &Path) -> u16 {
+    // FNV-1a, fixed here so ports never move across builds.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in root.as_os_str().as_encoded_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    23700 + (hash % 300) as u16
+}
+
+/// Records the bound preview address under the cache dir, keyed by workspace
+/// root (slashes replaced by `_`, matching `${ROOT//\//_}` in shell), so
+/// editor tasks can find the right window's preview server.
+fn write_preview_addr_file(root: &Path, addr: &str) {
+    let Some(cache_dir) = dirs::cache_dir() else {
+        return;
+    };
+    let dir = cache_dir.join("tinymist").join("preview");
+    let name = format!("{}.addr", root.to_string_lossy().replace('/', "_"));
+    let result = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(dir.join(&name), addr));
+    if let Err(err) = result {
+        log::warn!("failed to write preview addr file {name}: {err}");
+    } else {
+        log::info!("preview addr for {} recorded as {addr}", root.display());
     }
 }
 
