@@ -68,6 +68,13 @@ pub struct OverlayPayload {
     /// The extent of the paragraph-level block containing the editor's
     /// cursor, if it resolves.
     pub cursor: Option<BlockExtent>,
+    /// Whether `invertColors: "smart"` is active: the frontend inverts colors
+    /// only when the viewer is in dark mode but the document rendered light.
+    pub smart_invert: bool,
+    /// Whether the last successfully rendered document has a dark page
+    /// background. `None` means unknown; the frontend keeps its previous
+    /// value.
+    pub doc_dark: Option<bool>,
 }
 
 /// The vertical extent of a block on a page.
@@ -95,7 +102,31 @@ impl Default for OverlayPayload {
             messages: vec![],
             locations: vec![],
             cursor: None,
+            smart_invert: false,
+            doc_dark: None,
         }
+    }
+}
+
+/// Determines whether the rendered document's first page has a dark
+/// background. `None` when there is no paged document or the page fill is not
+/// a solid color.
+pub fn doc_is_dark(art: &LspCompiledArtifact) -> Option<bool> {
+    use typst::foundations::Smart;
+    use typst::visualize::Paint;
+    let TypstDocument::Paged(paged) = art.doc.as_ref()? else {
+        return None;
+    };
+    let page = paged.pages().first()?;
+    match &page.fill {
+        // `auto` and `none` fills both render on a white ground in the
+        // preview.
+        Smart::Auto | Smart::Custom(None) => Some(false),
+        Smart::Custom(Some(Paint::Solid(color))) => {
+            let [r, g, b, _] = color.to_vec4();
+            Some(0.2126 * r + 0.7152 * g + 0.0722 * b < 0.5)
+        }
+        Smart::Custom(Some(_)) => None,
     }
 }
 
@@ -438,6 +469,8 @@ pub fn diagnostics_payload(
         messages,
         locations,
         cursor: None,
+        smart_invert: false,
+        doc_dark: None,
     }
 }
 
@@ -462,6 +495,37 @@ pub const ERROR_OVERLAY_JS: &str = r#"
   let lastApplied = 0;
   let lastPageCount = 0;
   let lastScrollSig = null;
+  // invertColors: "smart" — invert only when the viewer prefers dark but the
+  // document rendered a light page (i.e. it ignored any dark theme inputs).
+  // invert(1) hue-rotate(180deg) is an involution, so images and our own
+  // overlay marks apply it a second time to restore their true colors.
+  const SMART_INVERT_ID = "tinymist-smart-invert";
+  const darkMedia = window.matchMedia("(prefers-color-scheme: dark)");
+  let smartState = { enabled: false, docDark: null };
+  const applySmartInvert = () => {
+    const on =
+      smartState.enabled && darkMedia.matches && smartState.docDark === false;
+    let style = document.getElementById(SMART_INVERT_ID);
+    if (on && !style) {
+      style = document.createElement("style");
+      style.id = SMART_INVERT_ID;
+      // The page ground (`.typst-page-inner`) is a sibling of the page
+      // groups, so the filter goes on the whole document svg.
+      style.textContent =
+        "svg.typst-doc { filter: invert(1) hue-rotate(180deg); }\n" +
+        "svg.typst-doc image, svg.typst-doc ." + OVERLAY_CLASS +
+        " { filter: invert(1) hue-rotate(180deg); }";
+      document.head.appendChild(style);
+    } else if (!on && style) {
+      style.remove();
+    }
+  };
+  darkMedia.addEventListener("change", applySmartInvert);
+  const updateSmartInvert = (data) => {
+    smartState.enabled = !!data.smartInvert;
+    if (data.docDark != null) smartState.docDark = data.docDark;
+    applySmartInvert();
+  };
   // Highlight the paragraph containing the editor's cursor: a soft tint and
   // a left accent bar over its vertical extent.
   // Page groups use pt coordinates with the origin at the page's top-left,
@@ -601,7 +665,9 @@ pub const ERROR_OVERLAY_JS: &str = r#"
     const es = new EventSource("/dev/diagnostics");
     es.onmessage = (ev) => {
       try {
-        render(JSON.parse(ev.data));
+        const data = JSON.parse(ev.data);
+        updateSmartInvert(data);
+        render(data);
       } catch (e) {
         console.warn("tinymist overlay:", e);
       }

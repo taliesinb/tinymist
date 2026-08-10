@@ -168,6 +168,8 @@ impl ServerState {
             preview,
             is_standalone: false,
             compile_debounce: std::time::Duration::from_millis(config.compile_debounce),
+            #[cfg(feature = "preview")]
+            smart_invert: config.preview().invert_colors.contains("smart"),
             last_edit: Arc::default(),
             #[cfg(feature = "export")]
             export: export.clone(),
@@ -494,6 +496,11 @@ pub struct CompileHandlerImpl {
     /// Debounce interval for compiles triggered by in-memory edits (typing).
     /// Zero disables debouncing. See `Config::compile_debounce`.
     pub compile_debounce: std::time::Duration,
+    /// Whether `preview.invertColors` is `"smart"`: the preview inverts
+    /// colors only when the viewer is in dark mode but the document rendered
+    /// a light page background.
+    #[cfg(feature = "preview")]
+    pub smart_invert: bool,
     /// The byte position of the most recent in-memory edit, shared with
     /// [`ProjectState::last_edit`].
     pub last_edit: Arc<Mutex<Option<(ImmutPath, usize)>>>,
@@ -852,10 +859,15 @@ impl CompileHandler<LspCompilerFeat, ProjectInsStateExt> for CompileHandlerImpl 
                     art,
                     last_edit.as_ref().map(|(path, offset)| (path.as_ref(), *offset)),
                 );
+                let doc_dark = crate::tool::preview::doc_is_dark(art);
                 diag_tx.send_modify(|state| {
                     state.ok = payload.ok;
                     state.messages = payload.messages;
                     state.locations = payload.locations;
+                    state.smart_invert = self.smart_invert;
+                    if doc_dark.is_some() {
+                        state.doc_dark = doc_dark;
+                    }
                 });
             }
             let art = art.clone();

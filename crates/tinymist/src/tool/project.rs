@@ -82,6 +82,8 @@ where
         preview: opts.preview,
         is_standalone: true,
         compile_debounce: std::time::Duration::from_millis(opts.config.compile_debounce),
+        #[cfg(feature = "preview")]
+        smart_invert: opts.config.preview().invert_colors.contains("smart"),
         last_edit: Arc::default(),
         #[cfg(feature = "export")]
         export: crate::task::ExportTask::new(handle, Some(editor_tx.clone()), opts.config.export()),

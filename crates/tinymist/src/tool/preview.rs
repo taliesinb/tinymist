@@ -2,7 +2,7 @@
 
 pub use compile::{PreviewCompileView, ProjectPreviewHandler};
 pub use error_overlay::{
-    cursor_overlay, diagnostics_payload, BlockExtent, DiagRx, DiagTx, OverlayPayload,
+    cursor_overlay, diagnostics_payload, doc_is_dark, BlockExtent, DiagRx, DiagTx, OverlayPayload,
     ERROR_OVERLAY_JS,
 };
 pub use http::{make_http_server, HttpServer};
@@ -497,7 +497,9 @@ impl PreviewState {
             preview_tx,
             watchers,
             customized_show_document: config.customized_show_document,
-            overlay_enabled: config.preview.error_overlay || config.preview.cursor_indicator,
+            overlay_enabled: config.preview.error_overlay
+                || config.preview.cursor_indicator
+                || config.preview().invert_colors.contains("smart"),
         }
     }
 

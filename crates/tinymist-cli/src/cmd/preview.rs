@@ -47,12 +47,19 @@ pub async fn preview_main(args: PreviewCliArgs) -> Result<()> {
 
     let (service, handle, diag_rx) = {
         let preview_state = ProjectPreviewState::default();
-        let opts = ProjectOpts {
+        let mut opts = ProjectOpts {
             handle: Some(handle),
             preview: preview_state.clone(),
             export_target: preview_target,
             ..ProjectOpts::default()
         };
+        // Propagate `--invert-colors=smart` into the shared config so the
+        // compile handler reports the rendered page appearance per compile.
+        if args.preview.invert_colors.as_deref() == Some("smart") {
+            opts.config.preview.invert_colors = tinymist_preview::PreviewInvertColors::Enum(
+                tinymist_preview::PreviewInvertColor::Smart,
+            );
+        }
 
         let StartProjectResult {
             service,

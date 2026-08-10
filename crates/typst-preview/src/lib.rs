@@ -345,7 +345,9 @@ impl PreviewBuilder {
             span_interner: span_interner.clone(),
             webview_tx: webview_tx.clone(),
             editor_tx: editor_tx.clone(),
-            invert_colors: config.invert_colors,
+            // The frontend renderer knows nothing about `smart`; the overlay
+            // script implements it instead (see `PreviewInvertColor::Smart`).
+            invert_colors: config.invert_colors.replace("smart", "never"),
             renderer_tx: renderer_mailbox.0.clone(),
             enable_partial_rendering: config.enable_partial_rendering,
             doc_sender,
@@ -683,6 +685,12 @@ pub enum PreviewInvertColor {
     Auto,
     /// Always inverts colors.
     Always,
+    /// Inverts colors only when the viewer is in dark mode but the document
+    /// itself rendered a light page background, i.e. it did not react to any
+    /// dark theme inputs. Implemented outside the frontend renderer: the
+    /// frontend receives `never`, and the overlay script applies the
+    /// inversion based on the rendered page appearance reported per compile.
+    Smart,
 }
 
 /// The invert colors for the preview, which can be applied to images and other
