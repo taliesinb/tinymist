@@ -228,8 +228,10 @@ pub async fn preview_main(args: PreviewCliArgs) -> Result<()> {
 
     #[cfg(feature = "open")]
     if open_in_browser {
-        open::that_detached(format!("http://{static_server_addr}"))
-            .log_error("failed to open browser for preview");
+        tinymist::tool::preview::open_preview_url(
+            format!("http://{static_server_addr}"),
+            args.open_in.as_deref(),
+        );
     }
 
     let _ = tokio::join!(previewer.join(), srv.join, control_plane_server_handle);

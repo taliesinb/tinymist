@@ -237,6 +237,12 @@ pub struct PreviewCliArgs {
     #[clap(long = "no-open")]
     pub no_open: bool,
 
+    /// Application to open the preview with (e.g. a Safari web app) instead of
+    /// the default browser, falling back to the default browser if opening
+    /// with the application fails.
+    #[clap(long = "open-in")]
+    pub open_in: Option<String>,
+
     /// Emit INFO level logging. The default is WARN.
     #[clap(long = "verbose")]
     pub verbose: bool,
@@ -247,6 +253,19 @@ impl PreviewCliArgs {
     pub fn open_in_browser(&self, default: bool) -> bool {
         !self.no_open && (self.open || default)
     }
+}
+
+/// Opens the preview URL, preferring the application named by `--open-in` and
+/// falling back to the default browser.
+#[cfg(feature = "open")]
+pub fn open_preview_url(url: String, open_in: Option<&str>) {
+    if let Some(app) = open_in {
+        if open::with_detached(&url, app).is_ok() {
+            return;
+        }
+        log::warn!("failed to open preview in {app}, falling back to the default browser");
+    }
+    open::that_detached(url).log_error("failed to open browser for preview");
 }
 
 /// Response for starting a preview instance.
@@ -639,8 +658,10 @@ impl PreviewState {
 
             #[cfg(feature = "open")]
             if open_in_browser {
-                open::that_detached(format!("http://127.0.0.1:{}", addr.port()))
-                    .log_error("failed to open browser for preview");
+                open_preview_url(
+                    format!("http://127.0.0.1:{}", addr.port()),
+                    args.open_in.as_deref(),
+                );
             }
 
             let sent = preview_tx.send(PreviewRequest::Started(PreviewTab {
