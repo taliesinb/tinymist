@@ -242,6 +242,13 @@ impl ServerState {
         // dependencies (e.g. an imported library). Editing the dependency
         // still recompiles and refreshes the preview of the main document.
         if self.config.preview.sticky_main {
+            // Annotation sidecars (*.annos.typ) are auxiliary by definition
+            // and usually not compile dependencies; never retarget to them.
+            let is_sidecar = new_entry.as_deref().is_some_and(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(".annos.typ"))
+            });
             let is_dependency = new_entry.as_deref().is_some_and(|path| {
                 self.project
                     .compiler
@@ -250,8 +257,10 @@ impl ServerState {
                     .iter()
                     .any(|dep| dep.as_ref() == path)
             });
-            if is_dependency {
-                log::debug!("stickyMain: keeping main file, {new_entry:?} is a dependency");
+            if is_sidecar || is_dependency {
+                log::debug!(
+                    "stickyMain: keeping main file, {new_entry:?} is a dependency or sidecar"
+                );
                 return Ok(false);
             }
         }

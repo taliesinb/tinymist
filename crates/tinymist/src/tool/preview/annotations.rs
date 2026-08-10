@@ -1,9 +1,9 @@
 //! Preview annotations: comments anchored to document text via labels.
 //!
-//! An annotation is a short label like `<a-e4de>` inserted into the document
+//! An annotation is a short label like `<A-E4DE>` inserted into the document
 //! source at the clicked word (through a workspace edit, so it goes through
 //! the editor buffer and is undoable), plus a record holding the comment
-//! text in a sidecar file `<main>-annotations.typ` next to the main file.
+//! text in a sidecar file `<main>.annos.typ` next to the main file.
 //! The rendered position of each annotation is resolved by querying the
 //! compiled document for the label, so anchors survive arbitrary edits
 //! around them.
@@ -60,7 +60,7 @@ pub struct AnnotationPin {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AnnotateRequest {
-    /// A client-suggested id, e.g. `a-e4de` (random 16-bit suffix stamped by
+    /// A client-suggested id, e.g. `A-E4DE` (random 16-bit suffix stamped by
     /// the browser). Used verbatim when valid and free; otherwise the server
     /// generates one.
     #[serde(default)]
@@ -101,14 +101,14 @@ pub trait AnnotationServer: Send + Sync {
     fn remove(&self, id: &str) -> Result<(), String>;
 }
 
-/// The sidecar path for the current main file, e.g. `typing-annotations.typ`
+/// The sidecar path for the current main file, e.g. `typing.annos.typ`
 /// next to `typing.typ`.
 pub fn sidecar_path(art: &LspCompiledArtifact) -> Option<PathBuf> {
     let world = art.world();
     let main = world.main();
     let path = world.path_for_id(main).ok()?.to_err().ok()?;
     let stem = path.file_stem()?.to_string_lossy().into_owned();
-    Some(path.with_file_name(format!("{stem}-annotations.typ")))
+    Some(path.with_file_name(format!("{stem}.annos.typ")))
 }
 
 fn escape(s: &str) -> String {
@@ -191,7 +191,7 @@ pub fn format_record(rec: &AnnotationRecord) -> String {
 
 const SIDECAR_HEADER: &str = "\
 // Annotations created from the tinymist preview. Each entry corresponds to
-// a matching <a-XXXX> label anchored in the document source; removing an
+// a matching <A-XXXX> label anchored in the document source; removing an
 // entry or its label orphans the other half harmlessly.\n\n";
 
 fn read_sidecar(path: &std::path::Path) -> (Vec<AnnotationRecord>, String) {
@@ -253,7 +253,7 @@ fn valid_id(id: &str) -> bool {
 }
 
 /// Picks the id for a new annotation: the client-suggested one when valid
-/// and free, else a fresh `a-XXXX` with a random 16-bit hex suffix.
+/// and free, else a fresh `A-XXXX` with a random 16-bit hex suffix.
 fn fresh_id(records: &[AnnotationRecord], requested: Option<&str>) -> String {
     let taken = |id: &str| records.iter().any(|rec| rec.id == id);
     if let Some(id) = requested {
@@ -271,7 +271,7 @@ fn fresh_id(records: &[AnnotationRecord], requested: Option<&str>) -> String {
         seed = seed
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
-        let id = format!("a-{:04x}", (seed >> 33) as u16);
+        let id = format!("A-{:04X}", (seed >> 33) as u16);
         if !taken(&id) {
             return id;
         }

@@ -550,7 +550,7 @@ pub const ERROR_OVERLAY_JS: &str = r#"
     page.appendChild(bar);
     lastApplied += 1;
   };
-  // --- annotations: comments anchored to <a-XXXX> labels ---
+  // --- annotations: comments anchored to <A-XXXX> labels ---
   // A floating HTML box (compose or view) lives outside the svg so renderer
   // redraws can't wipe it while the user is typing.
   // While Alt is held, the preview becomes an annotation surface: text
@@ -663,7 +663,10 @@ pub const ERROR_OVERLAY_JS: &str = r#"
         // back to its own if this one is taken.
         const rand = crypto.getRandomValues(new Uint8Array(2));
         const id =
-          "a-" + Array.from(rand, (b) => b.toString(16).padStart(2, "0")).join("");
+          "A-" +
+          Array.from(rand, (b) =>
+            b.toString(16).padStart(2, "0").toUpperCase(),
+          ).join("");
         post("/dev/annotate", { id, page: pageNo, x: px, y: py, text });
       }
       closeAnnotBox();
