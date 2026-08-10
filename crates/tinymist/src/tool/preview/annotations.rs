@@ -1,6 +1,6 @@
 //! Preview annotations: comments anchored to document text via labels.
 //!
-//! An annotation is a `<comment-NNN>` label inserted into the document
+//! An annotation is a short label like `<a-e4de>` inserted into the document
 //! source at the clicked word (through a workspace edit, so it goes through
 //! the editor buffer and is undoable), plus a record holding the comment
 //! text in a sidecar file `<main>-annotations.typ` next to the main file.
@@ -60,6 +60,11 @@ pub struct AnnotationPin {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AnnotateRequest {
+    /// A client-suggested id, e.g. `a-e4de` (random 16-bit suffix stamped by
+    /// the browser). Used verbatim when valid and free; otherwise the server
+    /// generates one.
+    #[serde(default)]
+    pub id: Option<String>,
     /// The 1-based page number.
     pub page: usize,
     /// The x coordinate of the click, in pt.
@@ -186,8 +191,8 @@ pub fn format_record(rec: &AnnotationRecord) -> String {
 
 const SIDECAR_HEADER: &str = "\
 // Annotations created from the tinymist preview. Each entry corresponds to
-// a <comment-NNN> label anchored in the document source; removing an entry
-// or its label orphans the other half harmlessly.\n\n";
+// a matching <a-XXXX> label anchored in the document source; removing an
+// entry or its label orphans the other half harmlessly.\n\n";
 
 fn read_sidecar(path: &std::path::Path) -> (Vec<AnnotationRecord>, String) {
     match std::fs::read_to_string(path) {
@@ -239,13 +244,38 @@ pub fn annotation_pins(art: &LspCompiledArtifact) -> Vec<AnnotationPin> {
         .collect()
 }
 
-fn next_id(records: &[AnnotationRecord]) -> String {
-    let max = records
-        .iter()
-        .filter_map(|rec| rec.id.strip_prefix("comment-")?.parse::<u64>().ok())
-        .max()
+fn valid_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 32
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// Picks the id for a new annotation: the client-suggested one when valid
+/// and free, else a fresh `a-XXXX` with a random 16-bit hex suffix.
+fn fresh_id(records: &[AnnotationRecord], requested: Option<&str>) -> String {
+    let taken = |id: &str| records.iter().any(|rec| rec.id == id);
+    if let Some(id) = requested {
+        if valid_id(id) && !taken(id) {
+            return id.to_owned();
+        }
+    }
+    let mut seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
-    format!("comment-{:03}", max + 1)
+    loop {
+        // splitmix-ish scramble; entropy needs are tiny and collisions are
+        // checked against the existing records anyway.
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let id = format!("a-{:04x}", (seed >> 33) as u16);
+        if !taken(&id) {
+            return id;
+        }
+    }
 }
 
 fn now_epoch() -> u64 {
@@ -299,7 +329,7 @@ pub fn prepare_annotate(
     let sidecar = sidecar_path(art).ok_or("cannot determine the sidecar path")?;
     let (records, content) = read_sidecar(&sidecar);
     let rec = AnnotationRecord {
-        id: next_id(&records),
+        id: fresh_id(&records, req.id.as_deref()),
         text: req.text.clone(),
         created: now_epoch(),
     };

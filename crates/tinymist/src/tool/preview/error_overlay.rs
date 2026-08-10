@@ -550,7 +550,7 @@ pub const ERROR_OVERLAY_JS: &str = r#"
     page.appendChild(bar);
     lastApplied += 1;
   };
-  // --- annotations: comments anchored to <comment-NNN> labels ---
+  // --- annotations: comments anchored to <a-XXXX> labels ---
   // A floating HTML box (compose or view) lives outside the svg so renderer
   // redraws can't wipe it while the user is typing.
   const ANNOT_BOX_ID = "tinymist-annot-box";
@@ -620,7 +620,14 @@ pub const ERROR_OVERLAY_JS: &str = r#"
       "padding:2px 10px;cursor:pointer";
     save.onclick = () => {
       const text = ta.value.trim();
-      if (text) post("/dev/annotate", { page: pageNo, x: px, y: py, text });
+      if (text) {
+        // Stamp a short random id (16 bits of entropy); the server falls
+        // back to its own if this one is taken.
+        const rand = crypto.getRandomValues(new Uint8Array(2));
+        const id =
+          "a-" + Array.from(rand, (b) => b.toString(16).padStart(2, "0")).join("");
+        post("/dev/annotate", { id, page: pageNo, x: px, y: py, text });
+      }
       closeAnnotBox();
     };
     const cancel = document.createElement("button");
@@ -633,9 +640,9 @@ pub const ERROR_OVERLAY_JS: &str = r#"
     ta.focus();
   };
   const drawAnnotations = (pages, list) => {
-    for (const pin of list) {
+    list.forEach((pin, idx) => {
       const page = pages[pin.page - 1];
-      if (!page || !(page instanceof SVGGraphicsElement)) continue;
+      if (!page || !(page instanceof SVGGraphicsElement)) return;
       const g = document.createElementNS(SVG_NS, "g");
       g.setAttribute("class", OVERLAY_CLASS);
       g.style.cursor = "pointer";
@@ -662,7 +669,7 @@ pub const ERROR_OVERLAY_JS: &str = r#"
       t.setAttribute("font-size", "8");
       t.setAttribute("font-family", "system-ui,sans-serif");
       t.setAttribute("fill", "white");
-      t.textContent = (pin.id.match(/[1-9]\d*$/) || ["?"])[0];
+      t.textContent = String(idx + 1);
       g.append(line, c, t);
       g.addEventListener("click", (ev) => {
         ev.preventDefault();
@@ -671,7 +678,7 @@ pub const ERROR_OVERLAY_JS: &str = r#"
       });
       page.appendChild(g);
       lastApplied += 1;
-    }
+    });
   };
   document.addEventListener(
     "click",
