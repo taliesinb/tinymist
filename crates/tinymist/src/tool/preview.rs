@@ -1,12 +1,16 @@
 //! Document preview tool for Typst
 
 pub use compile::{PreviewCompileView, ProjectPreviewHandler};
+pub use annotations::{
+    annotation_pins, AnnotateRequest, AnnotationPin, AnnotationServer,
+};
 pub use error_overlay::{
     cursor_overlay, diagnostics_payload, doc_is_dark, BlockExtent, DiagRx, DiagTx, OverlayPayload,
     ERROR_OVERLAY_JS,
 };
 pub use http::{make_http_server, HttpServer};
 
+mod annotations;
 mod compile;
 mod error_overlay;
 mod http;
@@ -408,8 +412,14 @@ impl ServerState {
             }
             self.set_pin_by_preview(true, is_browsing);
 
-            self.preview
-                .start(cli_args, previewer, id, true, is_background)
+            self.preview.start(
+                cli_args,
+                previewer,
+                id,
+                true,
+                is_background,
+                self.project.last_art.clone(),
+            )
         } else if let Some(entry) = entry {
             let id = self
                 .restart_dedicate(&task_id, Some(entry))
@@ -421,8 +431,14 @@ impl ServerState {
                 ));
             }
 
-            self.preview
-                .start(cli_args, previewer, id, false, is_background)
+            self.preview.start(
+                cli_args,
+                previewer,
+                id,
+                false,
+                is_background,
+                self.project.last_art.clone(),
+            )
         } else {
             Err(internal_error("entry file must be provided"))
         }
@@ -471,6 +487,8 @@ pub struct PreviewState {
     /// Whether the overlay channel (error overlay and/or cursor indicator) is
     /// enabled.
     pub overlay_enabled: bool,
+    /// The editor's position encoding, used when preparing annotation edits.
+    pub position_encoding: tinymist_query::PositionEncoding,
 }
 
 impl PreviewState {
@@ -500,6 +518,7 @@ impl PreviewState {
             overlay_enabled: config.preview.error_overlay
                 || config.preview.cursor_indicator
                 || config.preview().invert_colors.contains("smart"),
+            position_encoding: config.const_config.position_encoding,
         }
     }
 
@@ -530,7 +549,17 @@ impl PreviewState {
         project_id: ProjectInsId,
         is_primary: bool,
         is_background: bool,
+        last_art: Arc<parking_lot::Mutex<Option<tinymist_project::LspCompiledArtifact>>>,
     ) -> SchedulableResponse<StartPreviewResponse> {
+        let annot: Option<Arc<dyn AnnotationServer>> = self.overlay_enabled.then(|| {
+            Arc::new(LspAnnotationServer {
+                last_art,
+                client: self.client.clone(),
+                watchers: self.watchers.clone(),
+                project_id: project_id.clone(),
+                position_encoding: self.position_encoding,
+            }) as Arc<dyn AnnotationServer>
+        });
         let diag_rx = self.overlay_enabled.then(|| {
             let (diag_tx, diag_rx) = tokio::sync::watch::channel(OverlayPayload::default());
             self.watchers.register_diag(&project_id, diag_tx);
@@ -643,8 +672,14 @@ impl PreviewState {
                 }
             }
 
-            let srv =
-                make_http_server(frontend_html, args.data_plane_host, websocket_tx, diag_rx).await;
+            let srv = make_http_server(
+                frontend_html,
+                args.data_plane_host,
+                websocket_tx,
+                diag_rx,
+                annot,
+            )
+            .await;
             let addr = srv.addr;
             log::info!(
                 target: crate::PREVIEW_COMPAT_LOG_TARGET,
@@ -715,6 +750,74 @@ impl PreviewState {
         sent.map_err(|_| internal_error("failed to send scroll request"))?;
 
         just_ok(JsonValue::Null)
+    }
+}
+
+/// Serves preview annotation requests for the LSP-hosted previews: source
+/// edits go to the editor as workspace edits (so they land in the editor
+/// buffer, undoable), the sidecar is written on disk, and the updated pins
+/// are pushed over the SSE overlay channel after the next compile.
+struct LspAnnotationServer {
+    last_art: Arc<parking_lot::Mutex<Option<tinymist_project::LspCompiledArtifact>>>,
+    client: TypedLspClient<PreviewState>,
+    watchers: ProjectPreviewState,
+    project_id: ProjectInsId,
+    position_encoding: tinymist_query::PositionEncoding,
+}
+
+impl LspAnnotationServer {
+    fn apply(&self, edit: &annotations::AnnotationEdit) -> Result<(), String> {
+        std::fs::write(&edit.sidecar, &edit.sidecar_content)
+            .map_err(|e| format!("failed to write {}: {e}", edit.sidecar.display()))?;
+
+        let text_edit = lsp_types::TextEdit {
+            range: edit.range,
+            new_text: edit.new_text.clone(),
+        };
+        let mut changes = std::collections::HashMap::new();
+        changes.insert(edit.uri.clone(), vec![text_edit]);
+        let params = lsp_types::ApplyWorkspaceEditParams {
+            label: Some(format!("typst annotation {}", edit.id)),
+            edit: lsp_types::WorkspaceEdit {
+                changes: Some(changes),
+                ..Default::default()
+            },
+        };
+        self.client
+            .send_lsp_request::<lsp_types::request::ApplyWorkspaceEdit>(params, |_, resp| {
+                if let Some(err) = resp.error {
+                    log::error!("annotation workspace edit failed: {err:?}");
+                }
+            });
+
+        // The sidecar usually isn't a compile dependency, so its change alone
+        // wouldn't refresh the pins; the label edit comes back from the
+        // editor as a memory event and triggers a compile, whose notify pass
+        // recomputes the pins. Push an eager update for the delete case
+        // (where the entry is already gone from the sidecar).
+        let art = self.last_art.lock().clone();
+        if let (Some(art), Some(diag_tx)) = (art, self.watchers.diag_tx(&self.project_id)) {
+            let pins = annotations::annotation_pins(&art);
+            diag_tx.send_modify(|state| state.annotations = pins);
+        }
+        Ok(())
+    }
+}
+
+impl AnnotationServer for LspAnnotationServer {
+    fn annotate(&self, req: annotations::AnnotateRequest) -> Result<String, String> {
+        let art = self.last_art.lock().clone();
+        let art = art.ok_or("no compiled artifact yet")?;
+        let edit = annotations::prepare_annotate(&art, &req, self.position_encoding)?;
+        self.apply(&edit)?;
+        Ok(edit.id)
+    }
+
+    fn remove(&self, id: &str) -> Result<(), String> {
+        let art = self.last_art.lock().clone();
+        let art = art.ok_or("no compiled artifact yet")?;
+        let edit = annotations::prepare_delete(&art, id, self.position_encoding)?;
+        self.apply(&edit)
     }
 }
 

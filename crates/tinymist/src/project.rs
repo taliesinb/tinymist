@@ -170,6 +170,7 @@ impl ServerState {
             compile_debounce: std::time::Duration::from_millis(config.compile_debounce),
             #[cfg(feature = "preview")]
             smart_invert: config.preview().invert_colors.contains("smart"),
+            last_art: Arc::default(),
             last_edit: Arc::default(),
             #[cfg(feature = "export")]
             export: export.clone(),
@@ -257,6 +258,7 @@ impl ServerState {
             #[cfg(feature = "export")]
             export: handle.export.clone(),
             last_edit: handle.last_edit.clone(),
+            last_art: handle.last_art.clone(),
         }
     }
 }
@@ -348,6 +350,9 @@ pub struct ProjectState {
     /// The byte position of the most recent in-memory edit, used by the
     /// preview error overlay as a highlight fallback.
     pub last_edit: Arc<Mutex<Option<(ImmutPath, usize)>>>,
+    /// The most recent compiled artifact, used by the preview annotation
+    /// endpoint to resolve clicks against the rendered document.
+    pub last_art: Arc<Mutex<Option<LspCompiledArtifact>>>,
 }
 
 impl ProjectState {
@@ -504,6 +509,9 @@ pub struct CompileHandlerImpl {
     /// The byte position of the most recent in-memory edit, shared with
     /// [`ProjectState::last_edit`].
     pub last_edit: Arc<Mutex<Option<(ImmutPath, usize)>>>,
+    /// The most recent compiled artifact, shared with
+    /// [`ProjectState::last_art`].
+    pub last_art: Arc<Mutex<Option<LspCompiledArtifact>>>,
     /// The status revision map, used to track the status of the projects.
     pub(crate) status_revision: Mutex<FxHashMap<ProjectInsId, usize>>,
     /// The notified revision map, used to track the notified revisions of the
@@ -853,6 +861,7 @@ impl CompileHandler<LspCompilerFeat, ProjectInsStateExt> for CompileHandlerImpl 
 
         #[cfg(feature = "preview")]
         if let Some(inner) = self.preview.get(art.id()) {
+            *self.last_art.lock() = Some(art.clone());
             if let Some(diag_tx) = self.preview.diag_tx(art.id()) {
                 let last_edit = self.last_edit.lock().clone();
                 let payload = crate::tool::preview::diagnostics_payload(
@@ -860,11 +869,13 @@ impl CompileHandler<LspCompilerFeat, ProjectInsStateExt> for CompileHandlerImpl 
                     last_edit.as_ref().map(|(path, offset)| (path.as_ref(), *offset)),
                 );
                 let doc_dark = crate::tool::preview::doc_is_dark(art);
+                let annotations = crate::tool::preview::annotation_pins(art);
                 diag_tx.send_modify(|state| {
                     state.ok = payload.ok;
                     state.messages = payload.messages;
                     state.locations = payload.locations;
                     state.smart_invert = self.smart_invert;
+                    state.annotations = annotations;
                     if doc_dark.is_some() {
                         state.doc_dark = doc_dark;
                     }

@@ -75,6 +75,9 @@ pub struct OverlayPayload {
     /// background. `None` means unknown; the frontend keeps its previous
     /// value.
     pub doc_dark: Option<bool>,
+    /// The annotations of the current main file, resolved onto the last
+    /// successful render.
+    pub annotations: Vec<super::annotations::AnnotationPin>,
 }
 
 /// The vertical extent of a block on a page.
@@ -104,6 +107,7 @@ impl Default for OverlayPayload {
             cursor: None,
             smart_invert: false,
             doc_dark: None,
+            annotations: vec![],
         }
     }
 }
@@ -471,6 +475,7 @@ pub fn diagnostics_payload(
         cursor: None,
         smart_invert: false,
         doc_dark: None,
+        annotations: vec![],
     }
 }
 
@@ -545,6 +550,149 @@ pub const ERROR_OVERLAY_JS: &str = r#"
     page.appendChild(bar);
     lastApplied += 1;
   };
+  // --- annotations: comments anchored to <comment-NNN> labels ---
+  // A floating HTML box (compose or view) lives outside the svg so renderer
+  // redraws can't wipe it while the user is typing.
+  const ANNOT_BOX_ID = "tinymist-annot-box";
+  const closeAnnotBox = () => {
+    const box = document.getElementById(ANNOT_BOX_ID);
+    if (box) box.remove();
+  };
+  const annotBox = (clientX, clientY) => {
+    closeAnnotBox();
+    const box = document.createElement("div");
+    box.id = ANNOT_BOX_ID;
+    box.style.cssText =
+      "position:fixed;z-index:2147483647;background:#2b2b2b;color:#eee;" +
+      "border:1px solid #f5a623;border-radius:6px;padding:8px;width:260px;" +
+      "font:13px/1.4 system-ui,sans-serif;box-shadow:0 4px 16px rgba(0,0,0,0.4)";
+    box.style.left = Math.max(Math.min(clientX, window.innerWidth - 280), 4) + "px";
+    box.style.top = Math.max(Math.min(clientY + 8, window.innerHeight - 170), 4) + "px";
+    document.body.appendChild(box);
+    return box;
+  };
+  const post = (path, payload) =>
+    fetch(path, { method: "POST", body: JSON.stringify(payload) })
+      .then((r) => r.json())
+      .then((r) => {
+        if (!r.ok) console.warn("tinymist annotation:", r.error);
+      })
+      .catch((e) => console.warn("tinymist annotation:", e));
+  const showAnnot = (pin, x, y) => {
+    const box = annotBox(x, y);
+    const text = document.createElement("div");
+    text.style.cssText = "white-space:pre-wrap;margin-bottom:6px";
+    text.textContent = pin.text;
+    const meta = document.createElement("div");
+    meta.style.cssText = "color:#999;font-size:11px;margin-bottom:6px";
+    const when = pin.created ? new Date(pin.created * 1000).toLocaleString() : "";
+    meta.textContent = pin.id + (when ? " · " + when : "");
+    const del = document.createElement("button");
+    del.textContent = "Delete";
+    del.style.cssText =
+      "background:#5a2a2a;color:#ffb4b4;border:1px solid #a33;border-radius:4px;" +
+      "padding:2px 10px;cursor:pointer";
+    del.onclick = () => {
+      post("/dev/annotate/delete", { id: pin.id });
+      closeAnnotBox();
+    };
+    const close = document.createElement("button");
+    close.textContent = "Close";
+    close.style.cssText =
+      "background:#333;color:#ddd;border:1px solid #555;border-radius:4px;" +
+      "padding:2px 10px;cursor:pointer;margin-left:8px";
+    close.onclick = closeAnnotBox;
+    box.append(text, meta, del, close);
+  };
+  const composeAnnot = (pageNo, px, py, clientX, clientY) => {
+    const box = annotBox(clientX, clientY);
+    const ta = document.createElement("textarea");
+    ta.rows = 3;
+    ta.placeholder = "Comment…";
+    ta.style.cssText =
+      "width:100%;box-sizing:border-box;background:#1e1e1e;color:#eee;" +
+      "border:1px solid #555;border-radius:4px;padding:4px;" +
+      "font:13px/1.4 system-ui,sans-serif;margin-bottom:6px";
+    const save = document.createElement("button");
+    save.textContent = "Save";
+    save.style.cssText =
+      "background:#2a4a2a;color:#b4ffb4;border:1px solid #3a3;border-radius:4px;" +
+      "padding:2px 10px;cursor:pointer";
+    save.onclick = () => {
+      const text = ta.value.trim();
+      if (text) post("/dev/annotate", { page: pageNo, x: px, y: py, text });
+      closeAnnotBox();
+    };
+    const cancel = document.createElement("button");
+    cancel.textContent = "Cancel";
+    cancel.style.cssText =
+      "background:#333;color:#ddd;border:1px solid #555;border-radius:4px;" +
+      "padding:2px 10px;cursor:pointer;margin-left:8px";
+    cancel.onclick = closeAnnotBox;
+    box.append(ta, save, cancel);
+    ta.focus();
+  };
+  const drawAnnotations = (pages, list) => {
+    for (const pin of list) {
+      const page = pages[pin.page - 1];
+      if (!page || !(page instanceof SVGGraphicsElement)) continue;
+      const g = document.createElementNS(SVG_NS, "g");
+      g.setAttribute("class", OVERLAY_CLASS);
+      g.style.cursor = "pointer";
+      const cx = pin.pageWidth - 16;
+      const cy = pin.y - 4;
+      const line = document.createElementNS(SVG_NS, "line");
+      line.setAttribute("x1", pin.x);
+      line.setAttribute("y1", pin.y - 4);
+      line.setAttribute("x2", cx - 8);
+      line.setAttribute("y2", cy);
+      line.setAttribute("stroke", "rgba(245,166,35,0.35)");
+      line.setAttribute("stroke-dasharray", "2,2");
+      const c = document.createElementNS(SVG_NS, "circle");
+      c.setAttribute("cx", cx);
+      c.setAttribute("cy", cy);
+      c.setAttribute("r", 8);
+      c.setAttribute("fill", "rgb(245,166,35)");
+      c.setAttribute("stroke", "rgb(138,90,0)");
+      c.setAttribute("stroke-width", "0.8");
+      const t = document.createElementNS(SVG_NS, "text");
+      t.setAttribute("x", cx);
+      t.setAttribute("y", cy + 2.6);
+      t.setAttribute("text-anchor", "middle");
+      t.setAttribute("font-size", "8");
+      t.setAttribute("font-family", "system-ui,sans-serif");
+      t.setAttribute("fill", "white");
+      t.textContent = (pin.id.match(/[1-9]\d*$/) || ["?"])[0];
+      g.append(line, c, t);
+      g.addEventListener("click", (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        showAnnot(pin, ev.clientX, ev.clientY);
+      });
+      page.appendChild(g);
+      lastApplied += 1;
+    }
+  };
+  document.addEventListener(
+    "click",
+    (ev) => {
+      if (!ev.altKey) return;
+      const el =
+        ev.target && ev.target.closest
+          ? ev.target.closest("g.typst-page, .typst-page")
+          : null;
+      if (!(el instanceof SVGGraphicsElement)) return;
+      const pages = Array.from(findPages());
+      const pageNo = pages.indexOf(el) + 1;
+      const ctm = el.getScreenCTM();
+      if (!pageNo || !ctm) return;
+      ev.preventDefault();
+      ev.stopImmediatePropagation();
+      const pt = new DOMPoint(ev.clientX, ev.clientY).matrixTransform(ctm.inverse());
+      composeAnnot(pageNo, pt.x, pt.y, ev.clientX, ev.clientY);
+    },
+    true,
+  );
   const render = (data) => {
     lastData = data;
     clear();
@@ -557,6 +705,11 @@ pub const ERROR_OVERLAY_JS: &str = r#"
       } catch (e) {
         console.warn("tinymist overlay:", e);
       }
+    }
+    try {
+      drawAnnotations(pages, data.annotations || []);
+    } catch (e) {
+      console.warn("tinymist overlay:", e);
     }
     if (data.ok) {
       lastScrollSig = null;
@@ -648,7 +801,8 @@ pub const ERROR_OVERLAY_JS: &str = r#"
     });
     const want =
       (lastData.ok ? 0 : (lastData.locations || []).length) +
-      (lastData.cursor ? 1 : 0);
+      (lastData.cursor ? 1 : 0) +
+      (lastData.annotations || []).length;
     const wiped =
       els.length < lastApplied || (!lastData.ok && !document.getElementById(PANEL_ID));
     const morePages = lastApplied < want && findPages().length !== lastPageCount;

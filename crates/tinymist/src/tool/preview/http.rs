@@ -28,6 +28,7 @@ pub async fn make_http_server(
     static_file_addr: String,
     websocket_tx: mpsc::UnboundedSender<HyperWebsocket>,
     diag_rx: Option<super::DiagRx>,
+    annot: Option<std::sync::Arc<dyn super::AnnotationServer>>,
 ) -> HttpServer {
     use futures::StreamExt;
     use http_body_util::{Full, StreamBody};
@@ -52,11 +53,13 @@ pub async fn make_http_server(
         let websocket_tx = websocket_tx.clone();
         let static_file_addr = static_file_addr.clone();
         let diag_rx = diag_rx.clone();
+        let annot = annot.clone();
         service_fn(move |mut req: hyper::Request<Incoming>| {
             let frontend_html = frontend_html.clone();
             let websocket_tx = websocket_tx.clone();
             let static_file_addr = static_file_addr.clone();
             let diag_rx = diag_rx.clone();
+            let annot = annot.clone();
             async move {
                 // When a user visits a website in a browser, that website can try to connect to
                 // our http / websocket server on `127.0.0.1` which may leak sensitive
@@ -119,6 +122,43 @@ pub async fn make_http_server(
                         .header(hyper::header::CONTENT_TYPE, "text/event-stream")
                         .header(hyper::header::CACHE_CONTROL, "no-cache")
                         .body(Body::new(StreamBody::new(stream)))
+                        .unwrap();
+                    Ok(res)
+                } else if req.uri().path().starts_with("/dev/annotate") && annot.is_some() {
+                    // Annotation endpoints: POST /dev/annotate creates an
+                    // annotation at a clicked position; POST
+                    // /dev/annotate/delete removes one by id.
+                    use http_body_util::BodyExt;
+                    let is_delete = req.uri().path() == "/dev/annotate/delete";
+                    let annot = annot.unwrap();
+                    let body = req.into_body().collect().await?.to_bytes();
+                    let outcome = if is_delete {
+                        #[derive(serde::Deserialize)]
+                        struct DeleteReq {
+                            id: String,
+                        }
+                        serde_json::from_slice::<DeleteReq>(&body)
+                            .map_err(|e| e.to_string())
+                            .and_then(|req| annot.remove(&req.id).map(|()| String::new()))
+                    } else {
+                        serde_json::from_slice::<super::AnnotateRequest>(&body)
+                            .map_err(|e| e.to_string())
+                            .and_then(|req| annot.annotate(req))
+                    };
+                    let (status, body) = match outcome {
+                        Ok(id) => (
+                            hyper::StatusCode::OK,
+                            serde_json::json!({ "ok": true, "id": id }).to_string(),
+                        ),
+                        Err(err) => (
+                            hyper::StatusCode::BAD_REQUEST,
+                            serde_json::json!({ "ok": false, "error": err }).to_string(),
+                        ),
+                    };
+                    let res = hyper::Response::builder()
+                        .status(status)
+                        .header(hyper::header::CONTENT_TYPE, "application/json")
+                        .body(Body::new(Full::<Bytes>::from(body)))
                         .unwrap();
                     Ok(res)
                 } else {

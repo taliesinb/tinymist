@@ -99,7 +99,14 @@ pub async fn preview_main(args: PreviewCliArgs) -> Result<()> {
         let (control_sock_tx, mut control_sock_rx) = mpsc::unbounded_channel();
 
         let srv =
-            make_http_server(String::default(), args.control_plane_host, control_sock_tx, None).await;
+            make_http_server(
+                String::default(),
+                args.control_plane_host,
+                control_sock_tx,
+                None,
+                None,
+            )
+            .await;
         log::info!(
             target: PREVIEW_COMPAT_LOG_TARGET,
             "Control panel server listening on: {}",
@@ -212,6 +219,7 @@ pub async fn preview_main(args: PreviewCliArgs) -> Result<()> {
                 static_file_host,
                 websocket_tx.clone(),
                 Some(diag_rx.clone()),
+                None,
             )
             .await,
         )
@@ -220,7 +228,14 @@ pub async fn preview_main(args: PreviewCliArgs) -> Result<()> {
     };
 
     let srv =
-        make_http_server(frontend_html, args.data_plane_host, websocket_tx, Some(diag_rx)).await;
+        make_http_server(
+            frontend_html,
+            args.data_plane_host,
+            websocket_tx,
+            Some(diag_rx),
+            None,
+        )
+        .await;
     log::info!(
         target: PREVIEW_COMPAT_LOG_TARGET,
         "Data plane server listening on: {}",
