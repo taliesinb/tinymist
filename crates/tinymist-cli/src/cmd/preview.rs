@@ -198,14 +198,11 @@ pub async fn preview_main(args: PreviewCliArgs) -> Result<()> {
         "/",
         &page_title,
     );
-    let script = format!(
-        "<script>{}</script>",
-        tinymist::tool::preview::ERROR_OVERLAY_JS
-    );
+    let script = "<script src=\"/dev/overlay.js\"></script>";
     if frontend_html.contains("</body>") {
         frontend_html = frontend_html.replace("</body>", &format!("{script}</body>"));
     } else {
-        frontend_html.push_str(&script);
+        frontend_html.push_str(script);
     }
 
     let static_server = if let Some(static_file_host) = static_file_host {

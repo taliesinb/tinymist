@@ -124,6 +124,15 @@ pub async fn make_http_server(
                         .body(Body::new(StreamBody::new(stream)))
                         .unwrap();
                     Ok(res)
+                } else if req.uri().path() == "/dev/overlay.js" && diag_rx.is_some() {
+                    // Read from the source tree per request so overlay
+                    // script edits apply on browser reload, no rebuild.
+                    let res = hyper::Response::builder()
+                        .header(hyper::header::CONTENT_TYPE, "application/javascript")
+                        .header(hyper::header::CACHE_CONTROL, "no-cache")
+                        .body(Body::new(Full::<Bytes>::from(super::overlay_js())))
+                        .unwrap();
+                    Ok(res)
                 } else if req.uri().path().starts_with("/dev/annotate") && annot.is_some() {
                     // Annotation endpoints: POST /dev/annotate creates an
                     // annotation at a clicked position; POST

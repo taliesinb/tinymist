@@ -5,8 +5,8 @@ pub use annotations::{
     annotation_pins, AnnotateRequest, AnnotationPin, AnnotationServer,
 };
 pub use error_overlay::{
-    cursor_overlay, diagnostics_payload, doc_is_dark, BlockExtent, DiagRx, DiagTx, OverlayPayload,
-    ERROR_OVERLAY_JS,
+    cursor_overlay, diagnostics_payload, doc_is_dark, overlay_js, BlockExtent, DiagRx, DiagTx,
+    OverlayPayload,
 };
 pub use http::{make_http_server, HttpServer};
 
@@ -694,11 +694,13 @@ impl PreviewState {
                 &page_title,
             );
             if diag_rx.is_some() {
-                let script = format!("<script>{ERROR_OVERLAY_JS}</script>");
+                // Served per request so the script can be edited in the
+                // source tree and picked up on a browser reload.
+                let script = "<script src=\"/dev/overlay.js\"></script>";
                 if frontend_html.contains("</body>") {
                     frontend_html = frontend_html.replace("</body>", &format!("{script}</body>"));
                 } else {
-                    frontend_html.push_str(&script);
+                    frontend_html.push_str(script);
                 }
             }
 

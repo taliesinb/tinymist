@@ -24,8 +24,31 @@ use typst::syntax::SyntaxKind;
 use typst::utils::PicoStr;
 use typst::World;
 
+/// Loads a dev asset from the source tree when available — so it can be
+/// edited without rebuilding — falling back to the copy embedded at build
+/// time. The source tree path is baked in at build time, which is exactly
+/// right for a locally-built binary.
+pub(crate) fn dev_asset(rel: &str, embedded: &'static str) -> String {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src/tool/preview")
+        .join(rel);
+    std::fs::read_to_string(path).unwrap_or_else(|_| embedded.to_owned())
+}
+
 /// The schema documentation stamped at the top of new sidecar files.
-pub const ANNOS_PRELUDE: &str = include_str!("annos_prelude.typ");
+pub fn annos_prelude() -> String {
+    dev_asset("annos_prelude.typ", include_str!("annos_prelude.typ"))
+}
+
+/// The sidecar entry template, with `${...}` placeholders.
+fn entry_template() -> String {
+    dev_asset("annos_entry.tmpl", include_str!("annos_entry.tmpl"))
+}
+
+/// The discussion reply template, with `${...}` placeholders.
+fn reply_template() -> String {
+    dev_asset("annos_reply.tmpl", include_str!("annos_reply.tmpl"))
+}
 
 /// A reply in an annotation's discussion thread.
 #[derive(Debug, Clone, Serialize)]
@@ -308,31 +331,34 @@ pub fn parse_records(content: &str) -> Vec<AnnotationRecord> {
         .collect()
 }
 
-/// Formats one annotation record as a sidecar entry.
+/// Formats one annotation record as a sidecar entry, using the editable
+/// `annos_entry.tmpl` / `annos_reply.tmpl` templates. Templates must keep
+/// the `key: "value"` field shapes the parser recognizes.
 pub fn format_record(rec: &AnnotationRecord) -> String {
-    let mut out = String::new();
-    out.push_str("#metadata((\n");
-    out.push_str(&format!("  type: \"{}\",\n", escape(&rec.rtype)));
-    out.push_str(&format!("  label: \"{}\",\n", escape(&rec.label)));
-    out.push_str(&format!("  author: \"{}\",\n", escape(&rec.author)));
-    out.push_str(&format!("  content: \"{}\",\n", escape(&rec.content)));
-    out.push_str(&format!("  time: \"{}\",\n", escape(&rec.time)));
-    out.push_str(&format!("  status: \"{}\",\n", escape(&rec.status)));
-    if rec.discussion.is_empty() {
-        out.push_str("  discussion: (),\n");
+    let discussion = if rec.discussion.is_empty() {
+        "()".to_owned()
     } else {
-        out.push_str("  discussion: (\n");
-        for reply in &rec.discussion {
-            out.push_str("    (\n");
-            out.push_str(&format!("      author: \"{}\",\n", escape(&reply.author)));
-            out.push_str(&format!("      time: \"{}\",\n", escape(&reply.time)));
-            out.push_str(&format!("      content: \"{}\",\n", escape(&reply.content)));
-            out.push_str("    ),\n");
-        }
-        out.push_str("  ),\n");
-    }
-    out.push_str(&format!(")) <note-{}>\n", rec.label));
-    out
+        let reply_tmpl = reply_template();
+        let replies: String = rec
+            .discussion
+            .iter()
+            .map(|reply| {
+                reply_tmpl
+                    .replace("${author}", &escape(&reply.author))
+                    .replace("${time}", &escape(&reply.time))
+                    .replace("${content}", &escape(&reply.content))
+            })
+            .collect();
+        format!("(\n{replies}  )")
+    };
+    entry_template()
+        .replace("${type}", &escape(&rec.rtype))
+        .replace("${label}", &escape(&rec.label))
+        .replace("${author}", &escape(&rec.author))
+        .replace("${content}", &escape(&rec.content))
+        .replace("${time}", &escape(&rec.time))
+        .replace("${status}", &escape(&rec.status))
+        .replace("${discussion}", &discussion)
 }
 
 fn read_sidecar(path: &std::path::Path) -> (Vec<AnnotationRecord>, String) {
@@ -341,7 +367,7 @@ fn read_sidecar(path: &std::path::Path) -> (Vec<AnnotationRecord>, String) {
             let records = parse_records(&content);
             (records, content)
         }
-        Err(_) => (vec![], ANNOS_PRELUDE.to_owned()),
+        Err(_) => (vec![], annos_prelude()),
     }
 }
 

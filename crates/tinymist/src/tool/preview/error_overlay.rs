@@ -481,4 +481,8 @@ pub fn diagnostics_payload(
 
 /// The script injected into the frontend html when the error overlay or the
 /// cursor indicator is enabled.
-pub const ERROR_OVERLAY_JS: &str = include_str!("error_overlay.js");
+/// The overlay script, loaded from the source tree when available so it can
+/// be edited without rebuilding (served per request via `/dev/overlay.js`).
+pub fn overlay_js() -> String {
+    super::annotations::dev_asset("error_overlay.js", include_str!("error_overlay.js"))
+}
