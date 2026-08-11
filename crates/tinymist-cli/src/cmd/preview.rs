@@ -107,11 +107,24 @@ pub async fn preview_main(args: PreviewCliArgs) -> Result<()> {
             let poll_art = last_art.clone();
             tokio::spawn(async move {
                 let mut last_mtime = None;
+                let mut js_mtime = None;
+                let mut first = true;
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                     let Some(diag_tx) = watchers.diag_tx(&poll_id) else {
                         break;
                     };
+                    let mtime =
+                        std::fs::metadata(tinymist::tool::preview::overlay_js_path())
+                            .and_then(|m| m.modified())
+                            .ok();
+                    if mtime != js_mtime {
+                        js_mtime = mtime;
+                        if !first {
+                            diag_tx.send_modify(|state| state.asset_version += 1);
+                        }
+                    }
+                    first = false;
                     let Some(art) = poll_art.lock().clone() else {
                         continue;
                     };

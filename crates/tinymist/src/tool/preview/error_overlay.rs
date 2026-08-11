@@ -78,6 +78,9 @@ pub struct OverlayPayload {
     /// The annotations of the current main file, resolved onto the last
     /// successful render.
     pub annotations: Vec<super::annotations::AnnotationPin>,
+    /// Bumped when a dev asset (the overlay script) changes on disk; the
+    /// frontend reloads the page when it sees a new version.
+    pub asset_version: u64,
 }
 
 /// The vertical extent of a block on a page.
@@ -108,6 +111,7 @@ impl Default for OverlayPayload {
             smart_invert: false,
             doc_dark: None,
             annotations: vec![],
+            asset_version: 0,
         }
     }
 }
@@ -476,6 +480,7 @@ pub fn diagnostics_payload(
         smart_invert: false,
         doc_dark: None,
         annotations: vec![],
+        asset_version: 0,
     }
 }
 
@@ -485,4 +490,9 @@ pub fn diagnostics_payload(
 /// be edited without rebuilding (served per request via `/dev/overlay.js`).
 pub fn overlay_js() -> String {
     super::annotations::dev_asset("error_overlay.js", include_str!("error_overlay.js"))
+}
+
+/// The source-tree path of the overlay script, for dev asset watching.
+pub fn overlay_js_path() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tool/preview/error_overlay.js")
 }

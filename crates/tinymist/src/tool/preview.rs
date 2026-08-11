@@ -6,8 +6,8 @@ pub use annotations::{
 };
 
 pub use error_overlay::{
-    cursor_overlay, diagnostics_payload, doc_is_dark, overlay_js, BlockExtent, DiagRx, DiagTx,
-    OverlayPayload,
+    cursor_overlay, diagnostics_payload, doc_is_dark, overlay_js, overlay_js_path, BlockExtent,
+    DiagRx, DiagTx, OverlayPayload,
 };
 pub use http::{make_http_server, HttpServer};
 
@@ -576,11 +576,25 @@ impl PreviewState {
             let poll_art = last_art.clone();
             self.client.handle.spawn(async move {
                 let mut last_mtime = None;
+                let mut js_mtime = None;
+                let mut first = true;
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                     let Some(diag_tx) = watchers.diag_tx(&poll_id) else {
                         break;
                     };
+                    // Dev asset watching: reload connected pages when the
+                    // overlay script changes on disk.
+                    let mtime = std::fs::metadata(error_overlay::overlay_js_path())
+                        .and_then(|m| m.modified())
+                        .ok();
+                    if mtime != js_mtime {
+                        js_mtime = mtime;
+                        if !first {
+                            diag_tx.send_modify(|state| state.asset_version += 1);
+                        }
+                    }
+                    first = false;
                     let Some(art) = poll_art.lock().clone() else {
                         continue;
                     };

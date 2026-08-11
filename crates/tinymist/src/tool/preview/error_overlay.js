@@ -411,6 +411,68 @@
     },
     true,
   );
+  let assetVersion = null;
+  // Off-screen annotations stack at the right edge — pins whose anchors
+  // have scrolled past the top stick in a column at the top-right, ones
+  // below the viewport at the bottom-right — so every annotation in the
+  // document stays reachable.
+  const STACK_ID = "tinymist-annot-stacks";
+  const stackSquare = (pin) => {
+    const done = pin.status === "resolved";
+    const el = document.createElement("button");
+    el.textContent = pin.letter || "?";
+    el.title = (pin.author ? pin.author + ": " : "") + (pin.content || "");
+    el.style.cssText =
+      "pointer-events:auto;display:block;min-width:22px;height:20px;padding:0 4px;" +
+      "border-radius:4px;cursor:pointer;font:11px ui-monospace,monospace;color:white;" +
+      "border:1px solid " + (done ? "rgb(90,90,90)" : "rgb(138,90,0)") + ";" +
+      "background:" + (done ? "rgb(150,150,150)" : "rgb(245,166,35)") + ";" +
+      (pin.status === "ongoing" ? "opacity:0.55;" : "");
+    el.onclick = (ev) => {
+      ev.stopPropagation();
+      showAnnot(pin);
+    };
+    return el;
+  };
+  const updateStacks = () => {
+    let host = document.getElementById(STACK_ID);
+    if (!host) {
+      host = document.createElement("div");
+      host.id = STACK_ID;
+      host.style.cssText =
+        "position:fixed;inset:0;pointer-events:none;z-index:2147483645";
+      document.body.appendChild(host);
+    }
+    host.replaceChildren();
+    const list = (lastData && lastData.annotations) || [];
+    if (!list.length) return;
+    const pages = Array.from(findPages());
+    const above = [];
+    const below = [];
+    for (const pin of list) {
+      const page = pages[pin.page - 1];
+      if (!(page instanceof SVGGraphicsElement)) continue;
+      const ctm = page.getScreenCTM();
+      if (!ctm) continue;
+      const p = new DOMPoint(pin.x, pin.y).matrixTransform(ctm);
+      if (p.y < 32) above.push([p.y, pin]);
+      else if (p.y > window.innerHeight - 32) below.push([p.y, pin]);
+    }
+    const mkColumn = (items, fromTop) => {
+      if (!items.length) return;
+      const col = document.createElement("div");
+      col.style.cssText =
+        "position:absolute;right:10px;display:flex;flex-direction:column;gap:4px;" +
+        (fromTop ? "top:10px" : "bottom:10px");
+      items.sort((a, b) => a[0] - b[0]);
+      for (const [, pin] of items) col.appendChild(stackSquare(pin));
+      host.appendChild(col);
+    };
+    mkColumn(above, true);
+    mkColumn(below, false);
+  };
+  document.addEventListener("scroll", updateStacks, { capture: true, passive: true });
+  window.addEventListener("resize", updateStacks);
   const render = (data) => {
     lastData = data;
     clear();
@@ -532,14 +594,25 @@
     childList: true,
     subtree: true,
   });
-  setInterval(ensure, 1000);
+  setInterval(() => {
+    ensure();
+    updateStacks();
+  }, 1000);
   const connect = () => {
     const es = new EventSource("/dev/diagnostics");
     es.onmessage = (ev) => {
       try {
         const data = JSON.parse(ev.data);
+        // Dev asset auto-reload: the server bumps assetVersion when the
+        // overlay script changes on disk.
+        if (assetVersion === null) assetVersion = data.assetVersion || 0;
+        else if ((data.assetVersion || 0) !== assetVersion) {
+          location.reload();
+          return;
+        }
         updateSmartInvert(data);
         render(data);
+        updateStacks();
       } catch (e) {
         console.warn("tinymist overlay:", e);
       }
