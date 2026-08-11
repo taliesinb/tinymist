@@ -183,6 +183,8 @@ pub trait AnnotationServer: Send + Sync {
     fn reply(&self, uuid: &str, text: &str) -> Result<(), String>;
     /// Sets an annotation's status.
     fn set_status(&self, uuid: &str, status: &str) -> Result<(), String>;
+    /// Resolves a click to the exact would-be anchor position.
+    fn probe(&self, page: usize, x: f64, y: f64) -> Result<ProbeResult, String>;
 }
 
 /// The document anchor text for a uuid, e.g. `<-7C42->`.
@@ -710,23 +712,38 @@ fn best_effort_patch(
     None
 }
 
-/// Prepares the edits creating an annotation at a clicked position: an
-/// anchor label insertion at the end of the clicked word, and a new sidecar
-/// entry.
-pub fn prepare_annotate(
+/// The resolved would-be anchor of a click, as returned by the probe
+/// endpoint: the exact caret position where the anchor label would land.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProbeResult {
+    /// The 1-based page number.
+    pub page: usize,
+    /// The x coordinate of the would-be anchor, in pt.
+    pub x: f64,
+    /// The y coordinate of the would-be anchor, in pt.
+    pub y: f64,
+}
+
+/// Resolves a click to the source position where an anchor label would be
+/// inserted: the end of the clicked word. Errors when the click does not
+/// hit markup text (margins, whitespace past the end of the document, math,
+/// generated content).
+fn resolve_click(
     art: &LspCompiledArtifact,
-    req: &AnnotateRequest,
-    encoding: PositionEncoding,
-) -> Result<AnnotationEdit, String> {
+    page_no: usize,
+    x: f64,
+    y: f64,
+) -> Result<(typst::syntax::FileId, typst::syntax::Source, usize), String> {
     let world = art.world();
     let Some(TypstDocument::Paged(doc)) = art.success_doc() else {
         return Err("no rendered document".into());
     };
     let page = doc
         .pages()
-        .get(req.page.checked_sub(1).ok_or("bad page")?)
+        .get(page_no.checked_sub(1).ok_or("bad page")?)
         .ok_or("no such page")?;
-    let click = Point::new(Abs::pt(req.x), Abs::pt(req.y));
+    let click = Point::new(Abs::pt(x), Abs::pt(y));
     let (start, _) =
         jump_from_click(world, &page.frame, click).ok_or("no text under the click")?;
     let id = start.span.id().ok_or("clicked text has no source")?;
@@ -746,6 +763,40 @@ pub fn prepare_annotate(
             _ => break,
         }
     }
+    Ok((id, source, at))
+}
+
+/// Resolves a click to the exact would-be anchor position, without editing
+/// anything.
+pub fn probe_annotate(
+    art: &LspCompiledArtifact,
+    page_no: usize,
+    x: f64,
+    y: f64,
+) -> Result<ProbeResult, String> {
+    let (_, source, at) = resolve_click(art, page_no, x, y)?;
+    let Some(TypstDocument::Paged(paged)) = art.success_doc() else {
+        return Err("no rendered document".into());
+    };
+    let pos = exact_anchor_position(&paged, &source, at)
+        .ok_or("cannot resolve the anchor position")?;
+    Ok(ProbeResult {
+        page: pos.page.into(),
+        x: pos.point.x.to_pt(),
+        y: pos.point.y.to_pt(),
+    })
+}
+
+/// Prepares the edits creating an annotation at a clicked position: an
+/// anchor label insertion at the end of the clicked word, and a new sidecar
+/// entry.
+pub fn prepare_annotate(
+    art: &LspCompiledArtifact,
+    req: &AnnotateRequest,
+    encoding: PositionEncoding,
+) -> Result<AnnotationEdit, String> {
+    let world = art.world();
+    let (id, source, at) = resolve_click(art, req.page, req.x, req.y)?;
 
     let path = world.path_for_id(id).map_err(|e| e.to_string())?;
     let path = path.to_err().map_err(|e| e.to_string())?;

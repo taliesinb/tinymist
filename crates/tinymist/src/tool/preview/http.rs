@@ -166,6 +166,38 @@ pub async fn make_http_server(
                                 .set_status(&req.uuid, &req.status)
                                 .map(|()| String::new())
                         }),
+                        "/dev/annotate/probe" => {
+                            #[derive(serde::Deserialize)]
+                            struct ProbeReq {
+                                page: usize,
+                                x: f64,
+                                y: f64,
+                            }
+                            let outcome = serde_json::from_slice::<ProbeReq>(&body)
+                                .map_err(|e| e.to_string())
+                                .and_then(|req| annot.probe(req.page, req.x, req.y));
+                            let (status, body) = match outcome {
+                                Ok(pos) => (
+                                    hyper::StatusCode::OK,
+                                    serde_json::json!({
+                                        "ok": true,
+                                        "page": pos.page, "x": pos.x, "y": pos.y,
+                                    })
+                                    .to_string(),
+                                ),
+                                Err(err) => (
+                                    hyper::StatusCode::BAD_REQUEST,
+                                    serde_json::json!({ "ok": false, "error": err })
+                                        .to_string(),
+                                ),
+                            };
+                            let res = hyper::Response::builder()
+                                .status(status)
+                                .header(hyper::header::CONTENT_TYPE, "application/json")
+                                .body(Body::new(Full::<Bytes>::from(body)))
+                                .unwrap();
+                            return Ok(res);
+                        }
                         _ => Err(format!("unknown annotation endpoint: {path}")),
                     };
                     let (status, body) = match outcome {

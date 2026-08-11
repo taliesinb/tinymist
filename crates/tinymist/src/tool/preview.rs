@@ -917,6 +917,10 @@ impl AnnotationServer for LspAnnotationServer {
         let (path, content) = annotations::prepare_status(&art, uuid, status)?;
         self.write_sidecar(&path, &content)
     }
+
+    fn probe(&self, page: usize, x: f64, y: f64) -> Result<annotations::ProbeResult, String> {
+        annotations::probe_annotate(&self.art()?, page, x, y)
+    }
 }
 
 /// Serves preview annotation requests for the standalone CLI preview,
@@ -1034,6 +1038,10 @@ impl AnnotationServer for DiskAnnotationServer {
             "status": status,
         }));
         Ok(())
+    }
+
+    fn probe(&self, page: usize, x: f64, y: f64) -> Result<annotations::ProbeResult, String> {
+        annotations::probe_annotate(&self.art()?, page, x, y)
     }
 }
 

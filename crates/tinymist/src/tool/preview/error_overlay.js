@@ -115,6 +115,7 @@
   const closeAnnotBox = () => {
     const box = document.getElementById(ANNOT_BOX_ID);
     if (box) box.remove();
+    if (typeof clearProbeCaret === "function") clearProbeCaret();
     if (annotEscHandler) {
       document.removeEventListener("keydown", annotEscHandler, true);
       annotEscHandler = null;
@@ -128,14 +129,11 @@
       "position:fixed;z-index:2147483647;background:#2b2b2b;color:#eee;" +
       "border:1px solid #f5a623;border-radius:6px;padding:8px;width:260px;" +
       "font:13px/1.4 system-ui,sans-serif;box-shadow:0 4px 16px rgba(0,0,0,0.4)";
-    if (clientX == null) {
-      // Docked: always the same predictable spot, bottom-right corner.
-      box.style.right = "12px";
-      box.style.bottom = "12px";
-    } else {
-      box.style.left = Math.max(Math.min(clientX, window.innerWidth - 280), 4) + "px";
-      box.style.top = Math.max(Math.min(clientY + 8, window.innerHeight - 170), 4) + "px";
-    }
+    // Docked: always the same predictable spot, bottom-left corner.
+    void clientX;
+    void clientY;
+    box.style.left = "12px";
+    box.style.bottom = "12px";
     // Keep keystrokes inside the box: the preview binds document-level
     // shortcuts (h/j/k scrolling etc.) that must not fire while typing.
     for (const type of ["keydown", "keyup", "keypress"]) {
@@ -170,6 +168,31 @@
     const h = Math.floor(m / 60);
     if (h < 24) return h + "h" + (m % 60 ? (m % 60) + "m" : "") + " ago";
     return Math.floor(h / 24) + "d ago";
+  };
+  const postJson = (path, payload) =>
+    fetch(path, { method: "POST", body: JSON.stringify(payload) })
+      .then((r) => r.json())
+      .catch((e) => ({ ok: false, error: String(e) }));
+  // A preview caret marking where a new annotation's anchor would land,
+  // shown while the compose box is open.
+  const PROBE_CLASS = "tinymist-probe-caret";
+  const clearProbeCaret = () =>
+    document.querySelectorAll("." + PROBE_CLASS).forEach((el) => el.remove());
+  const drawProbeCaret = (pageNo, x, y) => {
+    clearProbeCaret();
+    const page = Array.from(findPages())[pageNo - 1];
+    if (!(page instanceof SVGGraphicsElement)) return;
+    const caret = document.createElementNS(SVG_NS, "path");
+    caret.setAttribute("class", PROBE_CLASS);
+    caret.setAttribute(
+      "d",
+      `M ${x - 2.2} ${y - 8.5} h 4.4 M ${x} ${y - 8.5} v 10 M ${x - 2.2} ${y + 1.5} h 4.4`,
+    );
+    caret.setAttribute("stroke", "rgb(245,166,35)");
+    caret.setAttribute("stroke-width", "1.4");
+    caret.setAttribute("stroke-linecap", "round");
+    caret.setAttribute("fill", "none");
+    page.appendChild(caret);
   };
   const linkButton = (label, color) => {
     const btn = document.createElement("button");
@@ -248,9 +271,19 @@
     close.onclick = closeAnnotBox;
     strip.append(reply, toggle, del, close);
     box.append(ta, strip);
+    ta.focus();
   };
-  const composeAnnot = (pageNo, px, py, clientX, clientY) => {
-    const box = annotBox(clientX, clientY);
+  const composeAnnot = (pageNo, px, py) => {
+    postJson("/dev/annotate/probe", { page: pageNo, x: px, y: py }).then((probe) => {
+      if (!probe.ok) return; // margin, past the end, or non-text: nothing to anchor
+      // Open first: opening replaces any previous box, which also clears
+      // the previous probe caret.
+      openCompose(pageNo, px, py);
+      drawProbeCaret(probe.page, probe.x, probe.y);
+    });
+  };
+  const openCompose = (pageNo, px, py) => {
+    const box = annotBox(null, null);
     // The whole box is the text field; save/cancel float in its bottom-left.
     box.style.padding = "0";
     const ta = document.createElement("textarea");
@@ -374,7 +407,9 @@
       if (
         ev.target &&
         ev.target.closest &&
-        ev.target.closest("." + OVERLAY_CLASS + ", #tinymist-annot-box")
+        ev.target.closest(
+          "." + OVERLAY_CLASS + ", #tinymist-annot-box, #tinymist-annot-stacks",
+        )
       ) {
         return;
       }
@@ -407,7 +442,7 @@
       ev.preventDefault();
       ev.stopImmediatePropagation();
       const pt = new DOMPoint(ev.clientX, ev.clientY).matrixTransform(ctm.inverse());
-      composeAnnot(pageNo, pt.x, pt.y, ev.clientX, ev.clientY);
+      composeAnnot(pageNo, pt.x, pt.y);
     },
     true,
   );
@@ -430,9 +465,23 @@
       (pin.status === "ongoing" ? "opacity:0.55;" : "");
     el.onclick = (ev) => {
       ev.stopPropagation();
+      scrollToPin(pin);
       showAnnot(pin);
     };
     return el;
+  };
+  const scrollToPin = (pin) => {
+    const page = Array.from(findPages())[pin.page - 1];
+    if (!(page instanceof SVGGraphicsElement)) return;
+    const ctm = page.getScreenCTM();
+    if (!ctm) return;
+    const p = new DOMPoint(pin.x, pin.y).matrixTransform(ctm);
+    // Find the scroll container (programmatic scrollTo is muted in annotate
+    // mode, so adjust scrollTop directly).
+    let sc = page.parentElement;
+    while (sc && !(sc.scrollHeight > sc.clientHeight + 10)) sc = sc.parentElement;
+    sc = sc || document.scrollingElement;
+    sc.scrollTop += p.y - window.innerHeight / 2;
   };
   const updateStacks = () => {
     let host = document.getElementById(STACK_ID);
