@@ -2,8 +2,9 @@
 
 pub use compile::{PreviewCompileView, ProjectPreviewHandler};
 pub use annotations::{
-    annotation_pins, AnnotateRequest, AnnotationPin, AnnotationServer,
+    annotation_pins, sidecar_path, AnnotateRequest, AnnotationPin, AnnotationServer,
 };
+
 pub use error_overlay::{
     cursor_overlay, diagnostics_payload, doc_is_dark, overlay_js, BlockExtent, DiagRx, DiagTx,
     OverlayPayload,
@@ -250,6 +251,12 @@ pub struct PreviewCliArgs {
     /// Emit INFO level logging. The default is WARN.
     #[clap(long = "verbose")]
     pub verbose: bool,
+
+    /// Open the preview in annotation mode: the web view is locked to
+    /// reading and writing annotations (plain click annotates; no editor
+    /// following or click-to-jump).
+    #[clap(long = "annotate")]
+    pub annotate: bool,
 }
 
 impl PreviewCliArgs {
@@ -895,6 +902,90 @@ impl AnnotationServer for LspAnnotationServer {
         let art = self.art()?;
         let (path, content) = annotations::prepare_status(&art, label, status)?;
         self.write_sidecar(&path, &content)
+    }
+}
+
+/// Serves preview annotation requests for the standalone CLI preview,
+/// which has no editor: all edits are written to disk directly (the CLI's
+/// world compiles from disk, so its sources cannot diverge except for a
+/// brief window after an external change, which the best-effort patch
+/// covers).
+pub struct DiskAnnotationServer {
+    /// The most recent compiled artifact.
+    pub last_art: Arc<parking_lot::Mutex<Option<tinymist_project::LspCompiledArtifact>>>,
+    /// The preview watchers holding the SSE diagnostics channel.
+    pub watchers: ProjectPreviewState,
+    /// The project instance id.
+    pub project_id: ProjectInsId,
+}
+
+impl DiskAnnotationServer {
+    fn art(&self) -> Result<tinymist_project::LspCompiledArtifact, String> {
+        self.last_art
+            .lock()
+            .clone()
+            .ok_or_else(|| "no compiled artifact yet".to_owned())
+    }
+
+    fn push_pins(&self) {
+        if let (Ok(art), Some(diag_tx)) = (self.art(), self.watchers.diag_tx(&self.project_id)) {
+            let pins = annotations::annotation_pins(&art);
+            diag_tx.send_modify(|state| state.annotations = pins);
+        }
+    }
+
+    fn apply(&self, edit: &annotations::AnnotationEdit) -> Result<(), String> {
+        std::fs::write(&edit.sidecar, &edit.sidecar_content)
+            .map_err(|e| format!("failed to write {}: {e}", edit.sidecar.display()))?;
+        let content = edit
+            .disk_content
+            .as_ref()
+            .ok_or("cannot apply the edit: the file has diverged on disk")?;
+        std::fs::write(&edit.path, content)
+            .map_err(|e| format!("failed to write {}: {e}", edit.path.display()))?;
+        self.push_pins();
+        Ok(())
+    }
+}
+
+impl AnnotationServer for DiskAnnotationServer {
+    fn annotate(&self, req: annotations::AnnotateRequest) -> Result<String, String> {
+        let art = self.art()?;
+        let edit = annotations::prepare_annotate(
+            &art,
+            &req,
+            tinymist_query::PositionEncoding::Utf16,
+        )?;
+        self.apply(&edit)?;
+        Ok(edit.label)
+    }
+
+    fn remove(&self, label: &str) -> Result<(), String> {
+        let art = self.art()?;
+        let edit = annotations::prepare_delete(
+            &art,
+            label,
+            tinymist_query::PositionEncoding::Utf16,
+        )?;
+        self.apply(&edit)
+    }
+
+    fn reply(&self, label: &str, text: &str) -> Result<(), String> {
+        let art = self.art()?;
+        let (path, content) = annotations::prepare_reply(&art, label, text)?;
+        std::fs::write(&path, &content)
+            .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
+        self.push_pins();
+        Ok(())
+    }
+
+    fn set_status(&self, label: &str, status: &str) -> Result<(), String> {
+        let art = self.art()?;
+        let (path, content) = annotations::prepare_status(&art, label, status)?;
+        std::fs::write(&path, &content)
+            .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
+        self.push_pins();
+        Ok(())
     }
 }
 

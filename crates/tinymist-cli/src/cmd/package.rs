@@ -75,6 +75,7 @@ async fn docs_main(args: PackageDocsArgs) -> Result<()> {
         export_target: ExportTarget::Paged,
         #[cfg(feature = "preview")]
         preview: Default::default(),
+        last_art: Default::default(),
     };
 
     let mut is_first = true;

@@ -97,6 +97,11 @@ enum Commands {
     /// Run preview server
     #[cfg(feature = "preview")]
     Preview(tinymist::tool::preview::PreviewCliArgs),
+    /// Run preview server in annotation mode: the web view is locked to
+    /// reading and writing annotations (plain click annotates; no editor
+    /// following or click-to-jump).
+    #[cfg(feature = "preview")]
+    Annotate(tinymist::tool::preview::PreviewCliArgs),
     /// Run compile command like `typst-cli compile`
     #[cfg(feature = "export")]
     #[clap(alias = "c")]
@@ -166,6 +171,7 @@ fn main() -> Result<()> {
         Commands::Test(test) => test.verbose,
         #[cfg(feature = "preview")]
         Commands::Preview(preview) => preview.verbose,
+        Commands::Annotate(preview) => preview.verbose,
 
         // Long-running commands, usually run from an editor.
         Commands::Lsp(..) => true,
@@ -199,6 +205,10 @@ fn main() -> Result<()> {
         Commands::Query(cmds) => crate::query::query_main(cmds),
         #[cfg(feature = "preview")]
         Commands::Preview(args) => block_on(crate::preview::preview_main(args)),
+        Commands::Annotate(mut args) => {
+            args.annotate = true;
+            block_on(crate::preview::preview_main(args))
+        }
         #[cfg(feature = "export")]
         Commands::Compile(args) => block_on(crate::compile::compile_main(args)),
         Commands::Lint(args) => crate::lint::lint_main(args),

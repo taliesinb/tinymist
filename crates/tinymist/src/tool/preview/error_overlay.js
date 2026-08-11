@@ -1,4 +1,8 @@
 (() => {
+  // Annotation mode (/?annotate): the view is locked to reading and
+  // writing annotations — plain click annotates, and the editor-coupled
+  // behaviors (cursor bar, click-to-jump, follow-scrolling) are muted.
+  const ANNOTATE = new URLSearchParams(location.search).has("annotate");
   const PANEL_ID = "tinymist-error-panel";
   const OVERLAY_CLASS = "tinymist-error-overlay";
   const SVG_NS = "http://www.w3.org/2000/svg";
@@ -80,19 +84,32 @@
       style.id = ALT_STYLE_ID;
       style.textContent =
         "svg.typst-doc, svg.typst-doc * { cursor: text !important; }\n" +
-        "svg.typst-doc * { pointer-events: none !important; }";
+        "svg.typst-doc * { pointer-events: none !important; }\n" +
+        "svg.typst-doc .tinymist-error-overlay, " +
+        "svg.typst-doc .tinymist-error-overlay * " +
+        "{ pointer-events: auto !important; cursor: pointer !important; }";
       document.head.appendChild(style);
     } else if (!on && style) {
       style.remove();
     }
   };
-  window.addEventListener("keydown", (e) => {
-    if (e.key === "Alt") setAltMode(true);
-  });
-  window.addEventListener("keyup", (e) => {
-    if (e.key === "Alt") setAltMode(false);
-  });
-  window.addEventListener("blur", () => setAltMode(false));
+  if (ANNOTATE) {
+    setAltMode(true);
+    // The renderer scrolls the view on editor events (follow-cursor,
+    // jumps); mute all programmatic scrolling in annotation mode.
+    const noop = () => {};
+    Element.prototype.scrollIntoView = noop;
+    Element.prototype.scrollTo = noop;
+    window.scrollTo = noop;
+  } else {
+    window.addEventListener("keydown", (e) => {
+      if (e.key === "Alt") setAltMode(true);
+    });
+    window.addEventListener("keyup", (e) => {
+      if (e.key === "Alt") setAltMode(false);
+    });
+    window.addEventListener("blur", () => setAltMode(false));
+  }
   const ANNOT_BOX_ID = "tinymist-annot-box";
   let annotEscHandler = null;
   const closeAnnotBox = () => {
@@ -353,7 +370,14 @@
   document.addEventListener(
     "click",
     (ev) => {
-      if (!ev.altKey) return;
+      if (!ev.altKey && !ANNOTATE) return;
+      if (
+        ev.target &&
+        ev.target.closest &&
+        ev.target.closest("." + OVERLAY_CLASS + ", #tinymist-annot-box")
+      ) {
+        return;
+      }
       const pages = Array.from(findPages());
       let el =
         ev.target && ev.target.closest
@@ -393,7 +417,7 @@
     lastApplied = 0;
     const pages = findPages();
     lastPageCount = pages.length;
-    if (data.cursor) {
+    if (data.cursor && !ANNOTATE) {
       try {
         drawCursorBlock(pages, data.cursor);
       } catch (e) {

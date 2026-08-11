@@ -45,12 +45,14 @@ pub async fn preview_main(args: PreviewCliArgs) -> Result<()> {
     let verse = args.compile.resolve()?;
     let previewer = PreviewBuilder::new(config);
 
-    let (service, handle, diag_rx) = {
+    let (service, handle, diag_rx, annot) = {
         let preview_state = ProjectPreviewState::default();
+        let last_art = Arc::new(parking_lot::Mutex::default());
         let mut opts = ProjectOpts {
             handle: Some(handle),
             preview: preview_state.clone(),
             export_target: preview_target,
+            last_art: last_art.clone(),
             ..ProjectOpts::default()
         };
         // Propagate `--invert-colors=smart` into the shared config so the
@@ -85,12 +87,51 @@ pub async fn preview_main(args: PreviewCliArgs) -> Result<()> {
         );
         preview_state.register_diag(&id, diag_tx);
 
+        // Annotations: the CLI has no editor, so all annotation edits are
+        // written to disk directly.
+        let annot: Arc<dyn tinymist::tool::preview::AnnotationServer> =
+            Arc::new(tinymist::tool::preview::DiskAnnotationServer {
+                last_art: last_art.clone(),
+                watchers: preview_state.clone(),
+                project_id: id.clone(),
+            });
+
+        // The sidecar is not a compile dependency; poll its mtime so
+        // external edits (e.g. an agent updating a status) refresh the pins.
+        {
+            let watchers = preview_state.clone();
+            let poll_id = id.clone();
+            let poll_art = last_art.clone();
+            tokio::spawn(async move {
+                let mut last_mtime = None;
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    let Some(diag_tx) = watchers.diag_tx(&poll_id) else {
+                        break;
+                    };
+                    let Some(art) = poll_art.lock().clone() else {
+                        continue;
+                    };
+                    let Some(path) = tinymist::tool::preview::sidecar_path(&art) else {
+                        continue;
+                    };
+                    let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+                    if mtime == last_mtime {
+                        continue;
+                    }
+                    last_mtime = mtime;
+                    let pins = tinymist::tool::preview::annotation_pins(&art);
+                    diag_tx.send_modify(|state| state.annotations = pins);
+                }
+            });
+        }
+
         let handle: Arc<ProjectPreviewHandler> = Arc::new(ProjectPreviewHandler {
             project_id: id,
             client: Box::new(intr_tx),
         });
 
-        (service, handle, diag_rx)
+        (service, handle, diag_rx, annot)
     };
 
     let (lsp_tx, mut lsp_rx) = ControlPlaneTx::new(true);
@@ -216,7 +257,7 @@ pub async fn preview_main(args: PreviewCliArgs) -> Result<()> {
                 static_file_host,
                 websocket_tx.clone(),
                 Some(diag_rx.clone()),
-                None,
+                Some(annot.clone()),
             )
             .await,
         )
@@ -230,7 +271,7 @@ pub async fn preview_main(args: PreviewCliArgs) -> Result<()> {
             args.data_plane_host,
             websocket_tx,
             Some(diag_rx),
-            None,
+            Some(annot),
         )
         .await;
     log::info!(
@@ -247,8 +288,9 @@ pub async fn preview_main(args: PreviewCliArgs) -> Result<()> {
 
     #[cfg(feature = "open")]
     if open_in_browser {
+        let query = if args.annotate { "/?annotate" } else { "" };
         tinymist::tool::preview::open_preview_url(
-            format!("http://{static_server_addr}"),
+            format!("http://{static_server_addr}{query}"),
             args.open_in.as_deref(),
         );
     }

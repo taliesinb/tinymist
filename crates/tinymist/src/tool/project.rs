@@ -23,6 +23,9 @@ pub struct ProjectOpts {
     pub preview: ProjectPreviewState,
     /// The export target.
     pub export_target: ExportTarget,
+    /// Shared slot for the most recent compiled artifact (used by the
+    /// preview annotation endpoints).
+    pub last_art: Arc<Mutex<Option<tinymist_project::LspCompiledArtifact>>>,
 }
 
 /// Result of starting a project.
@@ -84,7 +87,7 @@ where
         compile_debounce: std::time::Duration::from_millis(opts.config.compile_debounce),
         #[cfg(feature = "preview")]
         smart_invert: opts.config.preview().invert_colors.contains("smart"),
-        last_art: Arc::default(),
+        last_art: opts.last_art.clone(),
         last_edit: Arc::default(),
         #[cfg(feature = "export")]
         export: crate::task::ExportTask::new(handle, Some(editor_tx.clone()), opts.config.export()),
