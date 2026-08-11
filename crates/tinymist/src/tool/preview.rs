@@ -808,7 +808,7 @@ impl LspAnnotationServer {
             // overwrites.
             std::fs::write(&edit.path, content)
                 .map_err(|e| format!("failed to write {}: {e}", edit.path.display()))?;
-            log::info!("annotation {} written to disk: {}", edit.id, edit.path.display());
+            log::info!("annotation {} written to disk: {}", edit.label, edit.path.display());
         }
         if edit.buffer_edit {
             // Unsaved editor changes exist: the authoritative edit goes
@@ -821,7 +821,7 @@ impl LspAnnotationServer {
             let mut changes = std::collections::HashMap::new();
             changes.insert(edit.uri.clone(), vec![text_edit]);
             let params = lsp_types::ApplyWorkspaceEditParams {
-                label: Some(format!("typst annotation {}", edit.id)),
+                label: Some(format!("typst annotation {}", edit.label)),
                 edit: lsp_types::WorkspaceEdit {
                     changes: Some(changes),
                     ..Default::default()
@@ -849,20 +849,50 @@ impl LspAnnotationServer {
     }
 }
 
-impl AnnotationServer for LspAnnotationServer {
-    fn annotate(&self, req: annotations::AnnotateRequest) -> Result<String, String> {
-        let art = self.last_art.lock().clone();
-        let art = art.ok_or("no compiled artifact yet")?;
-        let edit = annotations::prepare_annotate(&art, &req, self.position_encoding)?;
-        self.apply(&edit)?;
-        Ok(edit.id)
+impl LspAnnotationServer {
+    fn art(&self) -> Result<tinymist_project::LspCompiledArtifact, String> {
+        self.last_art
+            .lock()
+            .clone()
+            .ok_or_else(|| "no compiled artifact yet".to_owned())
     }
 
-    fn remove(&self, id: &str) -> Result<(), String> {
-        let art = self.last_art.lock().clone();
-        let art = art.ok_or("no compiled artifact yet")?;
-        let edit = annotations::prepare_delete(&art, id, self.position_encoding)?;
+    /// Writes a sidecar-only change and pushes refreshed pins over SSE.
+    fn write_sidecar(&self, path: &Path, content: &str) -> Result<(), String> {
+        std::fs::write(path, content)
+            .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
+        if let (Ok(art), Some(diag_tx)) = (self.art(), self.watchers.diag_tx(&self.project_id)) {
+            let pins = annotations::annotation_pins(&art);
+            diag_tx.send_modify(|state| state.annotations = pins);
+        }
+        Ok(())
+    }
+}
+
+impl AnnotationServer for LspAnnotationServer {
+    fn annotate(&self, req: annotations::AnnotateRequest) -> Result<String, String> {
+        let art = self.art()?;
+        let edit = annotations::prepare_annotate(&art, &req, self.position_encoding)?;
+        self.apply(&edit)?;
+        Ok(edit.label)
+    }
+
+    fn remove(&self, label: &str) -> Result<(), String> {
+        let art = self.art()?;
+        let edit = annotations::prepare_delete(&art, label, self.position_encoding)?;
         self.apply(&edit)
+    }
+
+    fn reply(&self, label: &str, text: &str) -> Result<(), String> {
+        let art = self.art()?;
+        let (path, content) = annotations::prepare_reply(&art, label, text)?;
+        self.write_sidecar(&path, &content)
+    }
+
+    fn set_status(&self, label: &str, status: &str) -> Result<(), String> {
+        let art = self.art()?;
+        let (path, content) = annotations::prepare_status(&art, label, status)?;
+        self.write_sidecar(&path, &content)
     }
 }
 

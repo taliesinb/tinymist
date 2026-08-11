@@ -619,32 +619,79 @@ pub const ERROR_OVERLAY_JS: &str = r#"
         if (!r.ok) console.warn("tinymist annotation:", r.error);
       })
       .catch((e) => console.warn("tinymist annotation:", e));
+  const linkButton = (label, color) => {
+    const btn = document.createElement("button");
+    btn.textContent = label;
+    btn.style.cssText =
+      "background:none;border:none;padding:0;cursor:pointer;font:12px system-ui,sans-serif;" +
+      "color:" + color;
+    return btn;
+  };
   const showAnnot = (pin, x, y) => {
     const box = annotBox(x, y);
-    const text = document.createElement("div");
-    text.style.cssText = "white-space:pre-wrap;margin-bottom:6px";
-    text.textContent = pin.text;
     const meta = document.createElement("div");
     meta.style.cssText = "color:#999;font-size:11px;margin-bottom:6px";
-    const when = pin.created ? new Date(pin.created * 1000).toLocaleString() : "";
-    meta.textContent =
-      pin.id + (when ? " · " + when : "") + (pin.completed ? " · completed" : "");
-    const del = document.createElement("button");
-    del.textContent = "Delete";
-    del.style.cssText =
-      "background:#5a2a2a;color:#ffb4b4;border:1px solid #a33;border-radius:4px;" +
-      "padding:2px 10px;cursor:pointer";
-    del.onclick = () => {
-      post("/dev/annotate/delete", { id: pin.id });
+    meta.textContent = [pin.type, pin.author, pin.time, pin.status]
+      .filter(Boolean)
+      .join(" · ");
+    const text = document.createElement("div");
+    text.style.cssText = "white-space:pre-wrap;margin-bottom:6px";
+    text.textContent = pin.content;
+    box.append(meta, text);
+    for (const reply of pin.discussion || []) {
+      const rMeta = document.createElement("div");
+      rMeta.style.cssText =
+        "color:#999;font-size:11px;margin:6px 0 2px;padding-top:5px;" +
+        "border-top:1px solid rgba(255,255,255,0.12)";
+      rMeta.textContent = [reply.author, reply.time].filter(Boolean).join(" · ");
+      const rText = document.createElement("div");
+      rText.style.cssText = "white-space:pre-wrap;font-size:12px";
+      rText.textContent = reply.content;
+      box.append(rMeta, rText);
+    }
+    const ta = document.createElement("textarea");
+    ta.rows = 1;
+    ta.placeholder = "Reply…  (⇧⏎ send)";
+    ta.style.cssText =
+      "display:block;width:100%;box-sizing:border-box;background:rgba(255,255,255,0.06);" +
+      "color:#eee;border:none;outline:none;resize:none;border-radius:4px;" +
+      "padding:5px 6px;font:12px/1.4 system-ui,sans-serif;margin:8px 0 6px";
+    const doReply = () => {
+      const text = ta.value.trim();
+      if (text) post("/dev/annotate/reply", { label: pin.label, text });
       closeAnnotBox();
     };
-    const close = document.createElement("button");
-    close.textContent = "Close";
-    close.style.cssText =
-      "background:#333;color:#ddd;border:1px solid #555;border-radius:4px;" +
-      "padding:2px 10px;cursor:pointer;margin-left:8px";
+    ta.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && e.shiftKey) {
+        e.preventDefault();
+        doReply();
+      }
+    });
+    const strip = document.createElement("div");
+    strip.style.cssText = "display:flex;gap:10px";
+    const reply = linkButton("reply", "rgb(123,216,143)");
+    reply.onclick = doReply;
+    const resolved = pin.status === "resolved";
+    const toggle = linkButton(
+      resolved ? "reopen" : "resolve",
+      resolved ? "rgb(245,166,35)" : "rgb(150,180,220)",
+    );
+    toggle.onclick = () => {
+      post("/dev/annotate/status", {
+        label: pin.label,
+        status: resolved ? "created" : "resolved",
+      });
+      closeAnnotBox();
+    };
+    const del = linkButton("delete", "rgb(220,130,130)");
+    del.onclick = () => {
+      post("/dev/annotate/delete", { label: pin.label });
+      closeAnnotBox();
+    };
+    const close = linkButton("close", "rgb(150,150,150)");
     close.onclick = closeAnnotBox;
-    box.append(text, meta, del, close);
+    strip.append(reply, toggle, del, close);
+    box.append(ta, strip);
   };
   const composeAnnot = (pageNo, px, py, clientX, clientY) => {
     const box = annotBox(clientX, clientY);
@@ -660,15 +707,13 @@ pub const ERROR_OVERLAY_JS: &str = r#"
     const doSave = () => {
       const text = ta.value.trim();
       if (text) {
-        // Stamp a short random id (16 bits of entropy); the server falls
+        // Stamp a short random label (16 bits of entropy); the server falls
         // back to its own if this one is taken.
         const rand = crypto.getRandomValues(new Uint8Array(2));
-        const id =
-          "A-" +
-          Array.from(rand, (b) =>
-            b.toString(16).padStart(2, "0").toUpperCase(),
-          ).join("");
-        post("/dev/annotate", { id, page: pageNo, x: px, y: py, text });
+        const label = Array.from(rand, (b) =>
+          b.toString(16).padStart(2, "0").toUpperCase(),
+        ).join("");
+        post("/dev/annotate", { label, page: pageNo, x: px, y: py, text });
       }
       closeAnnotBox();
     };
@@ -709,7 +754,10 @@ pub const ERROR_OVERLAY_JS: &str = r#"
       g.style.cursor = "pointer";
       const cx = pin.pageWidth - 16;
       const cy = pin.y - 4;
-      const done = !!pin.completed;
+      // created = amber, ongoing = faded amber, resolved = gray
+      const done = pin.status === "resolved";
+      const fill = done ? "rgb(150,150,150)" : "rgb(245,166,35)";
+      const edge = done ? "rgb(90,90,90)" : "rgb(138,90,0)";
       const line = document.createElementNS(SVG_NS, "line");
       line.setAttribute("x1", pin.x);
       line.setAttribute("y1", pin.y - 4);
@@ -724,8 +772,9 @@ pub const ERROR_OVERLAY_JS: &str = r#"
       c.setAttribute("cx", cx);
       c.setAttribute("cy", cy);
       c.setAttribute("r", 8);
-      c.setAttribute("fill", done ? "rgb(150,150,150)" : "rgb(245,166,35)");
-      c.setAttribute("stroke", done ? "rgb(90,90,90)" : "rgb(138,90,0)");
+      c.setAttribute("fill", fill);
+      c.setAttribute("stroke", edge);
+      if (pin.status === "ongoing") g.setAttribute("opacity", "0.55");
       c.setAttribute("stroke-width", "0.8");
       const t = document.createElementNS(SVG_NS, "text");
       t.setAttribute("x", cx);

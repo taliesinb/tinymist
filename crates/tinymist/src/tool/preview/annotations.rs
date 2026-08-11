@@ -1,12 +1,13 @@
 //! Preview annotations: comments anchored to document text via labels.
 //!
-//! An annotation is a short label like `<A-E4DE>` inserted into the document
-//! source at the clicked word (through a workspace edit, so it goes through
-//! the editor buffer and is undoable), plus a record holding the comment
-//! text in a sidecar file `<main>.annos.typ` next to the main file.
-//! The rendered position of each annotation is resolved by querying the
-//! compiled document for the label, so anchors survive arbitrary edits
-//! around them.
+//! An annotation is a cursor label like `<-7C42->` inserted into the
+//! document source at the clicked word, plus a structured record in a
+//! sidecar file `<main>.annos.typ` next to the main file (schema documented
+//! in `annos_prelude.typ`, which is stamped at the top of every new
+//! sidecar). The rendered position of each annotation is resolved by
+//! querying the compiled document for the label, so anchors survive
+//! arbitrary edits around them. Records carry an author, ISO 8601 time, a
+//! status, and a discussion thread that agents and the preview UI append to.
 
 use std::path::PathBuf;
 
@@ -23,32 +24,59 @@ use typst::syntax::SyntaxKind;
 use typst::utils::PicoStr;
 use typst::World;
 
+/// The schema documentation stamped at the top of new sidecar files.
+pub const ANNOS_PRELUDE: &str = include_str!("annos_prelude.typ");
+
+/// A reply in an annotation's discussion thread.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnnotationReply {
+    /// The reply author.
+    pub author: String,
+    /// The reply time, ISO 8601 UTC.
+    pub time: String,
+    /// The reply text.
+    pub content: String,
+}
+
 /// A stored annotation record from the sidecar file.
 #[derive(Debug, Clone)]
 pub struct AnnotationRecord {
-    /// The annotation id, which is also the label name in the document.
-    pub id: String,
-    /// The comment text.
-    pub text: String,
-    /// Creation time, in seconds since the unix epoch.
-    pub created: u64,
-    /// Whether the annotation has been addressed. Agents flip this to true
-    /// in the sidecar; completed annotations render grayed out.
-    pub completed: bool,
+    /// The annotation kind: "comment" | "question" | "request".
+    pub rtype: String,
+    /// The short label, e.g. "7C42"; the document anchor is `<-7C42->`.
+    pub label: String,
+    /// The author of the annotation.
+    pub author: String,
+    /// The message.
+    pub content: String,
+    /// Creation time, ISO 8601 UTC.
+    pub time: String,
+    /// The status: "created" | "ongoing" | "resolved".
+    pub status: String,
+    /// The discussion thread, in order.
+    pub discussion: Vec<AnnotationReply>,
 }
 
 /// An annotation resolved onto the rendered document, sent to the frontend.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AnnotationPin {
-    /// The annotation id.
-    pub id: String,
-    /// The comment text.
-    pub text: String,
-    /// Creation time, in seconds since the unix epoch.
-    pub created: u64,
-    /// Whether the annotation has been addressed.
-    pub completed: bool,
+    /// The annotation kind.
+    #[serde(rename = "type")]
+    pub rtype: String,
+    /// The short label.
+    pub label: String,
+    /// The author.
+    pub author: String,
+    /// The message.
+    pub content: String,
+    /// Creation time, ISO 8601 UTC.
+    pub time: String,
+    /// The status.
+    pub status: String,
+    /// The discussion thread.
+    pub discussion: Vec<AnnotationReply>,
     /// The 1-based page number.
     pub page: usize,
     /// The x coordinate of the anchor, in pt.
@@ -65,11 +93,11 @@ pub struct AnnotationPin {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AnnotateRequest {
-    /// A client-suggested id, e.g. `A-E4DE` (random 16-bit suffix stamped by
+    /// A client-suggested label, e.g. `7C42` (random 16-bit hex stamped by
     /// the browser). Used verbatim when valid and free; otherwise the server
     /// generates one.
     #[serde(default)]
-    pub id: Option<String>,
+    pub label: Option<String>,
     /// The 1-based page number.
     pub page: usize,
     /// The x coordinate of the click, in pt.
@@ -88,8 +116,8 @@ pub struct AnnotateRequest {
 /// written on disk.
 #[derive(Debug, Clone)]
 pub struct AnnotationEdit {
-    /// The annotation id.
-    pub id: String,
+    /// The annotation label.
+    pub label: String,
     /// The uri of the source file to edit.
     pub uri: Url,
     /// The path of the source file to edit.
@@ -109,6 +137,324 @@ pub struct AnnotationEdit {
     pub sidecar: PathBuf,
     /// The new full content of the sidecar file.
     pub sidecar_content: String,
+}
+
+/// The server-side annotation API exposed to the preview http server.
+pub trait AnnotationServer: Send + Sync {
+    /// Creates an annotation at a clicked position. Returns the new label.
+    fn annotate(&self, req: AnnotateRequest) -> Result<String, String>;
+    /// Deletes an annotation by label.
+    fn remove(&self, label: &str) -> Result<(), String>;
+    /// Appends a reply to an annotation's discussion.
+    fn reply(&self, label: &str, text: &str) -> Result<(), String>;
+    /// Sets an annotation's status.
+    fn set_status(&self, label: &str, status: &str) -> Result<(), String>;
+}
+
+/// The document anchor text for a label, e.g. `<-7C42->`.
+fn anchor_text(label: &str) -> String {
+    format!("<-{label}->")
+}
+
+/// The label name queried in the compiled document, e.g. `-7C42-`.
+fn anchor_name(label: &str) -> String {
+    format!("-{label}-")
+}
+
+/// The sidecar path for the current main file, e.g. `typing.annos.typ`
+/// next to `typing.typ`.
+pub fn sidecar_path(art: &LspCompiledArtifact) -> Option<PathBuf> {
+    let world = art.world();
+    let main = world.main();
+    let path = world.path_for_id(main).ok()?.to_err().ok()?;
+    let stem = path.file_stem()?.to_string_lossy().into_owned();
+    Some(path.with_file_name(format!("{stem}.annos.typ")))
+}
+
+fn escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
+}
+
+fn unescape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some(other) => out.push(other),
+            None => {}
+        }
+    }
+    out
+}
+
+/// Reads a typst string literal starting at `s` (which must begin with a
+/// quote), returning the raw escaped content and the rest.
+fn read_string(s: &str) -> Option<(&str, &str)> {
+    let s = s.trim_start().strip_prefix('"')?;
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2,
+            b'"' => return Some((&s[..i], &s[i + 1..])),
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+fn read_field<'a>(block: &'a str, key: &str) -> Option<&'a str> {
+    let at = block.find(&format!("{key}: "))?;
+    Some(&block[at + key.len() + 2..])
+}
+
+fn read_string_field(block: &str, key: &str) -> Option<String> {
+    read_field(block, key)
+        .and_then(read_string)
+        .map(|(raw, _)| unescape(raw))
+}
+
+/// Parses the discussion segment of an entry block: everything after
+/// `discussion:`, as a sequence of (author, time, content) groups.
+fn parse_discussion(block: &str) -> Vec<AnnotationReply> {
+    let Some(mut rest) = read_field(block, "discussion") else {
+        return vec![];
+    };
+    let mut replies = vec![];
+    while let Some(at) = rest.find("author: ") {
+        let seg = &rest[at..];
+        let author = read_string_field(seg, "author");
+        let time = read_string_field(seg, "time");
+        let content = read_string_field(seg, "content");
+        if let (Some(author), Some(time), Some(content)) = (author, time, content) {
+            replies.push(AnnotationReply {
+                author,
+                time,
+                content,
+            });
+        }
+        rest = &seg["author: ".len()..];
+    }
+    replies
+}
+
+/// One parsed sidecar entry: its byte span in the file and its record.
+struct ParsedEntry {
+    span: std::ops::Range<usize>,
+    record: AnnotationRecord,
+}
+
+/// Parses the sidecar file into entries with their byte spans. Only entries
+/// in the format written by [`format_record`] are recognized.
+fn parse_entries(content: &str) -> Vec<ParsedEntry> {
+    let mut entries = vec![];
+    let mut at = 0;
+    while let Some(rel) = content[at..].find("#metadata((") {
+        let start = at + rel;
+        let block_start = start + "#metadata((".len();
+        // The entry ends at the label after the closing `))`.
+        let Some(close_rel) = content[block_start..].find("))") else {
+            break;
+        };
+        let close = block_start + close_rel;
+        let tail = &content[close..];
+        let end_rel = tail
+            .find(">\n")
+            .map(|e| e + 2)
+            .or_else(|| tail.find('>').map(|e| e + 1))
+            .unwrap_or(0);
+        let end = close + end_rel.max(2);
+        let block = &content[block_start..close];
+        at = end;
+
+        // The discussion field contains nested dicts, so cut the top-level
+        // fields off before it to avoid reading reply fields.
+        let head = block
+            .find("discussion:")
+            .map(|d| &block[..d])
+            .unwrap_or(block);
+        let label = read_string_field(head, "label");
+        let content_field = read_string_field(head, "content");
+        let Some(label) = label else { continue };
+        let Some(content_field) = content_field else {
+            continue;
+        };
+        entries.push(ParsedEntry {
+            span: start..end,
+            record: AnnotationRecord {
+                rtype: read_string_field(head, "type").unwrap_or_else(|| "comment".into()),
+                label,
+                author: read_string_field(head, "author").unwrap_or_else(|| "unknown".into()),
+                content: content_field,
+                time: read_string_field(head, "time").unwrap_or_default(),
+                status: read_string_field(head, "status").unwrap_or_else(|| "created".into()),
+                discussion: parse_discussion(block),
+            },
+        });
+    }
+    entries
+}
+
+/// Parses the sidecar file content into annotation records.
+pub fn parse_records(content: &str) -> Vec<AnnotationRecord> {
+    parse_entries(content)
+        .into_iter()
+        .map(|entry| entry.record)
+        .collect()
+}
+
+/// Formats one annotation record as a sidecar entry.
+pub fn format_record(rec: &AnnotationRecord) -> String {
+    let mut out = String::new();
+    out.push_str("#metadata((\n");
+    out.push_str(&format!("  type: \"{}\",\n", escape(&rec.rtype)));
+    out.push_str(&format!("  label: \"{}\",\n", escape(&rec.label)));
+    out.push_str(&format!("  author: \"{}\",\n", escape(&rec.author)));
+    out.push_str(&format!("  content: \"{}\",\n", escape(&rec.content)));
+    out.push_str(&format!("  time: \"{}\",\n", escape(&rec.time)));
+    out.push_str(&format!("  status: \"{}\",\n", escape(&rec.status)));
+    if rec.discussion.is_empty() {
+        out.push_str("  discussion: (),\n");
+    } else {
+        out.push_str("  discussion: (\n");
+        for reply in &rec.discussion {
+            out.push_str("    (\n");
+            out.push_str(&format!("      author: \"{}\",\n", escape(&reply.author)));
+            out.push_str(&format!("      time: \"{}\",\n", escape(&reply.time)));
+            out.push_str(&format!("      content: \"{}\",\n", escape(&reply.content)));
+            out.push_str("    ),\n");
+        }
+        out.push_str("  ),\n");
+    }
+    out.push_str(&format!(")) <note-{}>\n", rec.label));
+    out
+}
+
+fn read_sidecar(path: &std::path::Path) -> (Vec<AnnotationRecord>, String) {
+    match std::fs::read_to_string(path) {
+        Ok(content) => {
+            let records = parse_records(&content);
+            (records, content)
+        }
+        Err(_) => (vec![], ANNOS_PRELUDE.to_owned()),
+    }
+}
+
+/// Resolves all annotations of the current main file onto the last
+/// successful render.
+pub fn annotation_pins(art: &LspCompiledArtifact) -> Vec<AnnotationPin> {
+    let Some(sidecar) = sidecar_path(art) else {
+        return vec![];
+    };
+    let (records, _) = read_sidecar(&sidecar);
+    if records.is_empty() {
+        return vec![];
+    }
+    let Some(doc) = art.success_doc() else {
+        return vec![];
+    };
+    let TypstDocument::Paged(paged) = &doc else {
+        return vec![];
+    };
+    let introspector = doc.introspector();
+    records
+        .iter()
+        .filter_map(|rec| {
+            let label = Label::new(PicoStr::intern(&anchor_name(&rec.label)))?;
+            let elem = introspector.query_label(label).ok()?;
+            let loc = elem.location()?;
+            let pos: PagedPosition = introspector.position(loc)?.as_paged_or_default();
+            let page_no: usize = pos.page.into();
+            let size = paged.pages().get(page_no - 1)?.frame.size();
+            Some(AnnotationPin {
+                rtype: rec.rtype.clone(),
+                label: rec.label.clone(),
+                author: rec.author.clone(),
+                content: rec.content.clone(),
+                time: rec.time.clone(),
+                status: rec.status.clone(),
+                discussion: rec.discussion.clone(),
+                page: page_no,
+                x: pos.point.x.to_pt(),
+                y: pos.point.y.to_pt(),
+                page_width: size.x.to_pt(),
+                page_height: size.y.to_pt(),
+            })
+        })
+        .collect()
+}
+
+fn valid_label(label: &str) -> bool {
+    !label.is_empty()
+        && label.len() <= 32
+        && label
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Picks the label for a new annotation: the client-suggested one when valid
+/// and free, else a fresh random 16-bit uppercase hex label like `7C42`.
+fn fresh_label(records: &[AnnotationRecord], requested: Option<&str>) -> String {
+    let taken = |label: &str| records.iter().any(|rec| rec.label == label);
+    if let Some(label) = requested {
+        if valid_label(label) && !taken(label) {
+            return label.to_owned();
+        }
+    }
+    let mut seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    loop {
+        // splitmix-ish scramble; entropy needs are tiny and collisions are
+        // checked against the existing records anyway.
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let label = format!("{:04X}", (seed >> 33) as u16);
+        if !taken(&label) {
+            return label;
+        }
+    }
+}
+
+/// The current time as an ISO 8601 UTC string, e.g. "2026-08-11T01:12:40Z".
+pub fn iso_now() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let days = (secs / 86400) as i64;
+    let rem = secs % 86400;
+    // Civil-from-days (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { year + 1 } else { year };
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        rem / 3600,
+        (rem % 3600) / 60,
+        rem % 60
+    )
+}
+
+/// The author name recorded for annotations created via the preview.
+pub fn local_author() -> String {
+    std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_else(|_| "user".into())
 }
 
 /// Computes the new on-disk content carrying the edit, and whether the edit
@@ -139,9 +485,9 @@ fn disk_edit(
 
 /// Applies the edit to a diverged disk content by re-locating the edit site.
 /// Deletions locate the removed text itself (the label, unique by
-/// construction); insertions anchor on up to 48 bytes of context ending at
-/// the insertion point, retrying with shorter context when the exact window
-/// was disturbed by unsaved edits. Gives up (returns `None`) rather than
+/// construction); insertions anchor on up to 48 bytes of context around the
+/// insertion point, retrying with shorter context when the exact window was
+/// disturbed by unsaved edits. Gives up (returns `None`) rather than
 /// patching an ambiguous location.
 fn best_effort_patch(
     disk: &str,
@@ -211,205 +557,9 @@ fn best_effort_patch(
     None
 }
 
-/// The server-side annotation API exposed to the preview http server.
-pub trait AnnotationServer: Send + Sync {
-    /// Creates an annotation at a clicked position. Returns the new id.
-    fn annotate(&self, req: AnnotateRequest) -> Result<String, String>;
-    /// Deletes an annotation by id.
-    fn remove(&self, id: &str) -> Result<(), String>;
-}
-
-/// The sidecar path for the current main file, e.g. `typing.annos.typ`
-/// next to `typing.typ`.
-pub fn sidecar_path(art: &LspCompiledArtifact) -> Option<PathBuf> {
-    let world = art.world();
-    let main = world.main();
-    let path = world.path_for_id(main).ok()?.to_err().ok()?;
-    let stem = path.file_stem()?.to_string_lossy().into_owned();
-    Some(path.with_file_name(format!("{stem}.annos.typ")))
-}
-
-fn escape(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
-}
-
-fn unescape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars();
-    while let Some(c) = chars.next() {
-        if c != '\\' {
-            out.push(c);
-            continue;
-        }
-        match chars.next() {
-            Some('n') => out.push('\n'),
-            Some(other) => out.push(other),
-            None => {}
-        }
-    }
-    out
-}
-
-/// Reads a typst string literal starting at `s` (which must begin with a
-/// quote), returning the raw escaped content and the rest.
-fn read_string(s: &str) -> Option<(&str, &str)> {
-    let s = s.strip_prefix('"')?;
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\\' => i += 2,
-            b'"' => return Some((&s[..i], &s[i + 1..])),
-            _ => i += 1,
-        }
-    }
-    None
-}
-
-fn read_field<'a>(block: &'a str, key: &str) -> Option<&'a str> {
-    let at = block.find(&format!("{key}: "))?;
-    Some(&block[at + key.len() + 2..])
-}
-
-/// Parses the sidecar file content into annotation records. Only entries in
-/// the format written by [`format_record`] are recognized.
-pub fn parse_records(content: &str) -> Vec<AnnotationRecord> {
-    let mut records = vec![];
-    for block in content.split("#metadata((").skip(1) {
-        let Some(end) = block.find("))") else {
-            continue;
-        };
-        let block = &block[..end];
-        let id = read_field(block, "id").and_then(read_string);
-        let text = read_field(block, "text").and_then(read_string);
-        let created = read_field(block, "created")
-            .and_then(|rest| rest.split(',').next())
-            .and_then(|num| num.trim().parse::<u64>().ok());
-        let completed = read_field(block, "completed")
-            .is_some_and(|rest| rest.trim_start().starts_with("true"));
-        if let (Some((id, _)), Some((text, _)), Some(created)) = (id, text, created) {
-            records.push(AnnotationRecord {
-                id: unescape(id),
-                text: unescape(text),
-                created,
-                completed,
-            });
-        }
-    }
-    records
-}
-
-/// Formats one annotation record as a sidecar entry.
-pub fn format_record(rec: &AnnotationRecord) -> String {
-    format!(
-        "#metadata((\n  id: \"{}\",\n  text: \"{}\",\n  created: {},\n  completed: {},\n)) <{}-note>\n",
-        escape(&rec.id),
-        escape(&rec.text),
-        rec.created,
-        rec.completed,
-        rec.id,
-    )
-}
-
-const SIDECAR_HEADER: &str = "\
-// Annotations created from the tinymist preview. Each entry corresponds to
-// a matching <A-XXXX> label anchored in the document source; removing an
-// entry or its label orphans the other half harmlessly.\n\n";
-
-fn read_sidecar(path: &std::path::Path) -> (Vec<AnnotationRecord>, String) {
-    match std::fs::read_to_string(path) {
-        Ok(content) => {
-            let records = parse_records(&content);
-            (records, content)
-        }
-        Err(_) => (vec![], SIDECAR_HEADER.to_owned()),
-    }
-}
-
-/// Resolves all annotations of the current main file onto the last
-/// successful render.
-pub fn annotation_pins(art: &LspCompiledArtifact) -> Vec<AnnotationPin> {
-    let Some(sidecar) = sidecar_path(art) else {
-        return vec![];
-    };
-    let (records, _) = read_sidecar(&sidecar);
-    if records.is_empty() {
-        return vec![];
-    }
-    let Some(doc) = art.success_doc() else {
-        return vec![];
-    };
-    let TypstDocument::Paged(paged) = &doc else {
-        return vec![];
-    };
-    let introspector = doc.introspector();
-    records
-        .iter()
-        .filter_map(|rec| {
-            let label = Label::new(PicoStr::intern(&rec.id))?;
-            let elem = introspector.query_label(label).ok()?;
-            let loc = elem.location()?;
-            let pos: PagedPosition = introspector.position(loc)?.as_paged_or_default();
-            let page_no: usize = pos.page.into();
-            let size = paged.pages().get(page_no - 1)?.frame.size();
-            Some(AnnotationPin {
-                id: rec.id.clone(),
-                text: rec.text.clone(),
-                created: rec.created,
-                completed: rec.completed,
-                page: page_no,
-                x: pos.point.x.to_pt(),
-                y: pos.point.y.to_pt(),
-                page_width: size.x.to_pt(),
-                page_height: size.y.to_pt(),
-            })
-        })
-        .collect()
-}
-
-fn valid_id(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= 32
-        && id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-}
-
-/// Picks the id for a new annotation: the client-suggested one when valid
-/// and free, else a fresh `A-XXXX` with a random 16-bit hex suffix.
-fn fresh_id(records: &[AnnotationRecord], requested: Option<&str>) -> String {
-    let taken = |id: &str| records.iter().any(|rec| rec.id == id);
-    if let Some(id) = requested {
-        if valid_id(id) && !taken(id) {
-            return id.to_owned();
-        }
-    }
-    let mut seed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    loop {
-        // splitmix-ish scramble; entropy needs are tiny and collisions are
-        // checked against the existing records anyway.
-        seed = seed
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        let id = format!("A-{:04X}", (seed >> 33) as u16);
-        if !taken(&id) {
-            return id;
-        }
-    }
-}
-
-fn now_epoch() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-/// Prepares the edits creating an annotation at a clicked position: a label
-/// insertion at the end of the clicked word, and a new sidecar entry.
+/// Prepares the edits creating an annotation at a clicked position: an
+/// anchor label insertion at the end of the clicked word, and a new sidecar
+/// entry.
 pub fn prepare_annotate(
     art: &LspCompiledArtifact,
     req: &AnnotateRequest,
@@ -452,14 +602,17 @@ pub fn prepare_annotate(
     let sidecar = sidecar_path(art).ok_or("cannot determine the sidecar path")?;
     let (records, content) = read_sidecar(&sidecar);
     let rec = AnnotationRecord {
-        id: fresh_id(&records, req.id.as_deref()),
-        text: req.text.clone(),
-        created: now_epoch(),
-        completed: false,
+        rtype: "comment".into(),
+        label: fresh_label(&records, req.label.as_deref()),
+        author: local_author(),
+        content: req.text.clone(),
+        time: iso_now(),
+        status: "created".into(),
+        discussion: vec![],
     };
     let sidecar_content = format!("{content}{}", format_record(&rec));
 
-    let new_text = format!("<{}>", rec.id);
+    let new_text = anchor_text(&rec.label);
     let (disk_content, buffer_edit) = disk_edit(&path, source.text(), at..at, &new_text);
     Ok(AnnotationEdit {
         uri,
@@ -468,41 +621,41 @@ pub fn prepare_annotate(
         path: path.to_path_buf(),
         range: lsp_types::Range::new(as_lsp(pos), as_lsp(pos)),
         new_text,
-        id: rec.id,
+        label: rec.label,
         sidecar,
         sidecar_content,
     })
 }
 
-/// Prepares the edits deleting an annotation: removal of the label from
-/// whichever dependency file contains it, and of the sidecar entry.
+/// Prepares the edits deleting an annotation: removal of the anchor label
+/// from whichever dependency file contains it, and of the sidecar entry.
 pub fn prepare_delete(
     art: &LspCompiledArtifact,
-    id: &str,
+    label: &str,
     encoding: PositionEncoding,
 ) -> Result<AnnotationEdit, String> {
-    if !id
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-    {
-        return Err("bad annotation id".into());
+    if !valid_label(label) {
+        return Err("bad annotation label".into());
     }
     let world = art.world();
     let sidecar = sidecar_path(art).ok_or("cannot determine the sidecar path")?;
-    let (records, content) = read_sidecar(&sidecar);
-    if !records.iter().any(|rec| rec.id == id) {
-        return Err(format!("unknown annotation: {id}"));
-    }
-    let sidecar_content = strip_record(&content, id);
+    let content = std::fs::read_to_string(&sidecar).unwrap_or_default();
+    let entries = parse_entries(&content);
+    let entry = entries
+        .iter()
+        .find(|entry| entry.record.label == label)
+        .ok_or_else(|| format!("unknown annotation: {label}"))?;
+    let mut sidecar_content = content.clone();
+    sidecar_content.replace_range(entry.span.clone(), "");
 
-    // Find the label in the compiled project's files.
-    let needle = format!("<{id}>");
+    // Find the anchor label in the compiled project's files.
+    let needle = anchor_text(label);
     let hit = art.depended_files().iter().find_map(|&file| {
         let source = world.source(file).ok()?;
         let at = source.text().find(&needle)?;
         Some((file, at))
     });
-    let (file, at) = hit.ok_or_else(|| format!("label <{id}> not found in any source file"))?;
+    let (file, at) = hit.ok_or_else(|| format!("label {needle} not found in any source file"))?;
     let source = world.source(file).map_err(|e| e.to_string())?;
     let path = world.path_for_id(file).map_err(|e| e.to_string())?;
     let path = path.to_err().map_err(|e| e.to_string())?;
@@ -512,7 +665,7 @@ pub fn prepare_delete(
 
     let (disk_content, buffer_edit) = disk_edit(&path, source.text(), at..at + needle.len(), "");
     Ok(AnnotationEdit {
-        id: id.to_owned(),
+        label: label.to_owned(),
         uri,
         disk_content,
         buffer_edit,
@@ -524,27 +677,58 @@ pub fn prepare_delete(
     })
 }
 
-/// Removes the entry with the given id from the sidecar content.
-fn strip_record(content: &str, id: &str) -> String {
-    let mut out = String::with_capacity(content.len());
-    let mut rest = content;
-    while let Some(at) = rest.find("#metadata((") {
-        let (before, block) = rest.split_at(at);
-        out.push_str(before);
-        let end = block
-            .find(">\n")
-            .map(|e| e + 2)
-            .or_else(|| block.find('>').map(|e| e + 1))
-            .unwrap_or(block.len());
-        let (entry, after) = block.split_at(end);
-        let is_target = parse_records(entry).iter().any(|rec| rec.id == id);
-        if !is_target {
-            out.push_str(entry);
-        }
-        rest = after;
+/// Rewrites one entry of the sidecar in place via a modification of its
+/// parsed record, returning (sidecar path, new content).
+pub fn modify_record(
+    art: &LspCompiledArtifact,
+    label: &str,
+    modify: impl FnOnce(&mut AnnotationRecord),
+) -> Result<(PathBuf, String), String> {
+    if !valid_label(label) {
+        return Err("bad annotation label".into());
     }
-    out.push_str(rest);
-    out
+    let sidecar = sidecar_path(art).ok_or("cannot determine the sidecar path")?;
+    let content = std::fs::read_to_string(&sidecar)
+        .map_err(|e| format!("failed to read {}: {e}", sidecar.display()))?;
+    let entries = parse_entries(&content);
+    let entry = entries
+        .iter()
+        .find(|entry| entry.record.label == label)
+        .ok_or_else(|| format!("unknown annotation: {label}"))?;
+    let mut record = entry.record.clone();
+    modify(&mut record);
+    let mut new_content = content.clone();
+    new_content.replace_range(entry.span.clone(), &format_record(&record));
+    Ok((sidecar, new_content))
+}
+
+/// Appends a discussion reply to an annotation.
+pub fn prepare_reply(
+    art: &LspCompiledArtifact,
+    label: &str,
+    text: &str,
+) -> Result<(PathBuf, String), String> {
+    modify_record(art, label, |record| {
+        record.discussion.push(AnnotationReply {
+            author: local_author(),
+            time: iso_now(),
+            content: text.to_owned(),
+        });
+    })
+}
+
+/// Sets the status of an annotation.
+pub fn prepare_status(
+    art: &LspCompiledArtifact,
+    label: &str,
+    status: &str,
+) -> Result<(PathBuf, String), String> {
+    if !matches!(status, "created" | "ongoing" | "resolved") {
+        return Err(format!("bad status: {status}"));
+    }
+    modify_record(art, label, |record| {
+        record.status = status.to_owned();
+    })
 }
 
 fn as_lsp(pos: LspPosition) -> lsp_types::Position {
