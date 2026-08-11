@@ -5,7 +5,7 @@
 //! sidecar file `<main>.annos.typ` next to the main file (schema documented
 //! in `annos_prelude.typ`, which is stamped at the top of every new
 //! sidecar). The rendered position of each annotation is resolved by
-//! querying the compiled document for the label, so anchors survive
+//! querying the compiled document for the anchor label, so anchors survive
 //! arbitrary edits around them. Records carry an author, ISO 8601 time, a
 //! status, and a discussion thread that agents and the preview UI append to.
 //!
@@ -68,12 +68,14 @@ pub struct AnnotationReply {
 }
 
 /// A stored annotation record from the sidecar file.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AnnotationRecord {
     /// The annotation kind: "comment" | "question" | "request".
+    #[serde(rename = "type")]
     pub rtype: String,
-    /// The short label, e.g. "7C42"; the document anchor is `<-7C42->`.
-    pub label: String,
+    /// The unique id, e.g. "7C42"; the document anchor is `<-7C42->`.
+    pub uuid: String,
     /// The display letter shown on the pin: "a".."z", then "aa", ...
     pub letter: String,
     /// The author of the annotation.
@@ -95,8 +97,8 @@ pub struct AnnotationPin {
     /// The annotation kind.
     #[serde(rename = "type")]
     pub rtype: String,
-    /// The short label.
-    pub label: String,
+    /// The unique id.
+    pub uuid: String,
     /// The display letter shown on the pin.
     pub letter: String,
     /// The author.
@@ -125,11 +127,11 @@ pub struct AnnotationPin {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AnnotateRequest {
-    /// A client-suggested label, e.g. `7C42` (random 16-bit hex stamped by
+    /// A client-suggested uuid, e.g. `7C42` (random 16-bit uppercase hex,
     /// the browser). Used verbatim when valid and free; otherwise the server
     /// generates one.
     #[serde(default)]
-    pub label: Option<String>,
+    pub uuid: Option<String>,
     /// The 1-based page number.
     pub page: usize,
     /// The x coordinate of the click, in pt.
@@ -143,13 +145,13 @@ pub struct AnnotateRequest {
 /// The edits needed to create or delete an annotation. When the target file
 /// has no unsaved editor changes (its disk content matches the compiled
 /// source), `disk_content` carries the new file content to write directly on
-/// disk — so external watchers see the label immediately; otherwise the edit
+/// disk — so external watchers see the anchor immediately; otherwise the edit
 /// must go through the editor as a workspace edit. The sidecar is always
 /// written on disk.
 #[derive(Debug, Clone)]
 pub struct AnnotationEdit {
-    /// The annotation label.
-    pub label: String,
+    /// The annotation uuid.
+    pub uuid: String,
     /// The uri of the source file to edit.
     pub uri: Url,
     /// The path of the source file to edit.
@@ -173,24 +175,24 @@ pub struct AnnotationEdit {
 
 /// The server-side annotation API exposed to the preview http server.
 pub trait AnnotationServer: Send + Sync {
-    /// Creates an annotation at a clicked position. Returns the new label.
+    /// Creates an annotation at a clicked position. Returns the new uuid.
     fn annotate(&self, req: AnnotateRequest) -> Result<String, String>;
-    /// Deletes an annotation by label.
-    fn remove(&self, label: &str) -> Result<(), String>;
+    /// Deletes an annotation by uuid.
+    fn remove(&self, uuid: &str) -> Result<(), String>;
     /// Appends a reply to an annotation's discussion.
-    fn reply(&self, label: &str, text: &str) -> Result<(), String>;
+    fn reply(&self, uuid: &str, text: &str) -> Result<(), String>;
     /// Sets an annotation's status.
-    fn set_status(&self, label: &str, status: &str) -> Result<(), String>;
+    fn set_status(&self, uuid: &str, status: &str) -> Result<(), String>;
 }
 
-/// The document anchor text for a label, e.g. `<-7C42->`.
-fn anchor_text(label: &str) -> String {
-    format!("<-{label}->")
+/// The document anchor text for a uuid, e.g. `<-7C42->`.
+fn anchor_text(uuid: &str) -> String {
+    format!("<-{uuid}->")
 }
 
 /// The label name queried in the compiled document, e.g. `-7C42-`.
-fn anchor_name(label: &str) -> String {
-    format!("-{label}-")
+fn anchor_name(uuid: &str) -> String {
+    format!("-{uuid}-")
 }
 
 /// The sidecar path for the current main file, e.g. `typing.annos.typ`
@@ -278,7 +280,7 @@ fn record_from_value(value: &typst::foundations::Value) -> Option<AnnotationReco
         .unwrap_or_default();
     Some(AnnotationRecord {
         rtype: string_of(&dict, "type").unwrap_or_else(|| "comment".into()),
-        label: string_of(&dict, "label")?,
+        uuid: string_of(&dict, "uuid")?,
         letter: string_of(&dict, "letter").unwrap_or_default(),
         author: string_of(&dict, "author").unwrap_or_else(|| "unknown".into()),
         content: string_of(&dict, "content")?,
@@ -316,10 +318,10 @@ pub fn parse_records(content: &str) -> Vec<AnnotationRecord> {
 }
 
 /// Locates the byte span of an entry in the sidecar source by its trailing
-/// `<note-LABEL>` label, for surgical replacement. Format changes only need
-/// to keep that label after the entry's closing `))`.
-fn entry_span(content: &str, label: &str) -> Option<std::ops::Range<usize>> {
-    let note = format!("<note-{label}>");
+/// `<note-LABEL>` uuid, for surgical replacement. Format changes only need
+/// to keep that uuid after the entry's closing `))`.
+fn entry_span(content: &str, uuid: &str) -> Option<std::ops::Range<usize>> {
+    let note = format!("<note-{uuid}>");
     let note_at = content.find(&note)?;
     let start = content[..note_at].rfind("#metadata((")?;
     let mut end = note_at + note.len();
@@ -351,7 +353,7 @@ pub fn format_record(rec: &AnnotationRecord) -> String {
     };
     entry_template()
         .replace("${type}", &escape(&rec.rtype))
-        .replace("${label}", &escape(&rec.label))
+        .replace("${uuid}", &escape(&rec.uuid))
         .replace("${letter}", &escape(&rec.letter))
         .replace("${author}", &escape(&rec.author))
         .replace("${content}", &escape(&rec.content))
@@ -395,7 +397,7 @@ pub fn annotation_pins(art: &LspCompiledArtifact) -> Vec<AnnotationPin> {
             // offset in the source like a cursor, which lands on the precise
             // inter-character point. Fall back to the labeled element's
             // position (the start of its text run).
-            let needle = anchor_text(&rec.label);
+            let needle = anchor_text(&rec.uuid);
             let exact = art.depended_files().iter().find_map(|&file| {
                 let source = world.source(file).ok()?;
                 let at = source.text().find(&needle)?;
@@ -404,8 +406,8 @@ pub fn annotation_pins(art: &LspCompiledArtifact) -> Vec<AnnotationPin> {
             let pos: PagedPosition = match exact {
                 Some(pos) => pos,
                 None => {
-                    let label = Label::new(PicoStr::intern(&anchor_name(&rec.label)))?;
-                    let elem = introspector.query_label(label).ok()?;
+                    let uuid = Label::new(PicoStr::intern(&anchor_name(&rec.uuid)))?;
+                    let elem = introspector.query_label(uuid).ok()?;
                     let loc = elem.location()?;
                     introspector.position(loc)?.as_paged_or_default()
                 }
@@ -414,7 +416,7 @@ pub fn annotation_pins(art: &LspCompiledArtifact) -> Vec<AnnotationPin> {
             let size = paged.pages().get(page_no - 1)?.frame.size();
             Some(AnnotationPin {
                 rtype: rec.rtype.clone(),
-                label: rec.label.clone(),
+                uuid: rec.uuid.clone(),
                 letter: rec.letter.clone(),
                 author: rec.author.clone(),
                 content: rec.content.clone(),
@@ -431,21 +433,21 @@ pub fn annotation_pins(art: &LspCompiledArtifact) -> Vec<AnnotationPin> {
         .collect()
 }
 
-fn valid_label(label: &str) -> bool {
-    !label.is_empty()
-        && label.len() <= 32
-        && label
+fn valid_label(uuid: &str) -> bool {
+    !uuid.is_empty()
+        && uuid.len() <= 32
+        && uuid
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-/// Picks the label for a new annotation: the client-suggested one when valid
-/// and free, else a fresh random 16-bit uppercase hex label like `7C42`.
+/// Picks the uuid for a new annotation: the client-suggested one when valid
+/// and free, else a fresh random 16-bit uppercase hex uuid like `7C42`.
 fn fresh_label(records: &[AnnotationRecord], requested: Option<&str>) -> String {
-    let taken = |label: &str| records.iter().any(|rec| rec.label == label);
-    if let Some(label) = requested {
-        if valid_label(label) && !taken(label) {
-            return label.to_owned();
+    let taken = |uuid: &str| records.iter().any(|rec| rec.uuid == uuid);
+    if let Some(uuid) = requested {
+        if valid_label(uuid) && !taken(uuid) {
+            return uuid.to_owned();
         }
     }
     let mut seed = std::time::SystemTime::now()
@@ -458,9 +460,9 @@ fn fresh_label(records: &[AnnotationRecord], requested: Option<&str>) -> String 
         seed = seed
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
-        let label = format!("{:04X}", (seed >> 33) as u16);
-        if !taken(&label) {
-            return label;
+        let uuid = format!("{:04X}", (seed >> 33) as u16);
+        if !taken(&uuid) {
+            return uuid;
         }
     }
 }
@@ -614,7 +616,7 @@ pub fn local_author() -> String {
 /// A clean file (disk identical to the compiled source) is spliced exactly
 /// and needs no buffer edit — the editor reloads clean buffers silently. A
 /// dirty file still gets a best-effort patch, anchored on the text around
-/// the edit site, so external watchers of the disk see the label
+/// the edit site, so external watchers of the disk see the anchor
 /// immediately; the buffer edit remains the authoritative copy and its next
 /// save overwrites the patch.
 fn disk_edit(
@@ -635,7 +637,7 @@ fn disk_edit(
 }
 
 /// Applies the edit to a diverged disk content by re-locating the edit site.
-/// Deletions locate the removed text itself (the label, unique by
+/// Deletions locate the removed text itself (the anchor label, unique by
 /// construction); insertions anchor on up to 48 bytes of context around the
 /// insertion point, retrying with shorter context when the exact window was
 /// disturbed by unsaved edits. Gives up (returns `None`) rather than
@@ -754,7 +756,7 @@ pub fn prepare_annotate(
     let (records, content) = read_sidecar(&sidecar);
     let rec = AnnotationRecord {
         rtype: "comment".into(),
-        label: fresh_label(&records, req.label.as_deref()),
+        uuid: fresh_label(&records, req.uuid.as_deref()),
         letter: next_letter(&records),
         author: local_author(),
         content: req.text.clone(),
@@ -764,7 +766,7 @@ pub fn prepare_annotate(
     };
     let sidecar_content = format!("{content}{}", format_record(&rec));
 
-    let new_text = anchor_text(&rec.label);
+    let new_text = anchor_text(&rec.uuid);
     let (disk_content, buffer_edit) = disk_edit(&path, source.text(), at..at, &new_text);
     Ok(AnnotationEdit {
         uri,
@@ -773,7 +775,7 @@ pub fn prepare_annotate(
         path: path.to_path_buf(),
         range: lsp_types::Range::new(as_lsp(pos), as_lsp(pos)),
         new_text,
-        label: rec.label,
+        uuid: rec.uuid,
         sidecar,
         sidecar_content,
     })
@@ -783,28 +785,28 @@ pub fn prepare_annotate(
 /// from whichever dependency file contains it, and of the sidecar entry.
 pub fn prepare_delete(
     art: &LspCompiledArtifact,
-    label: &str,
+    uuid: &str,
     encoding: PositionEncoding,
 ) -> Result<AnnotationEdit, String> {
-    if !valid_label(label) {
-        return Err("bad annotation label".into());
+    if !valid_label(uuid) {
+        return Err("bad annotation uuid".into());
     }
     let world = art.world();
     let sidecar = sidecar_path(art).ok_or("cannot determine the sidecar path")?;
     let content = std::fs::read_to_string(&sidecar).unwrap_or_default();
-    let span = entry_span(&content, label)
-        .ok_or_else(|| format!("unknown annotation: {label}"))?;
+    let span = entry_span(&content, uuid)
+        .ok_or_else(|| format!("unknown annotation: {uuid}"))?;
     let mut sidecar_content = content.clone();
     sidecar_content.replace_range(span, "");
 
     // Find the anchor label in the compiled project's files.
-    let needle = anchor_text(label);
+    let needle = anchor_text(uuid);
     let hit = art.depended_files().iter().find_map(|&file| {
         let source = world.source(file).ok()?;
         let at = source.text().find(&needle)?;
         Some((file, at))
     });
-    let (file, at) = hit.ok_or_else(|| format!("label {needle} not found in any source file"))?;
+    let (file, at) = hit.ok_or_else(|| format!("uuid {needle} not found in any source file"))?;
     let source = world.source(file).map_err(|e| e.to_string())?;
     let path = world.path_for_id(file).map_err(|e| e.to_string())?;
     let path = path.to_err().map_err(|e| e.to_string())?;
@@ -814,7 +816,7 @@ pub fn prepare_delete(
 
     let (disk_content, buffer_edit) = disk_edit(&path, source.text(), at..at + needle.len(), "");
     Ok(AnnotationEdit {
-        label: label.to_owned(),
+        uuid: uuid.to_owned(),
         uri,
         disk_content,
         buffer_edit,
@@ -830,11 +832,11 @@ pub fn prepare_delete(
 /// parsed record, returning (sidecar path, new content).
 pub fn modify_record(
     art: &LspCompiledArtifact,
-    label: &str,
+    uuid: &str,
     modify: impl FnOnce(&mut AnnotationRecord),
 ) -> Result<(PathBuf, String), String> {
-    if !valid_label(label) {
-        return Err("bad annotation label".into());
+    if !valid_label(uuid) {
+        return Err("bad annotation uuid".into());
     }
     let sidecar = sidecar_path(art).ok_or("cannot determine the sidecar path")?;
     let content = std::fs::read_to_string(&sidecar)
@@ -842,10 +844,10 @@ pub fn modify_record(
     let records = parse_records(&content);
     let mut record = records
         .into_iter()
-        .find(|record| record.label == label)
-        .ok_or_else(|| format!("unknown annotation: {label}"))?;
-    let span = entry_span(&content, label)
-        .ok_or_else(|| format!("cannot locate the entry of {label} in the sidecar"))?;
+        .find(|record| record.uuid == uuid)
+        .ok_or_else(|| format!("unknown annotation: {uuid}"))?;
+    let span = entry_span(&content, uuid)
+        .ok_or_else(|| format!("cannot locate the entry of {uuid} in the sidecar"))?;
     modify(&mut record);
     let mut new_content = content.clone();
     new_content.replace_range(span, &format_record(&record));
@@ -855,10 +857,10 @@ pub fn modify_record(
 /// Appends a discussion reply to an annotation.
 pub fn prepare_reply(
     art: &LspCompiledArtifact,
-    label: &str,
+    uuid: &str,
     text: &str,
 ) -> Result<(PathBuf, String), String> {
-    modify_record(art, label, |record| {
+    modify_record(art, uuid, |record| {
         record.discussion.push(AnnotationReply {
             author: local_author(),
             time: iso_now(),
@@ -870,13 +872,13 @@ pub fn prepare_reply(
 /// Sets the status of an annotation.
 pub fn prepare_status(
     art: &LspCompiledArtifact,
-    label: &str,
+    uuid: &str,
     status: &str,
 ) -> Result<(PathBuf, String), String> {
     if !matches!(status, "created" | "ongoing" | "resolved") {
         return Err(format!("bad status: {status}"));
     }
-    modify_record(art, label, |record| {
+    modify_record(art, uuid, |record| {
         record.status = status.to_owned();
     })
 }

@@ -94,6 +94,9 @@ pub async fn preview_main(args: PreviewCliArgs) -> Result<()> {
                 last_art: last_art.clone(),
                 watchers: preview_state.clone(),
                 project_id: id.clone(),
+                // In annotate mode, stream annotation events as JSON lines
+                // on stdout so a driving agent can react to them.
+                emit_events: args.annotate,
             });
 
         // The sidecar is not a compile dependency; poll its mtime so

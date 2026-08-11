@@ -214,7 +214,7 @@
       "padding:5px 6px;font:12px/1.4 system-ui,sans-serif;margin:8px 0 6px";
     const doReply = () => {
       const text = ta.value.trim();
-      if (text) post("/dev/annotate/reply", { label: pin.label, text });
+      if (text) post("/dev/annotate/reply", { uuid: pin.uuid, text });
       closeAnnotBox();
     };
     ta.addEventListener("keydown", (e) => {
@@ -234,14 +234,14 @@
     );
     toggle.onclick = () => {
       post("/dev/annotate/status", {
-        label: pin.label,
+        uuid: pin.uuid,
         status: resolved ? "created" : "resolved",
       });
       closeAnnotBox();
     };
     const del = linkButton("delete", "rgb(220,130,130)");
     del.onclick = () => {
-      post("/dev/annotate/delete", { label: pin.label });
+      post("/dev/annotate/delete", { uuid: pin.uuid });
       closeAnnotBox();
     };
     const close = linkButton("close", "rgb(150,150,150)");
@@ -266,10 +266,10 @@
         // Stamp a short random label (16 bits of entropy); the server falls
         // back to its own if this one is taken.
         const rand = crypto.getRandomValues(new Uint8Array(2));
-        const label = Array.from(rand, (b) =>
+        const uuid = Array.from(rand, (b) =>
           b.toString(16).padStart(2, "0").toUpperCase(),
         ).join("");
-        post("/dev/annotate", { label, page: pageNo, x: px, y: py, text });
+        post("/dev/annotate", { uuid, page: pageNo, x: px, y: py, text });
       }
       closeAnnotBox();
     };

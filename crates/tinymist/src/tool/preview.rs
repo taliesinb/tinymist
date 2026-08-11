@@ -817,7 +817,7 @@ impl LspAnnotationServer {
             // overwrites.
             std::fs::write(&edit.path, content)
                 .map_err(|e| format!("failed to write {}: {e}", edit.path.display()))?;
-            log::info!("annotation {} written to disk: {}", edit.label, edit.path.display());
+            log::info!("annotation {} written to disk: {}", edit.uuid, edit.path.display());
         }
         if edit.buffer_edit {
             // Unsaved editor changes exist: the authoritative edit goes
@@ -830,7 +830,7 @@ impl LspAnnotationServer {
             let mut changes = std::collections::HashMap::new();
             changes.insert(edit.uri.clone(), vec![text_edit]);
             let params = lsp_types::ApplyWorkspaceEditParams {
-                label: Some(format!("typst annotation {}", edit.label)),
+                label: Some(format!("typst annotation {}", edit.uuid)),
                 edit: lsp_types::WorkspaceEdit {
                     changes: Some(changes),
                     ..Default::default()
@@ -883,24 +883,24 @@ impl AnnotationServer for LspAnnotationServer {
         let art = self.art()?;
         let edit = annotations::prepare_annotate(&art, &req, self.position_encoding)?;
         self.apply(&edit)?;
-        Ok(edit.label)
+        Ok(edit.uuid)
     }
 
-    fn remove(&self, label: &str) -> Result<(), String> {
+    fn remove(&self, uuid: &str) -> Result<(), String> {
         let art = self.art()?;
-        let edit = annotations::prepare_delete(&art, label, self.position_encoding)?;
+        let edit = annotations::prepare_delete(&art, uuid, self.position_encoding)?;
         self.apply(&edit)
     }
 
-    fn reply(&self, label: &str, text: &str) -> Result<(), String> {
+    fn reply(&self, uuid: &str, text: &str) -> Result<(), String> {
         let art = self.art()?;
-        let (path, content) = annotations::prepare_reply(&art, label, text)?;
+        let (path, content) = annotations::prepare_reply(&art, uuid, text)?;
         self.write_sidecar(&path, &content)
     }
 
-    fn set_status(&self, label: &str, status: &str) -> Result<(), String> {
+    fn set_status(&self, uuid: &str, status: &str) -> Result<(), String> {
         let art = self.art()?;
-        let (path, content) = annotations::prepare_status(&art, label, status)?;
+        let (path, content) = annotations::prepare_status(&art, uuid, status)?;
         self.write_sidecar(&path, &content)
     }
 }
@@ -917,6 +917,10 @@ pub struct DiskAnnotationServer {
     pub watchers: ProjectPreviewState,
     /// The project instance id.
     pub project_id: ProjectInsId,
+    /// Whether to emit annotation events as JSON lines on stdout, for
+    /// driving agents: annotation_added, discussion_extended,
+    /// annotation_deleted, annotation_status_changed.
+    pub emit_events: bool,
 }
 
 impl DiskAnnotationServer {
@@ -946,6 +950,17 @@ impl DiskAnnotationServer {
         self.push_pins();
         Ok(())
     }
+
+    fn emit(&self, event: serde_json::Value) {
+        if !self.emit_events {
+            return;
+        }
+        use std::io::Write;
+        let mut out = std::io::stdout().lock();
+        let _ = serde_json::to_writer(&mut out, &event);
+        let _ = out.write_all(b"\n");
+        let _ = out.flush();
+    }
 }
 
 impl AnnotationServer for DiskAnnotationServer {
@@ -957,34 +972,53 @@ impl AnnotationServer for DiskAnnotationServer {
             tinymist_query::PositionEncoding::Utf16,
         )?;
         self.apply(&edit)?;
-        Ok(edit.label)
+        let record = annotations::parse_records(&edit.sidecar_content)
+            .into_iter()
+            .find(|rec| rec.uuid == edit.uuid);
+        if let Some(record) = record {
+            self.emit(serde_json::json!({ "type": "annotation_added", "value": record }));
+        }
+        Ok(edit.uuid)
     }
 
-    fn remove(&self, label: &str) -> Result<(), String> {
+    fn remove(&self, uuid: &str) -> Result<(), String> {
         let art = self.art()?;
         let edit = annotations::prepare_delete(
             &art,
-            label,
+            uuid,
             tinymist_query::PositionEncoding::Utf16,
         )?;
-        self.apply(&edit)
-    }
-
-    fn reply(&self, label: &str, text: &str) -> Result<(), String> {
-        let art = self.art()?;
-        let (path, content) = annotations::prepare_reply(&art, label, text)?;
-        std::fs::write(&path, &content)
-            .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
-        self.push_pins();
+        self.apply(&edit)?;
+        self.emit(serde_json::json!({ "type": "annotation_deleted", "uuid": uuid }));
         Ok(())
     }
 
-    fn set_status(&self, label: &str, status: &str) -> Result<(), String> {
+    fn reply(&self, uuid: &str, text: &str) -> Result<(), String> {
         let art = self.art()?;
-        let (path, content) = annotations::prepare_status(&art, label, status)?;
+        let (path, content) = annotations::prepare_reply(&art, uuid, text)?;
         std::fs::write(&path, &content)
             .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
         self.push_pins();
+        self.emit(serde_json::json!({
+            "type": "discussion_extended",
+            "uuid": uuid,
+            "author": annotations::local_author(),
+            "text": text,
+        }));
+        Ok(())
+    }
+
+    fn set_status(&self, uuid: &str, status: &str) -> Result<(), String> {
+        let art = self.art()?;
+        let (path, content) = annotations::prepare_status(&art, uuid, status)?;
+        std::fs::write(&path, &content)
+            .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
+        self.push_pins();
+        self.emit(serde_json::json!({
+            "type": "annotation_status_changed",
+            "uuid": uuid,
+            "status": status,
+        }));
         Ok(())
     }
 }

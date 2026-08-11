@@ -139,8 +139,8 @@ pub async fn make_http_server(
                     // /dev/annotate/delete removes one by id.
                     use http_body_util::BodyExt;
                     #[derive(serde::Deserialize)]
-                    struct LabelReq {
-                        label: String,
+                    struct UuidReq {
+                        uuid: String,
                         #[serde(default)]
                         text: String,
                         #[serde(default)]
@@ -149,29 +149,29 @@ pub async fn make_http_server(
                     let path = req.uri().path().to_owned();
                     let annot = annot.unwrap();
                     let body = req.into_body().collect().await?.to_bytes();
-                    let parse_label = || {
-                        serde_json::from_slice::<LabelReq>(&body).map_err(|e| e.to_string())
+                    let parse_uuid = || {
+                        serde_json::from_slice::<UuidReq>(&body).map_err(|e| e.to_string())
                     };
                     let outcome = match path.as_str() {
                         "/dev/annotate" => serde_json::from_slice::<super::AnnotateRequest>(&body)
                             .map_err(|e| e.to_string())
                             .and_then(|req| annot.annotate(req)),
-                        "/dev/annotate/delete" => parse_label()
-                            .and_then(|req| annot.remove(&req.label).map(|()| String::new())),
-                        "/dev/annotate/reply" => parse_label().and_then(|req| {
-                            annot.reply(&req.label, &req.text).map(|()| String::new())
+                        "/dev/annotate/delete" => parse_uuid()
+                            .and_then(|req| annot.remove(&req.uuid).map(|()| String::new())),
+                        "/dev/annotate/reply" => parse_uuid().and_then(|req| {
+                            annot.reply(&req.uuid, &req.text).map(|()| String::new())
                         }),
-                        "/dev/annotate/status" => parse_label().and_then(|req| {
+                        "/dev/annotate/status" => parse_uuid().and_then(|req| {
                             annot
-                                .set_status(&req.label, &req.status)
+                                .set_status(&req.uuid, &req.status)
                                 .map(|()| String::new())
                         }),
                         _ => Err(format!("unknown annotation endpoint: {path}")),
                     };
                     let (status, body) = match outcome {
-                        Ok(label) => (
+                        Ok(uuid) => (
                             hyper::StatusCode::OK,
-                            serde_json::json!({ "ok": true, "label": label }).to_string(),
+                            serde_json::json!({ "ok": true, "uuid": uuid }).to_string(),
                         ),
                         Err(err) => (
                             hyper::StatusCode::BAD_REQUEST,
