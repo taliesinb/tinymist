@@ -74,6 +74,8 @@ pub struct AnnotationRecord {
     pub rtype: String,
     /// The short label, e.g. "7C42"; the document anchor is `<-7C42->`.
     pub label: String,
+    /// The display letter shown on the pin: "a".."z", then "aa", ...
+    pub letter: String,
     /// The author of the annotation.
     pub author: String,
     /// The message.
@@ -95,6 +97,8 @@ pub struct AnnotationPin {
     pub rtype: String,
     /// The short label.
     pub label: String,
+    /// The display letter shown on the pin.
+    pub letter: String,
     /// The author.
     pub author: String,
     /// The message.
@@ -275,6 +279,7 @@ fn record_from_value(value: &typst::foundations::Value) -> Option<AnnotationReco
     Some(AnnotationRecord {
         rtype: string_of(&dict, "type").unwrap_or_else(|| "comment".into()),
         label: string_of(&dict, "label")?,
+        letter: string_of(&dict, "letter").unwrap_or_default(),
         author: string_of(&dict, "author").unwrap_or_else(|| "unknown".into()),
         content: string_of(&dict, "content")?,
         time: string_of(&dict, "time").unwrap_or_default(),
@@ -347,6 +352,7 @@ pub fn format_record(rec: &AnnotationRecord) -> String {
     entry_template()
         .replace("${type}", &escape(&rec.rtype))
         .replace("${label}", &escape(&rec.label))
+        .replace("${letter}", &escape(&rec.letter))
         .replace("${author}", &escape(&rec.author))
         .replace("${content}", &escape(&rec.content))
         .replace("${time}", &escape(&rec.time))
@@ -381,18 +387,35 @@ pub fn annotation_pins(art: &LspCompiledArtifact) -> Vec<AnnotationPin> {
         return vec![];
     };
     let introspector = doc.introspector();
+    let world = art.world();
     records
         .iter()
         .filter_map(|rec| {
-            let label = Label::new(PicoStr::intern(&anchor_name(&rec.label)))?;
-            let elem = introspector.query_label(label).ok()?;
-            let loc = elem.location()?;
-            let pos: PagedPosition = introspector.position(loc)?.as_paged_or_default();
+            // Prefer the exact anchor position: resolve the `<-XXXX->` byte
+            // offset in the source like a cursor, which lands on the precise
+            // inter-character point. Fall back to the labeled element's
+            // position (the start of its text run).
+            let needle = anchor_text(&rec.label);
+            let exact = art.depended_files().iter().find_map(|&file| {
+                let source = world.source(file).ok()?;
+                let at = source.text().find(&needle)?;
+                exact_anchor_position(paged, &source, at)
+            });
+            let pos: PagedPosition = match exact {
+                Some(pos) => pos,
+                None => {
+                    let label = Label::new(PicoStr::intern(&anchor_name(&rec.label)))?;
+                    let elem = introspector.query_label(label).ok()?;
+                    let loc = elem.location()?;
+                    introspector.position(loc)?.as_paged_or_default()
+                }
+            };
             let page_no: usize = pos.page.into();
             let size = paged.pages().get(page_no - 1)?.frame.size();
             Some(AnnotationPin {
                 rtype: rec.rtype.clone(),
                 label: rec.label.clone(),
+                letter: rec.letter.clone(),
                 author: rec.author.clone(),
                 content: rec.content.clone(),
                 time: rec.time.clone(),
@@ -440,6 +463,115 @@ fn fresh_label(records: &[AnnotationRecord], requested: Option<&str>) -> String 
             return label;
         }
     }
+}
+
+/// Parses a display letter as a 1-based index in the sequence
+/// a..z, aa, ab, ... (bijective base 26).
+fn letter_index(s: &str) -> Option<u64> {
+    if s.is_empty() {
+        return None;
+    }
+    s.chars().try_fold(0u64, |acc, c| {
+        c.is_ascii_lowercase()
+            .then(|| acc * 26 + (c as u64 - 'a' as u64 + 1))
+    })
+}
+
+/// Formats a 1-based index as a display letter: 1 = "a", 26 = "z",
+/// 27 = "aa", ...
+fn index_letter(mut n: u64) -> String {
+    let mut out = vec![];
+    while n > 0 {
+        n -= 1;
+        out.push(b'a' + (n % 26) as u8);
+        n /= 26;
+    }
+    out.reverse();
+    String::from_utf8(out).unwrap_or_default()
+}
+
+/// The next free display letter: one past the maximum in use.
+fn next_letter(records: &[AnnotationRecord]) -> String {
+    let max = records
+        .iter()
+        .filter_map(|rec| letter_index(&rec.letter))
+        .max()
+        .unwrap_or(0);
+    index_letter(max + 1)
+}
+
+/// Resolves a source byte position to its exact rendered point, at glyph
+/// granularity — unlike `jump_from_cursor`, which only returns the position
+/// of the containing text run. Used to place the annotation caret at the
+/// precise inter-character anchor position.
+fn exact_anchor_position(
+    paged: &reflexo_typst::TypstPagedDocument,
+    source: &typst::syntax::Source,
+    cursor: usize,
+) -> Option<PagedPosition> {
+    use typst_shim::syntax::LinkedNodeExt;
+    let node = typst::syntax::LinkedNode::new(source.root()).leaf_at_compat(cursor)?;
+    if node.kind() != SyntaxKind::Text {
+        return None;
+    }
+    let span = node.span();
+    let target = cursor.checked_sub(node.offset())?;
+    for (idx, page) in paged.pages().iter().enumerate() {
+        let mut after = None;
+        let exact = anchor_in_frame(&page.frame, span, target, Point::zero(), &mut after);
+        if let Some(point) = exact.or(after) {
+            return Some(PagedPosition {
+                page: std::num::NonZeroUsize::new(idx + 1)?,
+                point,
+            });
+        }
+    }
+    None
+}
+
+/// Finds the point of the glyph boundary at `target` (a byte offset within
+/// the node with the given span). An exact hit is the left edge of the first
+/// glyph at or past the target; `after` collects the right edge of the last
+/// glyph ending at or before it (for anchors at the end of a word).
+fn anchor_in_frame(
+    frame: &typst::layout::Frame,
+    span: typst::syntax::Span,
+    target: usize,
+    origin: Point,
+    after: &mut Option<Point>,
+) -> Option<Point> {
+    use typst::layout::FrameItem;
+    for &(pos, ref item) in frame.items() {
+        match item {
+            FrameItem::Group(group) => {
+                if let Some(found) =
+                    anchor_in_frame(&group.frame, span, target, origin + pos, after)
+                {
+                    return Some(found);
+                }
+            }
+            FrameItem::Text(text) => {
+                let mut x = origin.x + pos.x;
+                let y = origin.y + pos.y;
+                for glyph in &text.glyphs {
+                    let advance = glyph.x_advance.at(text.size);
+                    let (gspan, goffset) = glyph.span;
+                    if gspan == span {
+                        let goffset = goffset as usize;
+                        if target <= goffset {
+                            return Some(Point::new(x, y));
+                        }
+                        if goffset + glyph.range().len() <= target {
+                            *after = Some(Point::new(x + advance, y));
+                        }
+                    }
+                    x += advance;
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// The current time as an ISO 8601 UTC string, e.g. "2026-08-11T01:12:40Z".
@@ -623,6 +755,7 @@ pub fn prepare_annotate(
     let rec = AnnotationRecord {
         rtype: "comment".into(),
         label: fresh_label(&records, req.label.as_deref()),
+        letter: next_letter(&records),
         author: local_author(),
         content: req.text.clone(),
         time: iso_now(),

@@ -111,8 +111,14 @@
       "position:fixed;z-index:2147483647;background:#2b2b2b;color:#eee;" +
       "border:1px solid #f5a623;border-radius:6px;padding:8px;width:260px;" +
       "font:13px/1.4 system-ui,sans-serif;box-shadow:0 4px 16px rgba(0,0,0,0.4)";
-    box.style.left = Math.max(Math.min(clientX, window.innerWidth - 280), 4) + "px";
-    box.style.top = Math.max(Math.min(clientY + 8, window.innerHeight - 170), 4) + "px";
+    if (clientX == null) {
+      // Docked: always the same predictable spot, bottom-right corner.
+      box.style.right = "12px";
+      box.style.bottom = "12px";
+    } else {
+      box.style.left = Math.max(Math.min(clientX, window.innerWidth - 280), 4) + "px";
+      box.style.top = Math.max(Math.min(clientY + 8, window.innerHeight - 170), 4) + "px";
+    }
     // Keep keystrokes inside the box: the preview binds document-level
     // shortcuts (h/j/k scrolling etc.) that must not fire while typing.
     for (const type of ["keydown", "keyup", "keypress"]) {
@@ -156,8 +162,8 @@
       "color:" + color;
     return btn;
   };
-  const showAnnot = (pin, x, y) => {
-    const box = annotBox(x, y);
+  const showAnnot = (pin) => {
+    const box = annotBox(null, null);
     const meta = document.createElement("div");
     meta.style.cssText = "color:#999;font-size:11px;margin-bottom:6px";
     meta.textContent = [pin.type, pin.author, pin.time && timeAgo(pin.time), pin.status]
@@ -291,37 +297,54 @@
       const done = pin.status === "resolved";
       const fill = done ? "rgb(150,150,150)" : "rgb(245,166,35)";
       const edge = done ? "rgb(90,90,90)" : "rgb(138,90,0)";
+      const letter = pin.letter || "?";
+      const w = Math.max(16, 9 + 5 * letter.length);
+      // A zero-space reticle at the exact anchor position: a small I-beam
+      // caret in the status color.
+      const caret = document.createElementNS(SVG_NS, "path");
+      caret.setAttribute(
+        "d",
+        `M ${pin.x - 2.2} ${pin.y - 8.5} h 4.4 ` +
+          `M ${pin.x} ${pin.y - 8.5} v 10 ` +
+          `M ${pin.x - 2.2} ${pin.y + 1.5} h 4.4`,
+      );
+      caret.setAttribute("stroke", done ? "rgb(150,150,150)" : "rgb(245,166,35)");
+      caret.setAttribute("stroke-width", "1.1");
+      caret.setAttribute("stroke-linecap", "round");
+      caret.setAttribute("fill", "none");
       const line = document.createElementNS(SVG_NS, "line");
       line.setAttribute("x1", pin.x);
       line.setAttribute("y1", pin.y - 4);
-      line.setAttribute("x2", cx - 8);
+      line.setAttribute("x2", cx - w / 2);
       line.setAttribute("y2", cy);
       line.setAttribute(
         "stroke",
         done ? "rgba(150,150,150,0.35)" : "rgba(245,166,35,0.35)",
       );
       line.setAttribute("stroke-dasharray", "2,2");
-      const c = document.createElementNS(SVG_NS, "circle");
-      c.setAttribute("cx", cx);
-      c.setAttribute("cy", cy);
-      c.setAttribute("r", 8);
+      const c = document.createElementNS(SVG_NS, "rect");
+      c.setAttribute("x", cx - w / 2);
+      c.setAttribute("y", cy - 8);
+      c.setAttribute("width", w);
+      c.setAttribute("height", 16);
+      c.setAttribute("rx", 3);
       c.setAttribute("fill", fill);
       c.setAttribute("stroke", edge);
       if (pin.status === "ongoing") g.setAttribute("opacity", "0.55");
       c.setAttribute("stroke-width", "0.8");
       const t = document.createElementNS(SVG_NS, "text");
       t.setAttribute("x", cx);
-      t.setAttribute("y", cy + 2.6);
+      t.setAttribute("y", cy + 3);
       t.setAttribute("text-anchor", "middle");
-      t.setAttribute("font-size", "8");
-      t.setAttribute("font-family", "system-ui,sans-serif");
+      t.setAttribute("font-size", "9");
+      t.setAttribute("font-family", "ui-monospace,monospace");
       t.setAttribute("fill", "white");
-      t.textContent = String(idx + 1);
-      g.append(line, c, t);
+      t.textContent = letter;
+      g.append(caret, line, c, t);
       g.addEventListener("click", (ev) => {
         ev.preventDefault();
         ev.stopPropagation();
-        showAnnot(pin, ev.clientX, ev.clientY);
+        showAnnot(pin);
       });
       page.appendChild(g);
       lastApplied += 1;
