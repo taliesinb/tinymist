@@ -8,6 +8,11 @@
 //! querying the compiled document for the label, so anchors survive
 //! arbitrary edits around them. Records carry an author, ISO 8601 time, a
 //! status, and a discussion thread that agents and the preview UI append to.
+//!
+//! The sidecar is *read* by actually evaluating it with the Typst compiler
+//! (in a minimal isolated world) and querying its metadata elements — the
+//! same data `typst query <sidecar> metadata` returns — so entries may be
+//! written with any valid Typst, not just the literal template shapes.
 
 use std::path::PathBuf;
 
@@ -198,137 +203,125 @@ fn escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
 }
 
-fn unescape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars();
-    while let Some(c) = chars.next() {
-        if c != '\\' {
-            out.push(c);
-            continue;
-        }
-        match chars.next() {
-            Some('n') => out.push('\n'),
-            Some(other) => out.push(other),
-            None => {}
+static SIDECAR_LIBRARY: std::sync::LazyLock<typst::utils::LazyHash<typst::Library>> =
+    std::sync::LazyLock::new(|| {
+        use typst::LibraryExt;
+        typst::utils::LazyHash::new(typst::Library::default())
+    });
+static SIDECAR_BOOK: std::sync::LazyLock<typst::utils::LazyHash<typst::text::FontBook>> =
+    std::sync::LazyLock::new(|| typst::utils::LazyHash::new(typst::text::FontBook::new()));
+
+/// A minimal world for evaluating a sidecar file in isolation: the default
+/// library, no fonts (a metadata-only document shapes no text), and no file
+/// access (sidecars must be self-contained).
+struct SidecarWorld {
+    main: typst::syntax::Source,
+}
+
+impl typst::World for SidecarWorld {
+    fn library(&self) -> &typst::utils::LazyHash<typst::Library> {
+        &SIDECAR_LIBRARY
+    }
+    fn book(&self) -> &typst::utils::LazyHash<typst::text::FontBook> {
+        &SIDECAR_BOOK
+    }
+    fn main(&self) -> typst::syntax::FileId {
+        self.main.id()
+    }
+    fn source(&self, id: typst::syntax::FileId) -> typst::diag::FileResult<typst::syntax::Source> {
+        if id == self.main.id() {
+            Ok(self.main.clone())
+        } else {
+            Err(typst::diag::FileError::AccessDenied)
         }
     }
-    out
-}
-
-/// Reads a typst string literal starting at `s` (which must begin with a
-/// quote), returning the raw escaped content and the rest.
-fn read_string(s: &str) -> Option<(&str, &str)> {
-    let s = s.trim_start().strip_prefix('"')?;
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\\' => i += 2,
-            b'"' => return Some((&s[..i], &s[i + 1..])),
-            _ => i += 1,
-        }
+    fn file(&self, _id: typst::syntax::FileId) -> typst::diag::FileResult<typst::foundations::Bytes> {
+        Err(typst::diag::FileError::AccessDenied)
     }
-    None
-}
-
-fn read_field<'a>(block: &'a str, key: &str) -> Option<&'a str> {
-    let at = block.find(&format!("{key}: "))?;
-    Some(&block[at + key.len() + 2..])
-}
-
-fn read_string_field(block: &str, key: &str) -> Option<String> {
-    read_field(block, key)
-        .and_then(read_string)
-        .map(|(raw, _)| unescape(raw))
-}
-
-/// Parses the discussion segment of an entry block: everything after
-/// `discussion:`, as a sequence of (author, time, content) groups.
-fn parse_discussion(block: &str) -> Vec<AnnotationReply> {
-    let Some(mut rest) = read_field(block, "discussion") else {
-        return vec![];
-    };
-    let mut replies = vec![];
-    while let Some(at) = rest.find("author: ") {
-        let seg = &rest[at..];
-        let author = read_string_field(seg, "author");
-        let time = read_string_field(seg, "time");
-        let content = read_string_field(seg, "content");
-        if let (Some(author), Some(time), Some(content)) = (author, time, content) {
-            replies.push(AnnotationReply {
-                author,
-                time,
-                content,
-            });
-        }
-        rest = &seg["author: ".len()..];
+    fn font(&self, _index: usize) -> Option<typst::text::Font> {
+        None
     }
-    replies
-}
-
-/// One parsed sidecar entry: its byte span in the file and its record.
-struct ParsedEntry {
-    span: std::ops::Range<usize>,
-    record: AnnotationRecord,
-}
-
-/// Parses the sidecar file into entries with their byte spans. Only entries
-/// in the format written by [`format_record`] are recognized.
-fn parse_entries(content: &str) -> Vec<ParsedEntry> {
-    let mut entries = vec![];
-    let mut at = 0;
-    while let Some(rel) = content[at..].find("#metadata((") {
-        let start = at + rel;
-        let block_start = start + "#metadata((".len();
-        // The entry ends at the label after the closing `))`.
-        let Some(close_rel) = content[block_start..].find("))") else {
-            break;
-        };
-        let close = block_start + close_rel;
-        let tail = &content[close..];
-        let end_rel = tail
-            .find(">\n")
-            .map(|e| e + 2)
-            .or_else(|| tail.find('>').map(|e| e + 1))
-            .unwrap_or(0);
-        let end = close + end_rel.max(2);
-        let block = &content[block_start..close];
-        at = end;
-
-        // The discussion field contains nested dicts, so cut the top-level
-        // fields off before it to avoid reading reply fields.
-        let head = block
-            .find("discussion:")
-            .map(|d| &block[..d])
-            .unwrap_or(block);
-        let label = read_string_field(head, "label");
-        let content_field = read_string_field(head, "content");
-        let Some(label) = label else { continue };
-        let Some(content_field) = content_field else {
-            continue;
-        };
-        entries.push(ParsedEntry {
-            span: start..end,
-            record: AnnotationRecord {
-                rtype: read_string_field(head, "type").unwrap_or_else(|| "comment".into()),
-                label,
-                author: read_string_field(head, "author").unwrap_or_else(|| "unknown".into()),
-                content: content_field,
-                time: read_string_field(head, "time").unwrap_or_default(),
-                status: read_string_field(head, "status").unwrap_or_else(|| "created".into()),
-                discussion: parse_discussion(block),
-            },
-        });
+    fn today(&self, _offset: Option<typst::foundations::Duration>) -> Option<typst::foundations::Datetime> {
+        None
     }
-    entries
 }
 
-/// Parses the sidecar file content into annotation records.
+fn string_of(dict: &typst::foundations::Dict, key: &str) -> Option<String> {
+    dict.get(key)
+        .ok()
+        .and_then(|value| value.clone().cast::<typst::foundations::Str>().ok())
+        .map(|s| s.to_string())
+}
+
+fn record_from_value(value: &typst::foundations::Value) -> Option<AnnotationRecord> {
+    let dict = value.clone().cast::<typst::foundations::Dict>().ok()?;
+    let discussion = dict
+        .get("discussion")
+        .ok()
+        .and_then(|value| value.clone().cast::<typst::foundations::Array>().ok())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|value| {
+                    let reply = value.clone().cast::<typst::foundations::Dict>().ok()?;
+                    Some(AnnotationReply {
+                        author: string_of(&reply, "author")?,
+                        time: string_of(&reply, "time").unwrap_or_default(),
+                        content: string_of(&reply, "content")?,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(AnnotationRecord {
+        rtype: string_of(&dict, "type").unwrap_or_else(|| "comment".into()),
+        label: string_of(&dict, "label")?,
+        author: string_of(&dict, "author").unwrap_or_else(|| "unknown".into()),
+        content: string_of(&dict, "content")?,
+        time: string_of(&dict, "time").unwrap_or_default(),
+        status: string_of(&dict, "status").unwrap_or_else(|| "created".into()),
+        discussion,
+    })
+}
+
+/// Parses the sidecar content by evaluating it with the Typst compiler and
+/// querying all metadata elements — the same data `typst query <sidecar>
+/// metadata` returns.
 pub fn parse_records(content: &str) -> Vec<AnnotationRecord> {
-    parse_entries(content)
-        .into_iter()
-        .map(|entry| entry.record)
+    let main = typst::syntax::Source::detached(content);
+    let world = SidecarWorld { main };
+    let compiled = typst::compile::<reflexo_typst::TypstPagedDocument>(&world);
+    let doc = match compiled.output {
+        Ok(doc) => doc,
+        Err(errors) => {
+            log::warn!("sidecar failed to evaluate: {errors:?}");
+            return vec![];
+        }
+    };
+    use typst::foundations::NativeElement;
+    use typst::introspection::Introspector as _;
+    let selector = typst::introspection::MetadataElem::ELEM.select();
+    doc.introspector()
+        .query(&selector)
+        .iter()
+        .filter_map(|elem: &typst::foundations::Content| {
+            let meta = elem.to_packed::<typst::introspection::MetadataElem>()?;
+            record_from_value(&meta.value)
+        })
         .collect()
+}
+
+/// Locates the byte span of an entry in the sidecar source by its trailing
+/// `<note-LABEL>` label, for surgical replacement. Format changes only need
+/// to keep that label after the entry's closing `))`.
+fn entry_span(content: &str, label: &str) -> Option<std::ops::Range<usize>> {
+    let note = format!("<note-{label}>");
+    let note_at = content.find(&note)?;
+    let start = content[..note_at].rfind("#metadata((")?;
+    let mut end = note_at + note.len();
+    if content[end..].starts_with('\n') {
+        end += 1;
+    }
+    Some(start..end)
 }
 
 /// Formats one annotation record as a sidecar entry, using the editable
@@ -666,13 +659,10 @@ pub fn prepare_delete(
     let world = art.world();
     let sidecar = sidecar_path(art).ok_or("cannot determine the sidecar path")?;
     let content = std::fs::read_to_string(&sidecar).unwrap_or_default();
-    let entries = parse_entries(&content);
-    let entry = entries
-        .iter()
-        .find(|entry| entry.record.label == label)
+    let span = entry_span(&content, label)
         .ok_or_else(|| format!("unknown annotation: {label}"))?;
     let mut sidecar_content = content.clone();
-    sidecar_content.replace_range(entry.span.clone(), "");
+    sidecar_content.replace_range(span, "");
 
     // Find the anchor label in the compiled project's files.
     let needle = anchor_text(label);
@@ -716,15 +706,16 @@ pub fn modify_record(
     let sidecar = sidecar_path(art).ok_or("cannot determine the sidecar path")?;
     let content = std::fs::read_to_string(&sidecar)
         .map_err(|e| format!("failed to read {}: {e}", sidecar.display()))?;
-    let entries = parse_entries(&content);
-    let entry = entries
-        .iter()
-        .find(|entry| entry.record.label == label)
+    let records = parse_records(&content);
+    let mut record = records
+        .into_iter()
+        .find(|record| record.label == label)
         .ok_or_else(|| format!("unknown annotation: {label}"))?;
-    let mut record = entry.record.clone();
+    let span = entry_span(&content, label)
+        .ok_or_else(|| format!("cannot locate the entry of {label} in the sidecar"))?;
     modify(&mut record);
     let mut new_content = content.clone();
-    new_content.replace_range(entry.span.clone(), &format_record(&record));
+    new_content.replace_range(span, &format_record(&record));
     Ok((sidecar, new_content))
 }
 

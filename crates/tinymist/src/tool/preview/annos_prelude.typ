@@ -16,6 +16,10 @@
 //   )) <note-7C42>
 //
 // Rules for agents:
+// - Read this file with `typst query <file> metadata` — it returns every
+//   entry as JSON. tinymist reads it the same way (by evaluation), so
+//   entries may use any valid Typst, not just literal dicts; only keep the
+//   trailing <note-XXXX> label directly after an entry's closing `))`.
 // - Reply by appending to `discussion`; never edit another author's text.
 // - Flip `status` to "ongoing" while addressing an entry and "resolved"
 //   when done. The preview renders resolved annotations gray.
