@@ -1,0 +1,50 @@
+<html><body style="background:#111;margin:0;padding:20px">
+<div id="out" style="display:flex;gap:30px;align-items:flex-end"></div>
+<script>
+// The web-app icons: a math tau, the letter Typst is named for, in a light
+// tint of the role's colour. Rendered here because it needs a real font;
+// window.__icons ends up holding the PNG bytes, base64.
+const ROLES = {
+  preview:  { bg: "#1f4fa8", tint: "#bcd4ff" },
+  annotate: { bg: "#1d7a37", tint: "#bdefc9" },
+};
+const draw = (role, n) => {
+  const { bg, tint } = ROLES[role];
+  const c = document.createElement("canvas");
+  c.width = c.height = n;
+  const g = c.getContext("2d");
+  const r = n * 0.225;
+  g.fillStyle = bg;
+  g.beginPath();
+  g.roundRect(0, 0, n, n, r);
+  g.fill();
+  g.fillStyle = tint;
+  g.font = `italic ${Math.round(n * 1.30)}px "STIXGeneral", "STIX Two Math", serif`;
+  // Centre on the glyph's ink, not on its metrics: a tau sits high and narrow
+  // in its em box, and centring on the box leaves it visibly off.
+  const m = g.measureText("τ");
+  const w = m.actualBoundingBoxRight + m.actualBoundingBoxLeft;
+  const h = m.actualBoundingBoxAscent + m.actualBoundingBoxDescent;
+  g.fillText("τ", n / 2 - (m.actualBoundingBoxRight - m.actualBoundingBoxLeft) / 2,
+             n / 2 + (m.actualBoundingBoxAscent - m.actualBoundingBoxDescent) / 2);
+  void w; void h;
+  return c;
+};
+window.__icons = {};
+for (const role of Object.keys(ROLES)) {
+  for (const n of [192, 512]) {
+    const c = draw(role, n);
+    window.__icons[`${role}-${n}`] = c.toDataURL("image/png").split(",")[1];
+    if (n === 512) {
+      const img = document.createElement("img");
+      img.src = c.toDataURL();
+      img.width = 150;
+      document.getElementById("out").append(img);
+      const small = c.cloneNode();
+      small.getContext("2d").drawImage(c, 0, 0);
+      small.style.width = "44px";
+      document.getElementById("out").append(small);
+    }
+  }
+}
+</script></body></html>

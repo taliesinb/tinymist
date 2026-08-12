@@ -6,7 +6,7 @@ pub use annotations::{
 };
 
 pub use error_overlay::{
-    annotations_js, annotations_js_path, cursor_overlay, diagnostics_payload, doc_is_dark,
+    annotations_js, annotations_js_path, cursor_overlay, EARLY_ERROR_JS, diagnostics_payload, doc_is_dark,
     overlay_js, overlay_js_path, BlockExtent, DiagRx, DiagTx, OverlayPayload,
 };
 pub use http::{make_http_server, HttpServer};
@@ -206,6 +206,23 @@ pub struct PreviewCliArgs {
     )]
     pub data_plane_host: String,
 
+    /// Keep running after the process that started this one goes away.
+    /// Without it the server exits when it is orphaned, so closing the editor
+    /// (or the terminal) that launched it does not leave a server behind.
+    #[clap(long = "daemon", default_value = "false", action = clap::ArgAction::SetTrue)]
+    pub daemon: bool,
+
+    /// Exit once the last browser disconnects, instead of staying up for the
+    /// next one. Off by default; the editor-hosted preview is expected to
+    /// outlive a closed tab, a standalone one usually is not.
+    #[clap(
+        long = "shutdown-on-last-client",
+        alias = "exit-with-client",
+        default_value = "false",
+        action = clap::ArgAction::SetTrue
+    )]
+    pub shutdown_on_last_client: bool,
+
     /// Configure the control plane server address.
     #[clap(
         long = "control-plane-host",
@@ -244,7 +261,9 @@ pub struct PreviewCliArgs {
 
     /// Application to open the preview with (e.g. a Safari web app) instead of
     /// the default browser, falling back to the default browser if opening
-    /// with the application fails.
+    /// with the application fails. Defaults to an app named after the mode —
+    /// "Typst Preview" or "Typst Annotate" — so a web app added to the Dock is
+    /// picked up without configuration.
     #[clap(long = "open-in")]
     pub open_in: Option<String>,
 
@@ -263,6 +282,118 @@ impl PreviewCliArgs {
     /// Determines whether to open the preview in the browser after compilation.
     pub fn open_in_browser(&self, default: bool) -> bool {
         !self.no_open && (self.open || default)
+    }
+
+    /// The application to open with: whatever `--open-in` said, else the web
+    /// app for this mode.
+    pub fn open_in_app(&self) -> &str {
+        match self.open_in.as_deref() {
+            Some(app) => app,
+            None if self.annotate => "Typst Annotate",
+            None => "Typst Preview",
+        }
+    }
+}
+
+/// The web-app furniture: each mode is a page of its own, with its own name,
+/// icon and manifest, so both can live in the Dock side by side. Safari takes
+/// the name, start URL, icons and scope from the manifest when there is one,
+/// and treats in-scope links as belonging to that app — which is why the
+/// annotate scope is the narrower `/annotate`.
+pub fn mode_head(html: &str, annotate: bool) -> String {
+    let (title, manifest, icon) = if annotate {
+        ("Typst Annotate", "/annotate/manifest.webmanifest", "/icon/annotate-192.png")
+    } else {
+        ("Typst Preview", "/manifest.webmanifest", "/icon/preview-192.png")
+    };
+    let head = format!(
+        "<title>{title}</title>\
+         <link rel=\"manifest\" href=\"{manifest}\">\
+         <link rel=\"apple-touch-icon\" href=\"{icon}\">\
+         <link rel=\"icon\" type=\"image/png\" href=\"{icon}\">"
+    );
+    if let Some(at) = html.find("<head>") {
+        let mut out = String::with_capacity(html.len() + head.len());
+        out.push_str(&html[..at + "<head>".len()]);
+        out.push_str(&head);
+        out.push_str(&html[at + "<head>".len()..]);
+        out
+    } else {
+        format!("{head}{html}")
+    }
+}
+
+/// The PNG behind an `/icon/...` path, if it names one of ours.
+pub fn icon_asset(path: &str) -> Option<Vec<u8>> {
+    let bytes: &[u8] = match path {
+        "/icon/preview-192.png" => include_bytes!("preview/icons/preview-192.png"),
+        "/icon/preview-512.png" => include_bytes!("preview/icons/preview-512.png"),
+        "/icon/annotate-192.png" => include_bytes!("preview/icons/annotate-192.png"),
+        "/icon/annotate-512.png" => include_bytes!("preview/icons/annotate-512.png"),
+        _ => return None,
+    };
+    Some(bytes.to_vec())
+}
+
+/// The web app manifest for a mode's path, if it names one.
+pub fn web_manifest(path: &str) -> Option<String> {
+    let (name, short, start, scope, icon) = match path {
+        "/manifest.webmanifest" => ("Typst Preview", "Preview", "/", "/", "preview"),
+        "/annotate/manifest.webmanifest" => (
+            "Typst Annotate",
+            "Annotate",
+            "/annotate",
+            "/annotate",
+            "annotate",
+        ),
+        _ => return None,
+    };
+    Some(format!(
+        r##"{{
+  "name": "{name}",
+  "short_name": "{short}",
+  "start_url": "{start}",
+  "scope": "{scope}",
+  "display": "standalone",
+  "background_color": "#1f1f24",
+  "icons": [
+    {{ "src": "/icon/{icon}-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable" }},
+    {{ "src": "/icon/{icon}-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }}
+  ]
+}}
+"##
+    ))
+}
+
+/// Exits when this process is orphaned — when whatever launched it is gone,
+/// so is the reason to keep serving.
+///
+/// Polled rather than driven by the OS: the native mechanisms are per-platform
+/// (kqueue's `EVFILT_PROC`/`NOTE_EXIT` on macOS and the BSDs, `PR_SET_PDEATHSIG`
+/// on Linux, job objects on Windows) and this costs one `getppid` every couple
+/// of seconds. Reparenting to pid 1 is the portable signal that the parent
+/// died; a process already started by pid 1 (launchd, systemd) is exempt, or it
+/// would exit immediately.
+pub fn exit_when_orphaned() {
+    #[cfg(unix)]
+    {
+        let original = std::os::unix::process::parent_id();
+        if original <= 1 {
+            log::info!("started detached: not watching for an orphaning parent");
+            return;
+        }
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                if std::os::unix::process::parent_id() != original {
+                    log::info!(
+                        target: crate::PREVIEW_COMPAT_LOG_TARGET,
+                        "the process that started this one is gone, shutting down"
+                    );
+                    std::process::exit(0);
+                }
+            }
+        });
     }
 }
 
@@ -720,6 +851,15 @@ impl PreviewState {
                 &page_title,
             );
             if diag_rx.is_some() {
+                let early = format!("<script>{EARLY_ERROR_JS}</script>");
+                frontend_html = match frontend_html.find("<head>") {
+                    Some(at) => {
+                        let mut html = frontend_html.clone();
+                        html.insert_str(at + "<head>".len(), &early);
+                        html
+                    }
+                    None => format!("{early}{frontend_html}"),
+                };
                 // Served per request so the script can be edited in the
                 // source tree and picked up on a browser reload.
                 let script = "<script src=\"/dev/overlay.js\"></script>";
@@ -736,6 +876,8 @@ impl PreviewState {
                 websocket_tx,
                 diag_rx,
                 annot,
+                // The editor owns this one's lifetime.
+                false,
             )
             .await;
             let addr = srv.addr;
@@ -936,6 +1078,22 @@ impl AnnotationServer for LspAnnotationServer {
     fn probe(&self, page: usize, x: f64, y: f64) -> Result<annotations::ProbeResult, String> {
         annotations::probe_annotate(&self.art()?, page, x, y)
     }
+
+    fn probe_span(
+        &self,
+        a: (usize, f64, f64),
+        b: (usize, f64, f64),
+    ) -> Result<annotations::ProbeResult, String> {
+        annotations::probe_span(&self.art()?, a, b)
+    }
+
+    fn layout(&self) -> Result<annotations::LayoutMap, String> {
+        Ok(annotations::layout_map(&self.art()?))
+    }
+
+    fn words(&self, s: usize, e: usize) -> Result<Vec<annotations::LayoutWord>, String> {
+        Ok(annotations::words_in_range(&self.art()?, s..e))
+    }
 }
 
 /// Serves preview annotation requests for the standalone CLI preview,
@@ -1065,6 +1223,22 @@ impl AnnotationServer for DiskAnnotationServer {
 
     fn probe(&self, page: usize, x: f64, y: f64) -> Result<annotations::ProbeResult, String> {
         annotations::probe_annotate(&self.art()?, page, x, y)
+    }
+
+    fn probe_span(
+        &self,
+        a: (usize, f64, f64),
+        b: (usize, f64, f64),
+    ) -> Result<annotations::ProbeResult, String> {
+        annotations::probe_span(&self.art()?, a, b)
+    }
+
+    fn layout(&self) -> Result<annotations::LayoutMap, String> {
+        Ok(annotations::layout_map(&self.art()?))
+    }
+
+    fn words(&self, s: usize, e: usize) -> Result<Vec<annotations::LayoutWord>, String> {
+        Ok(annotations::words_in_range(&self.art()?, s..e))
     }
 }
 

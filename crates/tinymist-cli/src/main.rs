@@ -171,6 +171,7 @@ fn main() -> Result<()> {
         Commands::Test(test) => test.verbose,
         #[cfg(feature = "preview")]
         Commands::Preview(preview) => preview.verbose,
+        #[cfg(feature = "preview")]
         Commands::Annotate(preview) => preview.verbose,
 
         // Long-running commands, usually run from an editor.
@@ -205,6 +206,7 @@ fn main() -> Result<()> {
         Commands::Query(cmds) => crate::query::query_main(cmds),
         #[cfg(feature = "preview")]
         Commands::Preview(args) => block_on(crate::preview::preview_main(args)),
+        #[cfg(feature = "preview")]
         Commands::Annotate(mut args) => {
             args.annotate = true;
             block_on(crate::preview::preview_main(args))

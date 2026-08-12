@@ -121,13 +121,19 @@ pub struct AnnotationPin {
     pub page_width: f64,
     /// The page height, in pt.
     pub page_height: f64,
-    /// "text" for a glyph-precise anchor, "block" when the anchor marks a
-    /// whole generated block (figure, `#lorem(..)` paragraph, ...).
-    pub kind: String,
-    /// For block anchors, the block's top edge, in pt.
-    pub y0: Option<f64>,
-    /// For block anchors, the block's bottom edge, in pt.
-    pub y1: Option<f64>,
+    /// What the annotation refers to: point, word, sentence, span, block
+    /// or para. The frontend decorates each scope differently.
+    pub scope: String,
+    /// The rendered boxes of the referent, one per line (empty for a
+    /// point anchor).
+    pub rects: Vec<AnnotRect>,
+    /// The x of the page's leftmost ink, in pt: the fallback rail for region
+    /// marks when the referent has no gutter of its own.
+    pub rail_x: f64,
+    /// The x, in pt, of the leftmost thing the referent covers — including
+    /// the bullets and numbers of any list items inside it, which are not
+    /// part of its own boxes. Region marks hang off this.
+    pub gutter_x: f64,
 }
 
 /// A request to create an annotation at a clicked position.
@@ -139,14 +145,36 @@ pub struct AnnotateRequest {
     /// generates one.
     #[serde(default)]
     pub uuid: Option<String>,
-    /// The 1-based page number.
-    pub page: usize,
+    /// The 1-based page number of the click, when created by clicking.
+    #[serde(default)]
+    pub page: Option<usize>,
     /// The x coordinate of the click, in pt.
-    pub x: f64,
+    #[serde(default)]
+    pub x: Option<f64>,
     /// The y coordinate of the click, in pt.
-    pub y: f64,
+    #[serde(default)]
+    pub y: Option<f64>,
     /// The comment text.
     pub text: String,
+    /// The scope to create, when the client has already decided (a click
+    /// between words makes a point, not a word).
+    #[serde(default)]
+    pub scope: Option<String>,
+    /// A source range, when the client already knows the span it wants.
+    #[serde(default)]
+    pub s: Option<usize>,
+    /// The end of that source range.
+    #[serde(default)]
+    pub e: Option<usize>,
+    /// The end point of a drag, when the annotation is a span.
+    #[serde(default)]
+    pub page2: Option<usize>,
+    /// The x coordinate of the drag end, in pt.
+    #[serde(default)]
+    pub x2: Option<f64>,
+    /// The y coordinate of the drag end, in pt.
+    #[serde(default)]
+    pub y2: Option<f64>,
 }
 
 /// The edits needed to create or delete an annotation. When the target file
@@ -192,16 +220,92 @@ pub trait AnnotationServer: Send + Sync {
     fn set_status(&self, uuid: &str, status: &str) -> Result<(), String>;
     /// Resolves a click to the exact would-be anchor position.
     fn probe(&self, page: usize, x: f64, y: f64) -> Result<ProbeResult, String>;
+    /// The document's annotatable structure, for local hit-testing.
+    fn layout(&self) -> Result<LayoutMap, String>;
+    /// The words of one region, for local word and span hit-testing.
+    fn words(&self, s: usize, e: usize) -> Result<Vec<LayoutWord>, String>;
+    /// Resolves a drag to the span it would create.
+    fn probe_span(
+        &self,
+        a: (usize, f64, f64),
+        b: (usize, f64, f64),
+    ) -> Result<ProbeResult, String>;
 }
 
-/// The document anchor text for a uuid, e.g. `<-7C42->`.
-fn anchor_text(uuid: &str) -> String {
-    format!("<-{uuid}->")
+/// What an annotation refers to. The scope is carried by the anchor label
+/// itself (`<7C42.word>`), so it is always visible in the document and
+/// never has to be stored — or kept in sync — in the sidecar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    /// A position between words: "insert something here". No decoration.
+    Point,
+    /// The word the anchor follows.
+    Word,
+    /// The sentence containing the anchor.
+    Sentence,
+    /// The text between a `.span.begin` and `.span.end` anchor pair.
+    Span,
+    /// A generated block: a figure, a `#lorem(..)` call, ...
+    Block,
+    /// A single list item: a bullet, a numbered entry, a term.
+    Item,
+    /// The paragraph containing the anchor; marked in the gutter.
+    Para,
 }
 
-/// The label name queried in the compiled document, e.g. `-7C42-`.
-fn anchor_name(uuid: &str) -> String {
-    format!("-{uuid}-")
+impl Scope {
+    fn from_suffix(suffix: &str) -> Option<Self> {
+        Some(match suffix {
+            "point" => Scope::Point,
+            "word" => Scope::Word,
+            "sentence" => Scope::Sentence,
+            "span.begin" | "span.end" => Scope::Span,
+            "block" => Scope::Block,
+            "item" => Scope::Item,
+            "para" => Scope::Para,
+            _ => return None,
+        })
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Scope::Point => "point",
+            Scope::Word => "word",
+            Scope::Sentence => "sentence",
+            Scope::Span => "span",
+            Scope::Block => "block",
+            Scope::Item => "item",
+            Scope::Para => "para",
+        }
+    }
+}
+
+/// The document anchor text for a uuid, e.g. `<7C42.word>`.
+fn anchor_text(uuid: &str, scope: Scope) -> String {
+    match scope {
+        Scope::Span => format!("<{uuid}.span.begin>"),
+        scope => format!("<{uuid}.{}>", scope.as_str()),
+    }
+}
+
+/// Finds every anchor of an annotation in a source: their byte offsets and
+/// scopes, in document order.
+fn find_anchors(text: &str, uuid: &str) -> Vec<(usize, Scope, String)> {
+    let prefix = format!("<{uuid}.");
+    let mut out = vec![];
+    let mut from = 0;
+    while let Some(rel) = text[from..].find(&prefix) {
+        let start = from + rel;
+        let Some(close) = text[start..].find('>') else {
+            break;
+        };
+        let suffix = &text[start + prefix.len()..start + close];
+        if let Some(scope) = Scope::from_suffix(suffix) {
+            out.push((start, scope, text[start..start + close + 1].to_owned()));
+        }
+        from = start + close + 1;
+    }
+    out
 }
 
 /// The sidecar path for the current main file, e.g. `typing.annos.typ`
@@ -429,81 +533,108 @@ pub fn annotation_pins(art: &LspCompiledArtifact) -> Vec<AnnotationPin> {
     let TypstDocument::Paged(paged) = &doc else {
         return vec![];
     };
-    let introspector = doc.introspector();
     let world = art.world();
     records
         .iter()
         .filter_map(|rec| {
-            // Prefer the exact anchor position: resolve the `<-XXXX->` byte
-            // offset in the source like a cursor, which lands on the precise
-            // inter-character point. Fall back to the labeled element's
-            // position (the start of its text run).
-            let needle = anchor_text(&rec.uuid);
-            // An anchor placed after generated content marks that whole
-            // block; report its extent so the frontend can point at it.
-            let block = art.depended_files().iter().find_map(|&file| {
-                use typst_shim::syntax::LinkedNodeExt;
+            // The anchors carry the scope in their labels, so what an
+            // annotation refers to is read straight off the document.
+            let (file, source, anchors) = art.depended_files().iter().find_map(|&file| {
                 let source = world.source(file).ok()?;
-                let at = source.text().find(&needle)?;
-                // What precedes the anchor decides its kind: markup text
-                // means a word anchor, anything else (a call, a figure)
-                // means the anchor marks that whole block.
-                let node = typst::syntax::LinkedNode::new(source.root())
-                    .leaf_at_compat(at)?;
-                if node.kind() == SyntaxKind::Text {
-                    return None;
+                let anchors = find_anchors(source.text(), &rec.uuid);
+                (!anchors.is_empty()).then(|| (file, source, anchors))
+            })?;
+            let text = source.text();
+            let (at, scope, label) = anchors.first().cloned()?;
+            let after = at + label.len();
+
+            // The source range the annotation refers to, per scope.
+            let range = match scope {
+                Scope::Point => None,
+                Scope::Word => Some(word_range(text, at)),
+                Scope::Sentence => Some(sentence_range(text, at)),
+                Scope::Para => Some(paragraph_range(text, at)),
+                Scope::Span => {
+                    let end = anchors
+                        .iter()
+                        .rev()
+                        .find(|(off, _, l)| *off > at && l.ends_with(".end>"));
+                    Some(after..end.map(|(off, _, _)| *off).unwrap_or(after))
                 }
-                let mut cursor = node;
-                loop {
-                    let parent = cursor.parent().cloned();
-                    match parent {
-                        Some(parent) if parent.kind() != SyntaxKind::Markup => {
-                            cursor = parent
+                Scope::Item => {
+                    // Any block of text: a list item, a heading, or failing
+                    // both, the paragraph. The marker points at its first
+                    // line, so this is uniform across block kinds.
+                    use typst_shim::syntax::LinkedNodeExt;
+                    let node = typst::syntax::LinkedNode::new(source.root())
+                        .leaf_at_compat(at)?;
+                    let mut cursor = node;
+                    let mut found = None;
+                    loop {
+                        if matches!(
+                            cursor.kind(),
+                            SyntaxKind::ListItem
+                                | SyntaxKind::EnumItem
+                                | SyntaxKind::TermItem
+                                | SyntaxKind::Heading
+                        ) {
+                            found = Some(cursor.range());
+                            break;
                         }
-                        _ => break,
+                        match cursor.parent().cloned() {
+                            Some(parent) => cursor = parent,
+                            None => break,
+                        }
                     }
+                    Some(found.unwrap_or_else(|| paragraph_range(text, at)))
                 }
-                let range = cursor.range();
-                let bbox = block_box(paged, file, &source, &range)?;
-                Some(bbox)
-            });
-            if let Some(bbox) = block {
-                let size = paged.pages().get(bbox.page - 1)?.frame.size();
-                return Some(AnnotationPin {
-                    rtype: rec.rtype.clone(),
-                    uuid: rec.uuid.clone(),
-                    letter: rec.letter.clone(),
-                    author: rec.author.clone(),
-                    content: rec.content.clone(),
-                    time: rec.time.clone(),
-                    status: rec.status.clone(),
-                    discussion: rec.discussion.clone(),
-                    page: bbox.page,
-                    x: bbox.x0,
-                    y: (bbox.y0 + bbox.y1) / 2.0,
-                    page_width: size.x.to_pt(),
-                    page_height: size.y.to_pt(),
-                    kind: "block".into(),
-                    y0: Some(bbox.y0),
-                    y1: Some(bbox.y1),
-                });
-            }
-            let exact = art.depended_files().iter().find_map(|&file| {
-                let source = world.source(file).ok()?;
-                let at = source.text().find(&needle)?;
-                exact_anchor_position(paged, &source, at)
-            });
-            let pos: PagedPosition = match exact {
-                Some(pos) => pos,
-                None => {
-                    let uuid = Label::new(PicoStr::intern(&anchor_name(&rec.uuid)))?;
-                    let elem = introspector.query_label(uuid).ok()?;
-                    let loc = elem.location()?;
-                    introspector.position(loc)?.as_paged_or_default()
+                Scope::Block => {
+                    use typst_shim::syntax::LinkedNodeExt;
+                    let node = typst::syntax::LinkedNode::new(source.root())
+                        .leaf_at_compat(at)?;
+                    let mut cursor = node;
+                    loop {
+                        let parent = cursor.parent().cloned();
+                        match parent {
+                            Some(parent) if parent.kind() != SyntaxKind::Markup => {
+                                cursor = parent
+                            }
+                            _ => break,
+                        }
+                    }
+                    Some(cursor.range())
                 }
             };
-            let page_no: usize = pos.page.into();
-            let size = paged.pages().get(page_no - 1)?.frame.size();
+            let mut rects = range
+                .as_ref()
+                .map(|range| range_rects(paged, file, &source, range, scope == Scope::Block))
+                .unwrap_or_default();
+
+            // The marker's own position: the anchor point for scopes that
+            // point at a spot, else derived from the rects by the frontend.
+            let gutter_x = gutter_of(paged, &rects);
+            let point = exact_anchor_position(paged, &source, at);
+            let (page, x, y) = match (rects.first(), point) {
+                (Some(first), _) if scope != Scope::Point => {
+                    let last = rects.last().unwrap_or(first);
+                    match scope {
+                        // An item is marked beside its bullet, which is not
+                        // part of its boxes.
+                        Scope::Item => (first.page, gutter_x, (first.y0 + first.y1) / 2.0),
+                        Scope::Block | Scope::Para => {
+                            (first.page, first.x0, (first.y0 + last.y1) / 2.0)
+                        }
+                        _ => (last.page, (last.x0 + last.x1) / 2.0, last.y1),
+                    }
+                }
+                (_, Some(pos)) => (
+                    pos.page.into(),
+                    pos.point.x.to_pt(),
+                    pos.point.y.to_pt(),
+                ),
+                _ => return None,
+            };
+            let size = paged.pages().get(page.checked_sub(1)?)?.frame.size();
             Some(AnnotationPin {
                 rtype: rec.rtype.clone(),
                 uuid: rec.uuid.clone(),
@@ -513,14 +644,15 @@ pub fn annotation_pins(art: &LspCompiledArtifact) -> Vec<AnnotationPin> {
                 time: rec.time.clone(),
                 status: rec.status.clone(),
                 discussion: rec.discussion.clone(),
-                page: page_no,
-                x: pos.point.x.to_pt(),
-                y: pos.point.y.to_pt(),
+                page,
+                x,
+                y,
                 page_width: size.x.to_pt(),
                 page_height: size.y.to_pt(),
-                kind: "text".into(),
-                y0: None,
-                y1: None,
+                scope: scope.as_str().into(),
+                rail_x: page_rail(&paged.pages().get(page - 1)?.frame),
+                gutter_x,
+                rects,
             })
         })
         .collect()
@@ -808,19 +940,318 @@ fn best_effort_patch(
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProbeResult {
-    /// "text" for a glyph-precise anchor, "block" for one attached to a
-    /// whole generated block (a figure, a `#lorem(..)` paragraph, ...).
-    pub kind: String,
+    /// The scope a new annotation here would get: "word" on text, "block"
+    /// on generated content.
+    pub scope: String,
+    /// The rendered boxes of the would-be referent.
+    pub rects: Vec<AnnotRect>,
     /// The 1-based page number.
     pub page: usize,
     /// The x coordinate of the would-be anchor, in pt.
     pub x: f64,
     /// The y coordinate of the would-be anchor, in pt.
     pub y: f64,
-    /// For block anchors, the block's vertical extent, in pt.
-    pub y0: Option<f64>,
-    /// For block anchors, the block's bottom edge, in pt.
-    pub y1: Option<f64>,
+}
+
+/// One rendered box of an annotation's target, in pt, on a page.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnnotRect {
+    /// The 1-based page number.
+    pub page: usize,
+    /// The left edge.
+    pub x0: f64,
+    /// The top edge.
+    pub y0: f64,
+    /// The right edge.
+    pub x1: f64,
+    /// The bottom edge.
+    pub y1: f64,
+}
+
+/// Collects the rendered boxes of everything whose span lies in a source
+/// range, one per rendered line (text wraps, so a range is a sequence of
+/// boxes rather than one).
+fn range_rects(
+    paged: &reflexo_typst::TypstPagedDocument,
+    id: typst::syntax::FileId,
+    source: &typst::syntax::Source,
+    range: &std::ops::Range<usize>,
+    // Generated blocks (figures, diagrams) have spans only on a few of
+    // their items, so a hit expands to the enclosing group. Text scopes
+    // must not do that, or a word inflates to its whole line.
+    use_group: bool,
+) -> Vec<AnnotRect> {
+    fn walk(
+        frame: &typst::layout::Frame,
+        id: typst::syntax::FileId,
+        source: &typst::syntax::Source,
+        range: &std::ops::Range<usize>,
+        origin: Point,
+        rows: &mut Vec<(f64, f64, f64, f64)>,
+        group: Option<(f64, f64, f64, f64)>,
+        use_group: bool,
+    ) {
+        use typst::layout::FrameItem;
+        fn add(
+            rows: &mut Vec<(f64, f64, f64, f64)>,
+            group: Option<(f64, f64, f64, f64)>,
+            x0: f64,
+            y0: f64,
+            x1: f64,
+            y1: f64,
+        ) {
+            let (x0, y0, x1, y1) = match group {
+                Some(g) => g,
+                None => (x0, y0, x1, y1),
+            };
+            // Merge into a row sharing (roughly) the same baseline.
+            for row in rows.iter_mut() {
+                if (row.3 - y1).abs() < 1.5 {
+                    row.0 = row.0.min(x0);
+                    row.1 = row.1.min(y0);
+                    row.2 = row.2.max(x1);
+                    row.3 = row.3.max(y1);
+                    return;
+                }
+            }
+            rows.push((x0, y0, x1, y1));
+        }
+        let in_range = |span: typst::syntax::Span| {
+            span.id() == Some(id)
+                && typst_shim::syntax::source_range(source, span)
+                    .is_some_and(|r| r.start >= range.start && r.end <= range.end)
+        };
+        for &(pos, ref item) in frame.items() {
+            let at = origin + pos;
+            match item {
+                FrameItem::Group(inner) => {
+                    let size = inner.frame.size();
+                    let gb = use_group.then(|| {
+                        (
+                            at.x.to_pt(),
+                            at.y.to_pt(),
+                            at.x.to_pt() + size.x.to_pt(),
+                            at.y.to_pt() + size.y.to_pt(),
+                        )
+                    });
+                    walk(
+                        &inner.frame, id, source, range, at, rows,
+                        group.or(gb), use_group,
+                    );
+                }
+                FrameItem::Text(text) => {
+                    let mut x = at.x;
+                    for glyph in &text.glyphs {
+                        let advance = glyph.x_advance.at(text.size);
+                        // A glyph's span covers its whole text node, so the
+                        // glyph's own source range is that span's start plus
+                        // the glyph's offset within it.
+                        let glyph_in_range = glyph.span.0.id() == Some(id)
+                            && typst_shim::syntax::source_range(source, glyph.span.0)
+                                .is_some_and(|r| {
+                                    let start = r.start + glyph.span.1 as usize;
+                                    let end = (start + glyph.range().len()).min(r.end);
+                                    start >= range.start && end <= range.end
+                                });
+                        if glyph_in_range {
+                            add(
+                                rows,
+                                group,
+                                x.to_pt(),
+                                at.y.to_pt() - text.size.to_pt() * 0.78,
+                                (x + advance).to_pt(),
+                                at.y.to_pt() + text.size.to_pt() * 0.22,
+                            );
+                        }
+                        x += advance;
+                    }
+                }
+                FrameItem::Shape(shape, span) => {
+                    if let typst::visualize::Geometry::Rect(size) = shape.geometry {
+                        if in_range(*span) {
+                            add(
+                                rows,
+                                group,
+                                at.x.to_pt(),
+                                at.y.to_pt(),
+                                at.x.to_pt() + size.x.to_pt(),
+                                at.y.to_pt() + size.y.to_pt(),
+                            );
+                        }
+                    }
+                }
+                FrameItem::Image(_, size, span) => {
+                    if in_range(*span) {
+                        add(
+                            rows,
+                            group,
+                            at.x.to_pt(),
+                            at.y.to_pt(),
+                            at.x.to_pt() + size.x.to_pt(),
+                            at.y.to_pt() + size.y.to_pt(),
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut out = vec![];
+    for (idx, page) in paged.pages().iter().enumerate() {
+        let mut rows = vec![];
+        walk(&page.frame, id, source, range, Point::zero(), &mut rows, None, use_group);
+        rows.sort_by(|a, b| a.3.partial_cmp(&b.3).unwrap_or(std::cmp::Ordering::Equal));
+        out.extend(rows.into_iter().map(|(x0, y0, x1, y1)| AnnotRect {
+            page: idx + 1,
+            x0,
+            y0,
+            x1,
+            y1,
+        }));
+    }
+    out
+}
+
+/// List markers ("1.", "•") are laid out by the list, not by the item's own
+/// markup, so they fall outside the item's source range. Extends a rect
+/// leftward to the nearest such glyph on the same line, so an item's box
+/// starts at its marker.
+/// The leftmost x a set of line boxes reaches once each line is extended to
+/// the marker in front of it, in pt: for a region built out of list items,
+/// the bullet column; for ordinary text, its own left edge.
+fn gutter_of(paged: &reflexo_typst::TypstPagedDocument, rects: &[AnnotRect]) -> f64 {
+    let mut best = f64::INFINITY;
+    for rect in rects {
+        let mut probe = *rect;
+        if let Some(page) = paged.pages().get(rect.page - 1) {
+            extend_to_marker(&page.frame, &mut probe);
+        }
+        best = best.min(probe.x0);
+    }
+    if best.is_finite() {
+        best
+    } else {
+        0.0
+    }
+}
+
+/// The x of the leftmost ink on a page, in pt. Markers, bullets and text all
+/// count, so a strip placed here is outside everything the page draws — the
+/// one thing the client cannot work out from a region's own boxes.
+fn page_rail(page: &typst::layout::Frame) -> f64 {
+    fn walk(frame: &typst::layout::Frame, origin: Point, best: &mut f64) {
+        use typst::layout::FrameItem;
+        for &(pos, ref item) in frame.items() {
+            let at = origin + pos;
+            match item {
+                FrameItem::Group(inner) => walk(&inner.frame, at, best),
+                FrameItem::Text(_) | FrameItem::Shape(..) | FrameItem::Image(..) => {
+                    *best = best.min(at.x.to_pt());
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut best = f64::INFINITY;
+    walk(page, Point::zero(), &mut best);
+    if best.is_finite() {
+        best
+    } else {
+        0.0
+    }
+}
+
+fn extend_to_marker(page: &typst::layout::Frame, rect: &mut AnnotRect) {
+    fn walk(
+        frame: &typst::layout::Frame,
+        origin: Point,
+        rect: &AnnotRect,
+        best: &mut Option<f64>,
+    ) {
+        use typst::layout::FrameItem;
+        for &(pos, ref item) in frame.items() {
+            let at = origin + pos;
+            match item {
+                FrameItem::Group(inner) => walk(&inner.frame, at, rect, best),
+                FrameItem::Text(text) => {
+                    let baseline = at.y.to_pt();
+                    let x0 = at.x.to_pt();
+                    let width: f64 = text
+                        .glyphs
+                        .iter()
+                        .map(|g| g.x_advance.at(text.size).to_pt())
+                        .sum();
+                    let on_line = (baseline - rect.y1).abs() < 3.0;
+                    let to_the_left = x0 < rect.x0 && x0 + width <= rect.x0 + 1.0;
+                    let near = rect.x0 - x0 < 60.0;
+                    if on_line && to_the_left && near {
+                        *best = Some(best.map_or(x0, |b: f64| b.min(x0)));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut best = None;
+    walk(page, Point::zero(), rect, &mut best);
+    if let Some(x0) = best {
+        rect.x0 = x0;
+    }
+}
+
+/// The source range of the paragraph containing a position: markup between
+/// blank lines.
+fn paragraph_range(text: &str, at: usize) -> std::ops::Range<usize> {
+    let start = text[..at].rfind("\n\n").map(|i| i + 2).unwrap_or(0);
+    let end = text[at..]
+        .find("\n\n")
+        .map(|i| at + i)
+        .unwrap_or_else(|| text.len());
+    start..end
+}
+
+/// The source range of the sentence containing a position, clipped to its
+/// paragraph. Sentence ends are `.`, `!` or `?` followed by whitespace —
+/// a heuristic, but one an agent can re-derive from the same source.
+fn sentence_range(text: &str, at: usize) -> std::ops::Range<usize> {
+    let para = paragraph_range(text, at);
+    let bytes = text.as_bytes();
+    let is_end = |i: usize| {
+        matches!(bytes[i], b'.' | b'!' | b'?')
+            && bytes
+                .get(i + 1)
+                .is_none_or(|c| c.is_ascii_whitespace())
+    };
+    let mut start = para.start;
+    for i in (para.start..at.min(para.end)).rev() {
+        if is_end(i) {
+            start = i + 1;
+            break;
+        }
+    }
+    while start < para.end && bytes[start].is_ascii_whitespace() {
+        start += 1;
+    }
+    let mut end = para.end;
+    for i in at.max(para.start)..para.end {
+        if is_end(i) {
+            end = i + 1;
+            break;
+        }
+    }
+    start..end.max(start)
+}
+
+/// The word ending at a position: back to the preceding whitespace.
+fn word_range(text: &str, at: usize) -> std::ops::Range<usize> {
+    let bytes = text.as_bytes();
+    let mut start = at;
+    while start > 0 && !bytes[start - 1].is_ascii_whitespace() {
+        start -= 1;
+    }
+    start..at
 }
 
 /// The rendered extent of a source range on a page: the union of the boxes
@@ -1040,6 +1471,289 @@ fn span_under_click(
     }
 }
 
+/// A word as rendered: its box and the source range behind it.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LayoutWord {
+    /// The 1-based page number.
+    pub page: usize,
+    /// The left edge, in pt.
+    pub x0: f64,
+    /// The top edge, in pt.
+    pub y0: f64,
+    /// The right edge, in pt.
+    pub x1: f64,
+    /// The bottom edge, in pt.
+    pub y1: f64,
+    /// The start of the word in the source.
+    pub s: usize,
+    /// The end of the word in the source.
+    pub e: usize,
+}
+
+/// A structural region of the document: what a click there would annotate
+/// at block granularity.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LayoutBlock {
+    /// "heading", "item", "para" or "block".
+    pub kind: String,
+    /// The start of the region in the source.
+    pub s: usize,
+    /// The end of the region in the source.
+    pub e: usize,
+    /// The rendered boxes of the region, one per line.
+    pub rects: Vec<AnnotRect>,
+    /// The x, in pt, where this region's own marker belongs: left of a list
+    /// item's bullet or number, or the text edge for anything else. The
+    /// client cannot derive this — a bullet is not part of the region's
+    /// boxes — so it is measured here.
+    pub gutter_x: f64,
+    /// The rail for the region's page: the leftmost ink on it, in pt.
+    pub rail_x: f64,
+}
+
+/// The document's annotatable structure, sent to the frontend in bulk so it
+/// can hit-test locally instead of probing the server on every mouse move.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LayoutMap {
+    /// Every structural region, innermost last. Word boxes are fetched per
+    /// region on demand — they are the bulky part and are only needed once
+    /// the cursor is actually inside a region.
+    pub blocks: Vec<LayoutBlock>,
+}
+
+/// Collects every rendered word of the main file with its source range.
+fn layout_words(
+    paged: &reflexo_typst::TypstPagedDocument,
+    id: typst::syntax::FileId,
+    source: &typst::syntax::Source,
+) -> Vec<LayoutWord> {
+    fn walk(
+        frame: &typst::layout::Frame,
+        id: typst::syntax::FileId,
+        source: &typst::syntax::Source,
+        origin: Point,
+        page: usize,
+        out: &mut Vec<LayoutWord>,
+    ) {
+        use typst::layout::FrameItem;
+        let text_of = source.text();
+        for &(pos, ref item) in frame.items() {
+            let at = origin + pos;
+            match item {
+                FrameItem::Group(inner) => walk(&inner.frame, id, source, at, page, out),
+                FrameItem::Text(text) => {
+                    let mut x = at.x;
+                    let mut cur: Option<LayoutWord> = None;
+                    for glyph in &text.glyphs {
+                        let advance = glyph.x_advance.at(text.size);
+                        let src = (glyph.span.0.id() == Some(id))
+                            .then(|| typst_shim::syntax::source_range(source, glyph.span.0))
+                            .flatten()
+                            .map(|r| r.start + glyph.span.1 as usize);
+                        let is_space = src
+                            .and_then(|s| text_of.get(s..).and_then(|t| t.chars().next()))
+                            .is_none_or(|c| c.is_whitespace());
+                        match (src, is_space) {
+                            (Some(s), false) => {
+                                let e = s + glyph.range().len().max(1);
+                                let (x0, y0, x1, y1) = (
+                                    x.to_pt(),
+                                    at.y.to_pt() - text.size.to_pt() * 0.78,
+                                    (x + advance).to_pt(),
+                                    at.y.to_pt() + text.size.to_pt() * 0.22,
+                                );
+                                match cur.as_mut() {
+                                    // Same word: contiguous in the source.
+                                    Some(w) if w.e >= s && (w.y1 - y1).abs() < 1.5 => {
+                                        w.x1 = x1.max(w.x1);
+                                        w.e = e.max(w.e);
+                                    }
+                                    _ => {
+                                        if let Some(w) = cur.take() {
+                                            out.push(w);
+                                        }
+                                        cur = Some(LayoutWord {
+                                            page,
+                                            x0,
+                                            y0,
+                                            x1,
+                                            y1,
+                                            s,
+                                            e,
+                                        });
+                                    }
+                                }
+                            }
+                            _ => {
+                                if let Some(w) = cur.take() {
+                                    out.push(w);
+                                }
+                            }
+                        }
+                        x += advance;
+                    }
+                    if let Some(w) = cur.take() {
+                        out.push(w);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut out = vec![];
+    for (idx, page) in paged.pages().iter().enumerate() {
+        walk(&page.frame, id, source, Point::zero(), idx + 1, &mut out);
+    }
+    out
+}
+
+/// Groups words into per-line boxes for a source range.
+fn rects_from_words(words: &[LayoutWord], range: &std::ops::Range<usize>) -> Vec<AnnotRect> {
+    let mut rows: Vec<AnnotRect> = vec![];
+    for w in words.iter().filter(|w| w.s >= range.start && w.e <= range.end) {
+        match rows.last_mut() {
+            Some(row) if row.page == w.page && (row.y1 - w.y1).abs() < 1.5 => {
+                row.x0 = row.x0.min(w.x0);
+                row.y0 = row.y0.min(w.y0);
+                row.x1 = row.x1.max(w.x1);
+                row.y1 = row.y1.max(w.y1);
+            }
+            _ => rows.push(AnnotRect {
+                page: w.page,
+                x0: w.x0,
+                y0: w.y0,
+                x1: w.x1,
+                y1: w.y1,
+            }),
+        }
+    }
+    rows
+}
+
+/// Builds the document's structural map: every word, and every heading,
+/// list item and paragraph with its rendered boxes.
+pub fn layout_map(art: &LspCompiledArtifact) -> LayoutMap {
+    let world = art.world();
+    let Some(doc) = art.success_doc() else {
+        return LayoutMap { blocks: vec![] };
+    };
+    let TypstDocument::Paged(paged) = &doc else {
+        return LayoutMap { blocks: vec![] };
+    };
+    let id = world.main();
+    let Ok(source) = world.source(id) else {
+        return LayoutMap { blocks: vec![] };
+    };
+    let words = layout_words(paged, id, &source);
+
+    let mut blocks = vec![];
+    // Headings and list items come from the syntax tree.
+    fn collect(
+        node: &typst::syntax::LinkedNode,
+        words: &[LayoutWord],
+        out: &mut Vec<LayoutBlock>,
+    ) {
+        let kind = match node.kind() {
+            SyntaxKind::Heading => Some("heading"),
+            SyntaxKind::ListItem | SyntaxKind::EnumItem | SyntaxKind::TermItem => Some("item"),
+            _ => None,
+        };
+        if let Some(kind) = kind {
+            let range = node.range();
+            let rects = rects_from_words(words, &range);
+            if !rects.is_empty() {
+                out.push(LayoutBlock {
+                    kind: kind.into(),
+                    s: range.start,
+                    e: range.end,
+                    gutter_x: rects[0].x0,
+                    rail_x: 0.0,
+                    rects,
+                });
+            }
+        }
+        for child in node.children() {
+            collect(&child, words, out);
+        }
+    }
+    collect(&typst::syntax::LinkedNode::new(source.root()), &words, &mut blocks);
+
+    // Paragraphs are the markup between blank lines.
+    let text = source.text();
+    let mut at = 0;
+    while at < text.len() {
+        let range = paragraph_range(text, at);
+        if range.end > range.start {
+            let rects = rects_from_words(&words, &range);
+            if !rects.is_empty() {
+                blocks.push(LayoutBlock {
+                    kind: "para".into(),
+                    s: range.start,
+                    e: range.end,
+                    gutter_x: rects[0].x0,
+                    rail_x: 0.0,
+                    rects,
+                });
+            }
+        }
+        at = (range.end + 2).max(at + 1);
+    }
+
+    // The marker's true left edge, and the page rail, measured off the frames.
+    let rails: Vec<f64> = paged.pages().iter().map(|p| page_rail(&p.frame)).collect();
+    for block in &mut blocks {
+        let Some(first) = block.rects.first().copied() else {
+            continue;
+        };
+        block.rail_x = rails.get(first.page - 1).copied().unwrap_or(0.0);
+        block.gutter_x = first.x0;
+        if block.kind == "item" {
+            if let Some(page) = paged.pages().get(first.page - 1) {
+                let mut probe = first;
+                extend_to_marker(&page.frame, &mut probe);
+                block.gutter_x = probe.x0;
+            }
+        }
+    }
+    // A region reaches as far left as anything it contains: a paragraph made
+    // of bullets owns their markers, so its own mark clears them too.
+    let own: Vec<(usize, usize, f64)> = blocks
+        .iter()
+        .map(|b| (b.s, b.e, b.gutter_x))
+        .collect();
+    for block in &mut blocks {
+        for &(s, e, gutter) in &own {
+            if s >= block.s && e <= block.e && gutter < block.gutter_x {
+                block.gutter_x = gutter;
+            }
+        }
+    }
+    LayoutMap { blocks }
+}
+
+/// The rendered words of one source range, for local hit-testing while the
+/// cursor is inside that region.
+pub fn words_in_range(art: &LspCompiledArtifact, range: std::ops::Range<usize>) -> Vec<LayoutWord> {
+    let world = art.world();
+    let Some(doc) = art.success_doc() else {
+        return vec![];
+    };
+    let TypstDocument::Paged(paged) = &doc else {
+        return vec![];
+    };
+    let id = world.main();
+    let Ok(source) = world.source(id) else {
+        return vec![];
+    };
+    layout_words(paged, id, &source)
+        .into_iter()
+        .filter(|w| w.s >= range.start && w.e <= range.end)
+        .collect()
+}
+
 /// Resolves a click to the source position where an anchor label would be
 /// inserted: the end of the clicked word. Errors when the click does not
 /// hit markup text (margins, whitespace past the end of the document, math,
@@ -1074,8 +1788,14 @@ fn resolve_click(
     // resolved via a shape, a group, or the nearest caption — in which case
     // the annotation belongs to the whole block, not to that text.
     let mut direct = true;
+    // The offset within the span matters: it is what distinguishes the
+    // clicked word from the first word of its text run.
+    let mut offset = 0;
     let span = match jump_from_click(world, &page.frame, click) {
-        Some((start, _)) => start.span,
+        Some((start, _)) => {
+            offset = start.offset;
+            start.span
+        }
         None => {
             direct = false;
             let mut best = None;
@@ -1097,7 +1817,7 @@ fn resolve_click(
             }
         }
     };
-    let start = reflexo::debug_loc::SourceSpanOffset { span, offset: 0 };
+    let start = reflexo::debug_loc::SourceSpanOffset { span, offset };
     let id = start.span.id().ok_or("clicked text has no source")?;
     let source = world.source(id).map_err(|e| e.to_string())?;
     let node = source.find(start.span).ok_or("span not found in source")?;
@@ -1138,6 +1858,24 @@ fn resolve_click(
 
 /// Resolves a click to the exact would-be anchor position, without editing
 /// anything.
+/// The word-level source range a drag between two clicks covers.
+fn span_range(
+    art: &LspCompiledArtifact,
+    a: (usize, f64, f64),
+    b: (usize, f64, f64),
+) -> Result<(typst::syntax::FileId, typst::syntax::Source, std::ops::Range<usize>), String> {
+    let (id_a, source, at_a, _) = resolve_click(art, a.0, a.1, a.2)?;
+    let (id_b, _, at_b, _) = resolve_click(art, b.0, b.1, b.2)?;
+    if id_a != id_b {
+        return Err("a span cannot cross files".into());
+    }
+    let text = source.text();
+    let (lo, hi) = if at_a <= at_b { (at_a, at_b) } else { (at_b, at_a) };
+    // Word-level: from the start of the first word to the end of the last.
+    let start = word_range(text, lo).start;
+    Ok((id_a, source, start..hi))
+}
+
 pub fn probe_annotate(
     art: &LspCompiledArtifact,
     page_no: usize,
@@ -1148,39 +1886,57 @@ pub fn probe_annotate(
     let Some(TypstDocument::Paged(paged)) = art.success_doc() else {
         return Err("no rendered document".into());
     };
-    // A block anchor marks the whole generated block: report its extent so
-    // the frontend can point at it from the left, rather than pretending to
-    // mark a position inside text that does not exist in the source.
-    if let Some(range) = block {
-        if let Some(bbox) = block_box(&paged, id, &source, &range) {
-            return Ok(ProbeResult {
-                kind: "block".into(),
-                page: bbox.page,
-                x: bbox.x0,
-                y: (bbox.y0 + bbox.y1) / 2.0,
-                y0: Some(bbox.y0),
-                y1: Some(bbox.y1),
-            });
+    // Clicking generated content annotates that whole block; clicking text
+    // annotates the word, which is what the marker previews.
+    let (scope, range) = match block {
+        Some(range) => (Scope::Block, range),
+        None => (Scope::Word, word_range(source.text(), at)),
+    };
+    let rects = range_rects(&paged, id, &source, &range, scope == Scope::Block);
+    let (page, x, y) = match rects.first() {
+        Some(first) => {
+            let last = rects.last().unwrap_or(first);
+            match scope {
+                Scope::Block => (first.page, first.x0, (first.y0 + last.y1) / 2.0),
+                _ => (last.page, (last.x0 + last.x1) / 2.0, last.y1),
+            }
         }
-    }
-    match exact_anchor_position(&paged, &source, at) {
-        Some(pos) => Ok(ProbeResult {
-            kind: "text".into(),
-            page: pos.page.into(),
-            x: pos.point.x.to_pt(),
-            y: pos.point.y.to_pt(),
-            y0: None,
-            y1: None,
-        }),
-        None => Ok(ProbeResult {
-            kind: "text".into(),
-            page: page_no,
-            x,
-            y,
-            y0: None,
-            y1: None,
-        }),
-    }
+        None => match exact_anchor_position(&paged, &source, at) {
+            Some(pos) => (pos.page.into(), pos.point.x.to_pt(), pos.point.y.to_pt()),
+            None => (page_no, x, y),
+        },
+    };
+    Ok(ProbeResult {
+        scope: scope.as_str().into(),
+        rects,
+        page,
+        x,
+        y,
+    })
+}
+
+/// Resolves a drag to the span it would create.
+pub fn probe_span(
+    art: &LspCompiledArtifact,
+    a: (usize, f64, f64),
+    b: (usize, f64, f64),
+) -> Result<ProbeResult, String> {
+    let (id, source, range) = span_range(art, a, b)?;
+    let Some(TypstDocument::Paged(paged)) = art.success_doc() else {
+        return Err("no rendered document".into());
+    };
+    let rects = range_rects(&paged, id, &source, &range, false);
+    let (page, x, y) = match (rects.first(), rects.last()) {
+        (Some(_), Some(last)) => (last.page, (last.x0 + last.x1) / 2.0, last.y1),
+        _ => (a.0, a.1, a.2),
+    };
+    Ok(ProbeResult {
+        scope: Scope::Span.as_str().into(),
+        rects,
+        page,
+        x,
+        y,
+    })
 }
 
 /// Prepares the edits creating an annotation at a clicked position: an
@@ -1192,11 +1948,109 @@ pub fn prepare_annotate(
     encoding: PositionEncoding,
 ) -> Result<AnnotationEdit, String> {
     let world = art.world();
-    let (id, source, at, _) = resolve_click(art, req.page, req.x, req.y)?;
+    // A client-side drag sends the source range it highlighted.
+    if let (Some(s), Some(e)) = (req.s, req.e) {
+        return prepare_span_range(art, req, s..e, encoding);
+    }
+    // A bare offset anchors at a point the client picked (between words).
+    if let Some(at) = req.s {
+        let scope = req
+            .scope
+            .as_deref()
+            .and_then(Scope::from_suffix)
+            .unwrap_or(Scope::Point);
+        return prepare_at(art, req, at, scope, encoding);
+    }
+    let (page, x, y) = match (req.page, req.x, req.y) {
+        (Some(page), Some(x), Some(y)) => (page, x, y),
+        _ => return Err("a click position or a source range is required".into()),
+    };
+    // A drag creates a span: two anchors bracketing the dragged words.
+    if let (Some(page2), Some(x2), Some(y2)) = (req.page2, req.x2, req.y2) {
+        return prepare_span(art, req, (page, x, y), (page2, x2, y2), encoding);
+    }
+    let (id, source, at, block) = resolve_click(art, page, x, y)?;
+    let scope = if block.is_some() { Scope::Block } else { Scope::Word };
 
+    prepare_at(art, req, at, scope, encoding)
+}
+
+/// A label placed where content has not started yet — at the head of a line,
+/// or before a list marker — attaches to whatever came *before* it: the
+/// previous item, or nothing at all, and a marker pushed off the line start
+/// stops being a marker. Region scopes (which anchor at the start of the
+/// region they cover) therefore snap forward past the marker to the end of
+/// the region's first word, where the label binds to the text it belongs to.
+fn snap_past_marker(text: &str, at: usize) -> usize {
+    let bytes = text.as_bytes();
+    let line_start = text[..at].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    // Already inside the text? Leave the anchor where the caller put it.
+    if text[line_start..at].chars().any(|c| !c.is_whitespace()) {
+        return at;
+    }
+    let mut i = at;
+    let space = |b: u8| b == b' ' || b == b'\t';
+    while i < bytes.len() && space(bytes[i]) {
+        i += 1;
+    }
+    // A list marker: "-", "+", "/", or an enumerator like "12." / "12)".
+    let before_marker = i;
+    if i < bytes.len() {
+        match bytes[i] {
+            b'-' | b'+' | b'/' => i += 1,
+            b'0'..=b'9' => {
+                let mut j = i;
+                while j < bytes.len() && bytes[j].is_ascii_digit() {
+                    j += 1;
+                }
+                if j < bytes.len() && (bytes[j] == b'.' || bytes[j] == b')') {
+                    i = j + 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    // Only a marker if a space follows it; otherwise it was ordinary text.
+    if i > before_marker && !(i < bytes.len() && space(bytes[i])) {
+        i = before_marker;
+    }
+    while i < bytes.len() && space(bytes[i]) {
+        i += 1;
+    }
+    // Past the first word of the body, so the label has content to bind to.
+    while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    while i < text.len() && !text.is_char_boundary(i) {
+        i += 1;
+    }
+    if i >= text.len() {
+        at
+    } else {
+        i
+    }
+}
+
+/// Creates an annotation whose anchor goes at a known source offset.
+fn prepare_at(
+    art: &LspCompiledArtifact,
+    req: &AnnotateRequest,
+    at: usize,
+    scope: Scope,
+    encoding: PositionEncoding,
+) -> Result<AnnotationEdit, String> {
+    let world = art.world();
+    let id = world.main();
+    let source = world.source(id).map_err(|e| e.to_string())?;
     let path = world.path_for_id(id).map_err(|e| e.to_string())?;
     let path = path.to_err().map_err(|e| e.to_string())?;
     let uri = Url::from_file_path(&path).map_err(|_| "bad file path".to_string())?;
+    // Region scopes anchor at the region's start, which may sit before a list
+    // marker or at a line head; move into the text so the label binds there.
+    let at = match scope {
+        Scope::Item | Scope::Para => snap_past_marker(source.text(), at),
+        _ => at,
+    };
     let pos = to_lsp_position(at, encoding, &source);
 
     let sidecar = sidecar_path(art).ok_or("cannot determine the sidecar path")?;
@@ -1213,7 +2067,7 @@ pub fn prepare_annotate(
     };
     let sidecar_content = format!("{content}{}", format_record(&rec));
 
-    let new_text = anchor_text(&rec.uuid);
+    let new_text = anchor_text(&rec.uuid, scope);
     let (disk_content, buffer_edit) = disk_edit(&path, source.text(), at..at, &new_text);
     Ok(AnnotationEdit {
         uri,
@@ -1223,6 +2077,79 @@ pub fn prepare_annotate(
         range: lsp_types::Range::new(as_lsp(pos), as_lsp(pos)),
         new_text,
         uuid: rec.uuid,
+        sidecar,
+        sidecar_content,
+    })
+}
+
+/// Prepares the edits creating a span annotation from a drag: a
+/// `<uuid.span.begin>` before the first word and a `<uuid.span.end>` after
+/// the last, plus the sidecar entry.
+fn prepare_span(
+    art: &LspCompiledArtifact,
+    req: &AnnotateRequest,
+    a: (usize, f64, f64),
+    b: (usize, f64, f64),
+    encoding: PositionEncoding,
+) -> Result<AnnotationEdit, String> {
+    let (_, _, range) = span_range(art, a, b)?;
+    prepare_span_range(art, req, range, encoding)
+}
+
+/// Creates a span annotation over a known source range.
+fn prepare_span_range(
+    art: &LspCompiledArtifact,
+    req: &AnnotateRequest,
+    range: std::ops::Range<usize>,
+    encoding: PositionEncoding,
+) -> Result<AnnotationEdit, String> {
+    let world = art.world();
+    let id = world.main();
+    let source = world.source(id).map_err(|e| e.to_string())?;
+    if range.is_empty() {
+        return Err("empty span".into());
+    }
+    let path = world.path_for_id(id).map_err(|e| e.to_string())?;
+    let path = path.to_err().map_err(|e| e.to_string())?;
+    let uri = Url::from_file_path(&path).map_err(|_| "bad file path".to_string())?;
+
+    let sidecar = sidecar_path(art).ok_or("cannot determine the sidecar path")?;
+    let (records, content) = read_sidecar(&sidecar);
+    let rec = AnnotationRecord {
+        rtype: "comment".into(),
+        uuid: fresh_label(&records, req.uuid.as_deref()),
+        letter: next_letter(&records),
+        author: local_author(),
+        content: req.text.clone(),
+        time: iso_now(),
+        status: "created".into(),
+        discussion: vec![],
+    };
+    let sidecar_content = format!("{content}{}", format_record(&rec));
+
+    // Insert the end anchor first: inserting the begin anchor would shift
+    // every later offset.
+    let begin = format!("<{}.span.begin>", rec.uuid);
+    let end = format!("<{}.span.end>", rec.uuid);
+    let mut new_source = source.text().to_owned();
+    new_source.insert_str(range.end, &end);
+    new_source.insert_str(range.start, &begin);
+    let disk_content = match std::fs::read_to_string(&path) {
+        Ok(disk) if disk == source.text() => Some(new_source.clone()),
+        _ => None,
+    };
+    let pos = to_lsp_position(range.start, encoding, &source);
+    Ok(AnnotationEdit {
+        uuid: rec.uuid,
+        uri,
+        disk_content,
+        // The whole file is rewritten on disk; the editor gets the begin
+        // anchor as an insertion and the end anchor follows on the next
+        // compile from disk.
+        buffer_edit: false,
+        path: path.to_path_buf(),
+        range: lsp_types::Range::new(as_lsp(pos), as_lsp(pos)),
+        new_text: begin,
         sidecar,
         sidecar_content,
     })
@@ -1247,13 +2174,16 @@ pub fn prepare_delete(
     sidecar_content.replace_range(span, "");
 
     // Find the anchor label in the compiled project's files.
-    let needle = anchor_text(uuid);
+    let needle_prefix = format!("<{uuid}.");
     let hit = art.depended_files().iter().find_map(|&file| {
         let source = world.source(file).ok()?;
-        let at = source.text().find(&needle)?;
-        Some((file, at))
+        let anchors = find_anchors(source.text(), uuid);
+        (!anchors.is_empty()).then(|| (file, anchors))
     });
-    let (file, at) = hit.ok_or_else(|| format!("uuid {needle} not found in any source file"))?;
+    let (file, anchors) = hit.ok_or_else(|| {
+        format!("no anchor {needle_prefix}..> found in any source file")
+    })?;
+    let (at, _, needle) = anchors.first().cloned().unwrap();
     let source = world.source(file).map_err(|e| e.to_string())?;
     let path = world.path_for_id(file).map_err(|e| e.to_string())?;
     let path = path.to_err().map_err(|e| e.to_string())?;
@@ -1261,7 +2191,21 @@ pub fn prepare_delete(
     let start = to_lsp_position(at, encoding, &source);
     let end = to_lsp_position(at + needle.len(), encoding, &source);
 
-    let (disk_content, buffer_edit) = disk_edit(&path, source.text(), at..at + needle.len(), "");
+    // Remove every anchor of this annotation (a span has two), last first
+    // so earlier offsets stay valid.
+    let mut stripped = source.text().to_owned();
+    for (off, _, label) in anchors.iter().rev() {
+        stripped.replace_range(*off..*off + label.len(), "");
+    }
+    let (mut disk_content, buffer_edit) =
+        disk_edit(&path, source.text(), at..at + needle.len(), "");
+    if anchors.len() > 1 {
+        // The single-range disk patch cannot express two removals.
+        disk_content = match std::fs::read_to_string(&path) {
+            Ok(disk) if disk == source.text() => Some(stripped),
+            _ => None,
+        };
+    }
     Ok(AnnotationEdit {
         uuid: uuid.to_owned(),
         uri,
@@ -1332,4 +2276,38 @@ pub fn prepare_status(
 
 fn as_lsp(pos: LspPosition) -> lsp_types::Position {
     lsp_types::Position::new(pos.line, pos.character)
+}
+
+#[cfg(test)]
+mod anchor_tests {
+    use super::snap_past_marker;
+
+    fn snapped(text: &str, at: usize) -> String {
+        let i = snap_past_marker(text, at);
+        format!("{}<L>{}", &text[..i], &text[i..])
+    }
+
+    #[test]
+    fn snaps_past_list_markers() {
+        // bullet: the label lands after the first word of the body
+        let t = "- Agents watch the sidecar\n";
+        assert_eq!(snapped(t, 0), "- Agents<L> watch the sidecar\n");
+        // indented bullet
+        let t = "text\n  - A nested bullet here\n";
+        assert_eq!(snapped(t, 5), "text\n  - A<L> nested bullet here\n");
+        // enumerator
+        let t = "+ A numbered item, first\n";
+        assert_eq!(snapped(t, 0), "+ A<L> numbered item, first\n");
+        let t = "12. A numbered item\n";
+        assert_eq!(snapped(t, 0), "12. A<L> numbered item\n");
+        // plain paragraph start
+        let t = "This document demonstrates\n";
+        assert_eq!(snapped(t, 0), "This<L> document demonstrates\n");
+        // a hyphen that is not a marker stays put
+        let t = "-notamarker word\n";
+        assert_eq!(snapped(t, 0), "-notamarker<L> word\n");
+        // an offset already inside the text is left alone
+        let t = "- Agents watch\n";
+        assert_eq!(snapped(t, 9), "- Agents <L>watch\n");
+    }
 }

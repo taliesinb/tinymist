@@ -29,12 +29,24 @@ pub async fn make_http_server(
     websocket_tx: mpsc::UnboundedSender<HyperWebsocket>,
     diag_rx: Option<super::DiagRx>,
     annot: Option<std::sync::Arc<dyn super::AnnotationServer>>,
+    shutdown_on_last_client: bool,
 ) -> HttpServer {
     use futures::StreamExt;
     use http_body_util::{Full, StreamBody};
     use hyper::body::{Bytes, Frame, Incoming};
     type Server = hyper_util::server::conn::auto::Builder<hyper_util::rt::TokioExecutor>;
     type Body = http_body_util::combinators::UnsyncBoxBody<Bytes, std::convert::Infallible>;
+
+    /// One open page, counted for as long as its event stream lives. Page
+    /// count is the honest measure of "is anyone there": a browser keeps idle
+    /// TCP connections pooled long after the tab that opened them is gone, but
+    /// it tears down the event stream immediately.
+    struct ClientGuard(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+    impl Drop for ClientGuard {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
 
     fn sse_frame(payload: &super::OverlayPayload) -> Result<Frame<Bytes>, std::convert::Infallible> {
         let payload = serde_json::to_string(payload).unwrap_or_default();
@@ -48,18 +60,27 @@ pub async fn make_http_server(
     log::info!("preview server listening on http://{addr}");
 
     let frontend_html = hyper::body::Bytes::from(frontend_html);
-    let make_service = move || {
+    let live = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let served_anyone = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let make_service = {
+        let live = live.clone();
+        let served_anyone = served_anyone.clone();
+        move || {
         let frontend_html = frontend_html.clone();
         let websocket_tx = websocket_tx.clone();
         let static_file_addr = static_file_addr.clone();
         let diag_rx = diag_rx.clone();
         let annot = annot.clone();
+        let live = live.clone();
+        let served_anyone = served_anyone.clone();
         service_fn(move |mut req: hyper::Request<Incoming>| {
             let frontend_html = frontend_html.clone();
             let websocket_tx = websocket_tx.clone();
             let static_file_addr = static_file_addr.clone();
             let diag_rx = diag_rx.clone();
             let annot = annot.clone();
+            let live = live.clone();
+            let served_anyone = served_anyone.clone();
             async move {
                 // When a user visits a website in a browser, that website can try to connect to
                 // our http / websocket server on `127.0.0.1` which may leak sensitive
@@ -84,6 +105,16 @@ pub async fn make_http_server(
                     );
                 }
 
+                log::info!(
+                    target: crate::PREVIEW_COMPAT_LOG_TARGET,
+                    "{} {} ua={:?}",
+                    req.method(),
+                    req.uri().path(),
+                    req.headers()
+                        .get(hyper::header::USER_AGENT)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("-"),
+                );
                 // Check if the request is a websocket upgrade request.
                 if hyper_tungstenite::is_upgrade_request(&req) {
                     if origin_header.is_none() {
@@ -100,22 +131,62 @@ pub async fn make_http_server(
 
                     // Return the response so the spawned future can continue.
                     Ok(response.map(|b| Body::new(b)))
-                } else if req.uri().path() == "/" {
-                    // log::debug!("Serve frontend: {mode:?}");
+                } else if req.uri().path() == "/" || req.uri().path() == "/annotate" {
+                    // Two paths, one document: the mode rides in the URL, so each
+                    // has its own manifest, icon and dock app.
+                    let annotate = req.uri().path() == "/annotate";
+                    let html = super::mode_head(
+                        std::str::from_utf8(&frontend_html).unwrap_or_default(),
+                        annotate,
+                    );
                     let res = hyper::Response::builder()
                         .header(hyper::header::CONTENT_TYPE, "text/html")
-                        .body(Body::new(Full::<Bytes>::from(frontend_html)))
+                        .body(Body::new(Full::<Bytes>::from(html)))
+                        .unwrap();
+                    Ok(res)
+                } else if let Some(icon) = super::icon_asset(req.uri().path()) {
+                    let res = hyper::Response::builder()
+                        .header(hyper::header::CONTENT_TYPE, "image/png")
+                        .header(hyper::header::CACHE_CONTROL, "max-age=3600")
+                        .body(Body::new(Full::<Bytes>::from(icon)))
+                        .unwrap();
+                    Ok(res)
+                } else if let Some(manifest) = super::web_manifest(req.uri().path()) {
+                    let res = hyper::Response::builder()
+                        .header(hyper::header::CONTENT_TYPE, "application/manifest+json")
+                        .body(Body::new(Full::<Bytes>::from(manifest)))
                         .unwrap();
                     Ok(res)
                 } else if req.uri().path() == "/dev/diagnostics" && diag_rx.is_some() {
                     // Stream diagnostics updates as server-sent events.
                     let rx = diag_rx.unwrap();
                     let init = rx.borrow().clone();
+                    use std::sync::atomic::Ordering::SeqCst;
+                    live.fetch_add(1, SeqCst);
+                    served_anyone.store(true, SeqCst);
+                    let guard = ClientGuard(live.clone());
+                    // A comment line every few seconds. Nothing reads it: it
+                    // exists so writing to a browser that has gone away fails,
+                    // which is the only way this connection learns it is dead
+                    // during a quiet stretch with no recompiles.
                     let stream = futures::stream::once(async move { sse_frame(&init) }).chain(
-                        futures::stream::unfold(rx, |mut rx| async move {
-                            rx.changed().await.ok()?;
-                            let payload = rx.borrow_and_update().clone();
-                            Some((sse_frame(&payload), rx))
+                        futures::stream::unfold((rx, guard), |(mut rx, guard)| async move {
+                            loop {
+                                let tick = tokio::time::sleep(std::time::Duration::from_secs(3));
+                                tokio::select! {
+                                    changed = rx.changed() => {
+                                        changed.ok()?;
+                                        let payload = rx.borrow_and_update().clone();
+                                        return Some((sse_frame(&payload), (rx, guard)));
+                                    }
+                                    _ = tick => {
+                                        return Some((
+                                            Ok(Frame::data(Bytes::from_static(b": ping\n\n"))),
+                                            (rx, guard),
+                                        ));
+                                    }
+                                }
+                            }
                         }),
                     );
                     let res = hyper::Response::builder()
@@ -196,24 +267,94 @@ pub async fn make_http_server(
                                 .set_status(&req.uuid, &req.status)
                                 .map(|()| String::new())
                         }),
+                        "/dev/annotate/layout" => {
+                            let (status, body) = match annot.layout() {
+                                Ok(map) => (
+                                    hyper::StatusCode::OK,
+                                    serde_json::to_string(&serde_json::json!({
+                                        "ok": true,
+                                        "blocks": map.blocks,
+                                    }))
+                                    .unwrap_or_default(),
+                                ),
+                                Err(err) => (
+                                    hyper::StatusCode::BAD_REQUEST,
+                                    serde_json::json!({ "ok": false, "error": err })
+                                        .to_string(),
+                                ),
+                            };
+                            let res = hyper::Response::builder()
+                                .status(status)
+                                .header(hyper::header::CONTENT_TYPE, "application/json")
+                                .header(hyper::header::CACHE_CONTROL, "no-cache")
+                                .body(Body::new(Full::<Bytes>::from(body)))
+                                .unwrap();
+                            return Ok(res);
+                        }
+                        "/dev/annotate/words" => {
+                            #[derive(serde::Deserialize)]
+                            struct WordsReq {
+                                s: usize,
+                                e: usize,
+                            }
+                            let outcome = serde_json::from_slice::<WordsReq>(&body)
+                                .map_err(|e| e.to_string())
+                                .and_then(|req| annot.words(req.s, req.e));
+                            let (status, body) = match outcome {
+                                Ok(words) => (
+                                    hyper::StatusCode::OK,
+                                    serde_json::to_string(&serde_json::json!({
+                                        "ok": true, "words": words,
+                                    }))
+                                    .unwrap_or_default(),
+                                ),
+                                Err(err) => (
+                                    hyper::StatusCode::BAD_REQUEST,
+                                    serde_json::json!({ "ok": false, "error": err })
+                                        .to_string(),
+                                ),
+                            };
+                            let res = hyper::Response::builder()
+                                .status(status)
+                                .header(hyper::header::CONTENT_TYPE, "application/json")
+                                .body(Body::new(Full::<Bytes>::from(body)))
+                                .unwrap();
+                            return Ok(res);
+                        }
                         "/dev/annotate/probe" => {
                             #[derive(serde::Deserialize)]
                             struct ProbeReq {
                                 page: usize,
                                 x: f64,
                                 y: f64,
+                                // A second point makes it a drag: the probe
+                                // reports the span it would create.
+                                #[serde(default)]
+                                page2: Option<usize>,
+                                #[serde(default)]
+                                x2: Option<f64>,
+                                #[serde(default)]
+                                y2: Option<f64>,
                             }
                             let outcome = serde_json::from_slice::<ProbeReq>(&body)
                                 .map_err(|e| e.to_string())
-                                .and_then(|req| annot.probe(req.page, req.x, req.y));
+                                .and_then(|req| {
+                                    match (req.page2, req.x2, req.y2) {
+                                        (Some(p2), Some(x2), Some(y2)) => annot.probe_span(
+                                            (req.page, req.x, req.y),
+                                            (p2, x2, y2),
+                                        ),
+                                        _ => annot.probe(req.page, req.x, req.y),
+                                    }
+                                });
                             let (status, body) = match outcome {
                                 Ok(pos) => (
                                     hyper::StatusCode::OK,
                                     serde_json::json!({
                                         "ok": true,
-                                        "kind": pos.kind,
+                                        "scope": pos.scope,
                                         "page": pos.page, "x": pos.x, "y": pos.y,
-                                        "y0": pos.y0, "y1": pos.y1,
+                                        "rects": pos.rects,
                                     })
                                     .to_string(),
                                 ),
@@ -259,6 +400,7 @@ pub async fn make_http_server(
                 }
             }
         })
+        }
     };
 
     let (shutdown_tx, rx) = tokio::sync::oneshot::channel();
@@ -266,6 +408,39 @@ pub async fn make_http_server(
 
     // the graceful watcher
     let graceful = hyper_util::server::graceful::GracefulShutdown::new();
+
+    // Serving nobody: when the last browser goes away the server has no reason
+    // to outlive it. A short grace period covers a page reload, which drops
+    // every connection for a moment before opening new ones.
+    const IDLE_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+    if shutdown_on_last_client {
+        let live = live.clone();
+        let served_anyone = served_anyone.clone();
+        tokio::spawn(async move {
+            use std::sync::atomic::Ordering::SeqCst;
+            loop {
+                tokio::time::sleep(IDLE_GRACE).await;
+                log::debug!(
+                    target: crate::PREVIEW_COMPAT_LOG_TARGET,
+                    "idle check: pages={} served={}",
+                    live.load(SeqCst),
+                    served_anyone.load(SeqCst)
+                );
+                if !served_anyone.load(SeqCst) || live.load(SeqCst) > 0 {
+                    continue;
+                }
+                // Still nobody a whole grace period later: this was not a reload.
+                tokio::time::sleep(IDLE_GRACE).await;
+                if live.load(SeqCst) == 0 {
+                    log::info!(
+                        target: crate::PREVIEW_COMPAT_LOG_TARGET,
+                        "last client disconnected, shutting down"
+                    );
+                    std::process::exit(0);
+                }
+            }
+        });
+    }
 
     let serve_conn = move |server: &Server, graceful: &GracefulShutdown, conn| {
         let (stream, _peer_addr) = match conn {

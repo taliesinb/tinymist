@@ -2,7 +2,7 @@
   // Annotation mode (/?annotate): the view is locked to reading and
   // writing annotations — plain click annotates, and the editor-coupled
   // behaviors (cursor bar, click-to-jump, follow-scrolling) are muted.
-  const ANNOTATE = new URLSearchParams(location.search).has("annotate");
+  const ANNOTATE = location.pathname.replace(/\/+$/, "") === "/annotate";
   const PANEL_ID = "tinymist-error-panel";
   const OVERLAY_CLASS = "tinymist-error-overlay";
   const SVG_NS = "http://www.w3.org/2000/svg";
@@ -194,6 +194,57 @@
     subtree: true,
   });
   setInterval(ensure, 1000);
+  // A blank viewer explains itself: if the document has not rendered after
+  // a few seconds, or anything threw, show what went wrong in the page
+  // instead of leaving a grey rectangle.
+  const FAILURE_ID = "tinymist-failure";
+  const showFailure = () => {
+    const errs = window.__tinymistErrors || [];
+    const rendered = document.querySelectorAll(".typst-page").length;
+    if (rendered && !errs.length) {
+      const old = document.getElementById(FAILURE_ID);
+      if (old) old.remove();
+      return;
+    }
+    let panel = document.getElementById(FAILURE_ID);
+    if (!panel) {
+      panel = document.createElement("div");
+      panel.id = FAILURE_ID;
+      panel.style.cssText =
+        "position:fixed;left:0;right:0;top:0;z-index:2147483647;padding:14px 18px;" +
+        "background:#2e1010;color:#ffd9d9;white-space:pre-wrap;overflow:auto;" +
+        "max-height:60vh;border-bottom:2px solid #e5534b;box-sizing:border-box;" +
+        "font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace";
+      document.body.appendChild(panel);
+    }
+    const lines = [
+      rendered
+        ? `tinymist preview: ${errs.length} script error(s)`
+        : "tinymist preview: nothing rendered yet",
+      `page ${location.href}`,
+      `document pages: ${rendered}`,
+      "",
+    ];
+    for (const e of errs.slice(-6)) lines.push(`${e.kind}: ${e.detail}`);
+    if (!errs.length) {
+      lines.push(
+        "No script errors were captured. The viewer is connected but has",
+        "received no document — the compile may have failed, or the",
+        "websocket to the preview server never opened.",
+      );
+    }
+    panel.textContent = lines.join("\n");
+  };
+  window.__tinymistShowFailure = showFailure;
+  // Give the renderer a few seconds before complaining, then keep checking
+  // cheaply so the panel disappears once pages do arrive.
+  setTimeout(showFailure, 5000);
+  setInterval(() => {
+    if (document.getElementById(FAILURE_ID) || (window.__tinymistErrors || []).length) {
+      showFailure();
+    }
+  }, 3000);
+
   // Client-side errors are reported to the server (stderr + a well-known
   // temp file), so failures in the overlay scripts are findable after the
   // fact instead of hiding in the browser console.
@@ -210,6 +261,7 @@
       );
     } catch (e) {}
   };
+  for (const e of window.__tinymistErrors || []) report(e.kind, e.detail);
   window.addEventListener("error", (e) => {
     report(
       "error",

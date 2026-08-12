@@ -497,6 +497,58 @@ pub fn overlay_js_path() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tool/preview/error_overlay.js")
 }
 
+/// A tiny trap injected at the top of `<head>`: it records failures that
+/// happen before (or instead of) the overlay script loading, so a blank
+/// viewer can explain itself rather than showing a grey page.
+pub const EARLY_ERROR_JS: &str = r#"
+window.__tinymistErrors = [];
+(() => {
+  const push = (kind, detail) => {
+    window.__tinymistErrors.push({ kind, detail, time: new Date().toISOString() });
+    if (window.__tinymistShowFailure) window.__tinymistShowFailure();
+  };
+  window.addEventListener("error", (e) => {
+    push(
+      "error",
+      (e.message || "error") +
+        (e.filename ? ` @ ${e.filename}:${e.lineno}:${e.colno}` : "") +
+        (e.error && e.error.stack ? "\n" + e.error.stack : ""),
+    );
+  });
+  window.addEventListener("unhandledrejection", (e) => {
+    const r = e.reason;
+    push("unhandledrejection", (r && (r.stack || r.message)) || String(r));
+  });
+  // If the overlay script never loads (or the renderer dies first), paint a
+  // minimal panel here so the viewer is never a silent grey rectangle.
+  const bare = () => {
+    if (window.__tinymistShowFailure) return window.__tinymistShowFailure();
+    if (document.querySelectorAll(".typst-page").length) return;
+    let el = document.getElementById("tinymist-failure-early");
+    if (!el) {
+      el = document.createElement("div");
+      el.id = "tinymist-failure-early";
+      el.style.cssText =
+        "position:fixed;left:0;right:0;top:0;z-index:2147483647;padding:14px 18px;" +
+        "background:#2e1010;color:#ffd9d9;white-space:pre-wrap;overflow:auto;" +
+        "max-height:60vh;border-bottom:2px solid #e5534b;box-sizing:border-box;" +
+        "font:12px/1.5 ui-monospace,Menlo,monospace";
+      (document.body || document.documentElement).appendChild(el);
+    }
+    const errs = window.__tinymistErrors;
+    el.textContent =
+      "tinymist preview: nothing rendered\n" +
+      "page " + location.href + "\n" +
+      "overlay script loaded: " + !!window.__tinymistShowFailure + "\n\n" +
+      (errs.length
+        ? errs.map((e) => e.kind + ": " + e.detail).join("\n\n")
+        : "No script errors were captured.");
+  };
+  setTimeout(bare, 6000);
+  setInterval(bare, 4000);
+})();
+"#;
+
 /// The annotation UI script, served separately (loaded only by /?annotate
 /// pages) and editable in the source tree like the overlay script.
 pub fn annotations_js() -> String {

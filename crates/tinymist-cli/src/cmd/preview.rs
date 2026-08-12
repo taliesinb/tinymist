@@ -28,7 +28,11 @@ pub async fn preview_main(args: PreviewCliArgs) -> Result<()> {
 
     let config = args.preview.config(&PreviewConfig::default());
     #[cfg(feature = "open")]
-    let open_in_browser = args.open_in_browser(true);
+    // `preview` is usually run to look at something now; `annotate` is
+    // typically driven by an editor task that opens its own window.
+    let open_in_browser = args.open_in_browser(!args.annotate);
+    #[cfg(feature = "open")]
+    let open_in_app = args.open_in_app().to_string();
     let static_file_host =
         if args.static_file_host == args.data_plane_host || !args.static_file_host.is_empty() {
             Some(args.static_file_host)
@@ -38,6 +42,10 @@ pub async fn preview_main(args: PreviewCliArgs) -> Result<()> {
 
     exit_on_ctrl_c();
 
+    let shutdown_on_last_client = args.shutdown_on_last_client;
+    if !args.daemon {
+        tinymist::tool::preview::exit_when_orphaned();
+    }
     let preview_target = args.preview.format;
     if matches!(preview_target, ExportTarget::Bundle) {
         bail!("bundle export target is not supported by preview");
@@ -166,6 +174,8 @@ pub async fn preview_main(args: PreviewCliArgs) -> Result<()> {
                 control_sock_tx,
                 None,
                 None,
+                // The control plane serves the editor, not a browser.
+                false,
             )
             .await;
         log::info!(
@@ -259,6 +269,18 @@ pub async fn preview_main(args: PreviewCliArgs) -> Result<()> {
         "/",
         &page_title,
     );
+    let early = format!(
+        "<script>{}</script>",
+        tinymist::tool::preview::EARLY_ERROR_JS
+    );
+    frontend_html = match frontend_html.find("<head>") {
+        Some(at) => {
+            let mut html = frontend_html.clone();
+            html.insert_str(at + "<head>".len(), &early);
+            html
+        }
+        None => format!("{early}{frontend_html}"),
+    };
     let script = "<script src=\"/dev/overlay.js\"></script>";
     if frontend_html.contains("</body>") {
         frontend_html = frontend_html.replace("</body>", &format!("{script}</body>"));
@@ -278,6 +300,7 @@ pub async fn preview_main(args: PreviewCliArgs) -> Result<()> {
                 websocket_tx.clone(),
                 Some(diag_rx.clone()),
                 Some(annot.clone()),
+                shutdown_on_last_client,
             )
             .await,
         )
@@ -292,6 +315,7 @@ pub async fn preview_main(args: PreviewCliArgs) -> Result<()> {
             websocket_tx,
             Some(diag_rx),
             Some(annot),
+            shutdown_on_last_client,
         )
         .await;
     log::info!(
@@ -306,12 +330,17 @@ pub async fn preview_main(args: PreviewCliArgs) -> Result<()> {
         "Static file server listening on: {static_server_addr}"
     );
 
+    // Printed, not logged: the whole URL, so it can be clicked out of a
+    // terminal rather than reassembled from a log line.
+    let path = if args.annotate { "/annotate" } else { "/" };
+    println!("http://{static_server_addr}{path}");
+
     #[cfg(feature = "open")]
     if open_in_browser {
-        let query = if args.annotate { "/?annotate" } else { "" };
+        let path = if args.annotate { "/annotate" } else { "/" };
         tinymist::tool::preview::open_preview_url(
-            format!("http://{static_server_addr}{query}"),
-            args.open_in.as_deref(),
+            format!("http://{static_server_addr}{path}"),
+            Some(open_in_app.as_str()),
         );
     }
 
