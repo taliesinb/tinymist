@@ -1,50 +1,99 @@
-<html><body style="background:#111;margin:0;padding:20px">
-<div id="out" style="display:flex;gap:30px;align-items:flex-end"></div>
+<html><body style="background:#111;margin:0;padding:18px;color:#ccc;font:13px system-ui">
+<div id="out" style="display:flex;gap:24px;align-items:flex-end"></div>
+<p id="status">baking…</p>
 <script>
-// The web-app icons: a math tau, the letter Typst is named for, in a light
-// tint of the role's colour. Rendered here because it needs a real font;
-// window.__icons ends up holding the PNG bytes, base64.
-const ROLES = {
-  preview:  { bg: "#1f4fa8", tint: "#bcd4ff" },
-  annotate: { bg: "#1d7a37", tint: "#bdefc9" },
-};
-const draw = (role, n) => {
-  const { bg, tint } = ROLES[role];
+// Bakes the three role glyphs as 512x512 alpha masks, deflated. The server
+// composites them over a colour derived from its port, so both the role and
+// the project are legible in the Dock without shipping a font or a rasteriser.
+//
+// Masks are written as raw alpha (one byte per pixel, row-major), zlib-
+// deflated; `window.__masks` ends up holding them base64-encoded.
+const N = 512;
+const ROLES = ["lsp", "serve", "anno"];
+
+const drawGlyph = (role) => {
   const c = document.createElement("canvas");
-  c.width = c.height = n;
+  c.width = c.height = N;
   const g = c.getContext("2d");
-  const r = n * 0.225;
-  g.fillStyle = bg;
-  g.beginPath();
-  g.roundRect(0, 0, n, n, r);
-  g.fill();
-  g.fillStyle = tint;
-  g.font = `italic ${Math.round(n * 1.30)}px "STIXGeneral", "STIX Two Math", serif`;
-  // Centre on the glyph's ink, not on its metrics: a tau sits high and narrow
-  // in its em box, and centring on the box leaves it visibly off.
+  g.fillStyle = "#fff";
+  const font = (px) => `italic ${Math.round(px)}px "STIXGeneral", "STIX Two Math", serif`;
+
+  // The tau is the constant; the role decorates it.
+  const size = role === "lsp" ? N * 1.06 : N * 1.3;
+  g.font = font(size);
   const m = g.measureText("τ");
-  const w = m.actualBoundingBoxRight + m.actualBoundingBoxLeft;
-  const h = m.actualBoundingBoxAscent + m.actualBoundingBoxDescent;
-  g.fillText("τ", n / 2 - (m.actualBoundingBoxRight - m.actualBoundingBoxLeft) / 2,
-             n / 2 + (m.actualBoundingBoxAscent - m.actualBoundingBoxDescent) / 2);
-  void w; void h;
+  const ink = {
+    w: m.actualBoundingBoxRight + m.actualBoundingBoxLeft,
+    h: m.actualBoundingBoxAscent + m.actualBoundingBoxDescent,
+  };
+  // Centre on the ink, then shift right for the chevron when there is one.
+  const shift = role === "lsp" ? N * 0.135 : 0;
+  // The underline adds ink below the glyph, so the tau rides up to keep the
+  // pair centred rather than the letter alone.
+  const lift = role === "anno" ? N * 0.055 : 0;
+  const x = N / 2 - (m.actualBoundingBoxRight - m.actualBoundingBoxLeft) / 2 + shift;
+  const y = N / 2 + (m.actualBoundingBoxAscent - m.actualBoundingBoxDescent) / 2 - lift;
+  g.fillText("τ", x, y);
+
+  if (role === "lsp") {
+    // A prompt chevron: this one is driven by an editor.
+    const cx = N * 0.265, cy = N / 2, r = N * 0.15, w = N * 0.062;
+    g.strokeStyle = "#fff";
+    g.lineWidth = w;
+    g.lineCap = "round";
+    g.lineJoin = "round";
+    g.beginPath();
+    g.moveTo(cx - r * 0.55, cy - r);
+    g.lineTo(cx + r * 0.55, cy);
+    g.lineTo(cx - r * 0.55, cy + r);
+    g.stroke();
+  } else if (role === "anno") {
+    // The annotation underline, as drawn under annotated words in the UI.
+    const left = x - ink.w * 0.06, right = x + ink.w * 0.96;
+    const top = y + N * 0.075;
+    g.fillRect(left, top, right - left, N * 0.055);
+  }
   return c;
 };
-window.__icons = {};
-for (const role of Object.keys(ROLES)) {
-  for (const n of [192, 512]) {
-    const c = draw(role, n);
-    window.__icons[`${role}-${n}`] = c.toDataURL("image/png").split(",")[1];
-    if (n === 512) {
-      const img = document.createElement("img");
-      img.src = c.toDataURL();
-      img.width = 150;
-      document.getElementById("out").append(img);
-      const small = c.cloneNode();
-      small.getContext("2d").drawImage(c, 0, 0);
-      small.style.width = "44px";
-      document.getElementById("out").append(small);
-    }
+
+const bake = async () => {
+  window.__masks = {};
+  for (const role of ROLES) {
+    const c = drawGlyph(role);
+    const px = c.getContext("2d").getImageData(0, 0, N, N).data;
+    const alpha = new Uint8Array(N * N);
+    for (let i = 0; i < N * N; i++) alpha[i] = px[i * 4 + 3];
+    const zipped = new Response(
+      new Blob([alpha]).stream().pipeThrough(new CompressionStream("deflate")),
+    );
+    const buf = new Uint8Array(await zipped.arrayBuffer());
+    let s = "";
+    for (const b of buf) s += String.fromCharCode(b);
+    window.__masks[role] = { b64: btoa(s), bytes: buf.length };
+
+    // a look at it, over a sample colour
+    const show = document.createElement("canvas");
+    show.width = show.height = 150;
+    const sg = show.getContext("2d");
+    sg.fillStyle = ["#3a4048", "#1f4fa8", "#1d7a37"][ROLES.indexOf(role)];
+    sg.beginPath(); sg.roundRect(0, 0, 150, 150, 34); sg.fill();
+    sg.globalCompositeOperation = "source-atop";
+    sg.globalAlpha = 1;
+    const tint = document.createElement("canvas");
+    tint.width = tint.height = N;
+    const tg = tint.getContext("2d");
+    tg.drawImage(c, 0, 0);
+    tg.globalCompositeOperation = "source-in";
+    tg.fillStyle = ["#c9d2de", "#bcd4ff", "#bdefc9"][ROLES.indexOf(role)];
+    tg.fillRect(0, 0, N, N);
+    sg.drawImage(tint, 0, 0, 150, 150);
+    const wrap = document.createElement("div");
+    wrap.style.textAlign = "center";
+    wrap.append(show, Object.assign(document.createElement("div"), { textContent: role }));
+    document.getElementById("out").append(wrap);
   }
-}
+  document.getElementById("status").textContent = "baked: " +
+    ROLES.map((r) => `${r} ${window.__masks[r].bytes}b`).join(", ");
+};
+bake();
 </script></body></html>

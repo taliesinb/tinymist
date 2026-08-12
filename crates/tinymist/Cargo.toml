@@ -32,6 +32,7 @@ dapts.workspace = true
 dhat = { workspace = true, optional = true }
 dirs.workspace = true
 env_logger.workspace = true
+flate2.workspace = true
 futures.workspace = true
 itertools.workspace = true
 lsp-types.workspace = true

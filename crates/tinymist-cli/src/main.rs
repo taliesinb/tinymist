@@ -64,7 +64,7 @@ impl Default for Runtimes {
 static RUNTIMES: LazyLock<Runtimes> = LazyLock::new(Runtimes::default);
 
 #[derive(Debug, Clone, clap::Parser)]
-#[clap(name = "tinymist", author, version, about, long_version(tinymist::LONG_VERSION.as_str()))]
+#[clap(name = "talimist", author, version, about, long_version(tinymist::LONG_VERSION.as_str()))]
 struct Args {
     /// Configure log filter of tinymist
     #[clap(long = "log-filter", env = "TINYMIST_LOG")]
@@ -194,6 +194,11 @@ fn main() -> Result<()> {
         filter: args.log_filter,
         output: None,
     });
+
+    // Nothing should outlive the binary it came from: a language server or
+    // preview left running after `cargo install` would serve code that no
+    // longer exists on disk.
+    crate::utils::exit_when_binary_replaced();
 
     match cmd {
         Commands::Probe => Ok(()),

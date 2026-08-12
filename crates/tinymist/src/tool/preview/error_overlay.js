@@ -26,7 +26,24 @@
   // invert(1) hue-rotate(180deg) is an involution, so images and our own
   // overlay marks apply it a second time to restore their true colors.
   const SMART_INVERT_ID = "tinymist-smart-invert";
-  const darkMedia = window.matchMedia("(prefers-color-scheme: dark)");
+  // ?dark and ?light override what the viewer's system says. The appearance of
+  // the *page* is a viewing choice, so it belongs in the URL — the server's
+  // theme setting is only the default. (What the document itself compiles to,
+  // when it styles itself from sys.inputs, is baked in at compile time and a
+  // query cannot change it.)
+  const themeParam = new URLSearchParams(location.search);
+  const forcedDark = themeParam.has("dark")
+    ? true
+    : themeParam.has("light")
+      ? false
+      : null;
+  const systemDark = window.matchMedia("(prefers-color-scheme: dark)");
+  const darkMedia = {
+    get matches() {
+      return forcedDark === null ? systemDark.matches : forcedDark;
+    },
+    addEventListener: (type, fn) => systemDark.addEventListener(type, fn),
+  };
   let smartState = { enabled: false, docDark: null };
   const applySmartInvert = () => {
     const on =

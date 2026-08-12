@@ -12,7 +12,10 @@ repository.workspace = true
 rust-version.workspace = true
 
 [[bin]]
-name = "tinymist"
+# Named apart from upstream's so this fork can be installed alongside a stock
+# tinymist: `cargo install --path crates/tinymist-cli` blesses a build as
+# ~/.cargo/bin/talimist, leaving `tinymist` to whatever else provides it.
+name = "talimist"
 path = "src/main.rs"
 doc = false
 

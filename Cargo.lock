@@ -6702,6 +6702,7 @@ dependencies = [
  "dhat",
  "dirs",
  "env_logger",
+ "flate2",
  "futures",
  "http-body-util",
  "hyper",

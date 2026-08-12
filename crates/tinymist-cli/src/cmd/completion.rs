@@ -21,7 +21,7 @@ pub fn completion_main(args: ShellCompletionArgs) -> Result<()> {
     };
 
     let mut cmd = crate::Args::command();
-    generate(shell, &mut cmd, "tinymist", &mut io::stdout());
+    generate(shell, &mut cmd, "talimist", &mut io::stdout());
 
     Ok(())
 }

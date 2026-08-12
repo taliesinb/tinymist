@@ -30,6 +30,7 @@ pub async fn make_http_server(
     diag_rx: Option<super::DiagRx>,
     annot: Option<std::sync::Arc<dyn super::AnnotationServer>>,
     shutdown_on_last_client: bool,
+    identity: super::WebAppIdentity,
 ) -> HttpServer {
     use futures::StreamExt;
     use http_body_util::{Full, StreamBody};
@@ -60,11 +61,15 @@ pub async fn make_http_server(
     log::info!("preview server listening on http://{addr}");
 
     let frontend_html = hyper::body::Bytes::from(frontend_html);
+    // Icons and manifests are keyed to the port this server answers on.
+    let port = addr.port();
     let live = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let served_anyone = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let identity = std::sync::Arc::new(identity);
     let make_service = {
         let live = live.clone();
         let served_anyone = served_anyone.clone();
+        let identity = identity.clone();
         move || {
         let frontend_html = frontend_html.clone();
         let websocket_tx = websocket_tx.clone();
@@ -73,7 +78,9 @@ pub async fn make_http_server(
         let annot = annot.clone();
         let live = live.clone();
         let served_anyone = served_anyone.clone();
+        let identity = identity.clone();
         service_fn(move |mut req: hyper::Request<Incoming>| {
+            let identity = identity.clone();
             let frontend_html = frontend_html.clone();
             let websocket_tx = websocket_tx.clone();
             let static_file_addr = static_file_addr.clone();
@@ -134,24 +141,29 @@ pub async fn make_http_server(
                 } else if req.uri().path() == "/" || req.uri().path() == "/annotate" {
                     // Two paths, one document: the mode rides in the URL, so each
                     // has its own manifest, icon and dock app.
-                    let annotate = req.uri().path() == "/annotate";
+                    let identity = if req.uri().path() == "/annotate" {
+                        identity.with_role(super::icons::IconRole::Annotate)
+                    } else {
+                        (*identity).clone()
+                    };
                     let html = super::mode_head(
                         std::str::from_utf8(&frontend_html).unwrap_or_default(),
-                        annotate,
+                        &identity,
+                        port,
                     );
                     let res = hyper::Response::builder()
                         .header(hyper::header::CONTENT_TYPE, "text/html")
                         .body(Body::new(Full::<Bytes>::from(html)))
                         .unwrap();
                     Ok(res)
-                } else if let Some(icon) = super::icon_asset(req.uri().path()) {
+                } else if let Some(icon) = super::icon_asset(req.uri().path(), port, &identity) {
                     let res = hyper::Response::builder()
                         .header(hyper::header::CONTENT_TYPE, "image/png")
                         .header(hyper::header::CACHE_CONTROL, "max-age=3600")
                         .body(Body::new(Full::<Bytes>::from(icon)))
                         .unwrap();
                     Ok(res)
-                } else if let Some(manifest) = super::web_manifest(req.uri().path()) {
+                } else if let Some(manifest) = super::web_manifest(req.uri().path(), port, &identity) {
                     let res = hyper::Response::builder()
                         .header(hyper::header::CONTENT_TYPE, "application/manifest+json")
                         .body(Body::new(Full::<Bytes>::from(manifest)))

@@ -11,6 +11,7 @@ pub use error_overlay::{
 };
 pub use http::{make_http_server, HttpServer};
 
+pub mod icons;
 mod annotations;
 mod compile;
 mod error_overlay;
@@ -206,6 +207,17 @@ pub struct PreviewCliArgs {
     )]
     pub data_plane_host: String,
 
+    /// The tile colour for this server's web-app icon, as `#rrggbb`. Without
+    /// it the colour comes from the port, which is stable for a given project
+    /// but arbitrary; name one when a project should be recognisable.
+    #[clap(long = "icon-color", value_name = "HEX")]
+    pub icon_color: Option<String>,
+
+    /// What this server calls the thing it serves, used in the web app's name
+    /// ("Typst Server: Foo"). Without it the name falls back to the port.
+    #[clap(long = "root-name", value_name = "NAME")]
+    pub root_name: Option<String>,
+
     /// Keep running after the process that started this one goes away.
     /// Without it the server exits when it is orphaned, so closing the editor
     /// (or the terminal) that launched it does not leave a server behind.
@@ -295,59 +307,160 @@ impl PreviewCliArgs {
     }
 }
 
+/// What a server calls itself in the Dock: its role, and the two things an
+/// operator can override — the colour and the name.
+#[derive(Debug, Clone)]
+pub struct WebAppIdentity {
+    /// Which glyph the icon wears.
+    pub role: icons::IconRole,
+    /// The tile colour, if one was chosen; otherwise derived from the port.
+    pub color: Option<[u8; 3]>,
+    /// What the server serves, as a person would name it.
+    pub name: Option<String>,
+}
+
+impl WebAppIdentity {
+    /// An identity for a role, with nothing overridden.
+    pub fn new(role: icons::IconRole) -> Self {
+        Self { role, color: None, name: None }
+    }
+
+    /// The identity of a page, which may be the annotating face of a server
+    /// that is otherwise a plain one.
+    pub fn with_role(&self, role: icons::IconRole) -> Self {
+        Self { role, ..self.clone() }
+    }
+
+    /// The web app's name: "Typst Server: Foo", falling back to the port when
+    /// nobody has said what is being served.
+    pub fn title(&self, port: u16) -> String {
+        match &self.name {
+            Some(name) => format!("{} ({name})", self.role.title()),
+            None => format!("{} ({port})", self.role.title()),
+        }
+    }
+}
+
 /// The web-app furniture: each mode is a page of its own, with its own name,
 /// icon and manifest, so both can live in the Dock side by side. Safari takes
 /// the name, start URL, icons and scope from the manifest when there is one,
 /// and treats in-scope links as belonging to that app — which is why the
 /// annotate scope is the narrower `/annotate`.
-pub fn mode_head(html: &str, annotate: bool) -> String {
-    let (title, manifest, icon) = if annotate {
-        ("Typst Annotate", "/annotate/manifest.webmanifest", "/icon/annotate-192.png")
-    } else {
-        ("Typst Preview", "/manifest.webmanifest", "/icon/preview-192.png")
+pub fn mode_head(html: &str, identity: &WebAppIdentity, port: u16) -> String {
+    let (manifest, icon) = match identity.role {
+        icons::IconRole::Lsp => ("/manifest.webmanifest", "/icon/lsp-192.png"),
+        icons::IconRole::Serve => ("/manifest.webmanifest", "/icon/serve-192.png"),
+        icons::IconRole::Annotate => ("/annotate/manifest.webmanifest", "/icon/anno-192.png"),
     };
+    let title = identity.title(port);
     let head = format!(
         "<title>{title}</title>\
          <link rel=\"manifest\" href=\"{manifest}\">\
          <link rel=\"apple-touch-icon\" href=\"{icon}\">\
          <link rel=\"icon\" type=\"image/png\" href=\"{icon}\">"
     );
-    if let Some(at) = html.find("<head>") {
-        let mut out = String::with_capacity(html.len() + head.len());
-        out.push_str(&html[..at + "<head>".len()]);
-        out.push_str(&head);
-        out.push_str(&html[at + "<head>".len()..]);
-        out
-    } else {
-        format!("{head}{html}")
+
+    // The bundled frontend ships its own title and icon; a browser takes the
+    // last icon it is offered, so ours has to both replace theirs and come
+    // last. Strip, then append at the end of the head.
+    let html = strip_tags(html, &["<title>"], &["</title>"]);
+    let html = strip_icon_links(&html);
+    match html.find("</head>") {
+        Some(at) => {
+            let mut out = String::with_capacity(html.len() + head.len());
+            out.push_str(&html[..at]);
+            out.push_str(&head);
+            out.push_str(&html[at..]);
+            out
+        }
+        None => format!("{head}{html}"),
     }
 }
 
+/// Removes every `open..close` span from `html`.
+fn strip_tags(html: &str, open: &[&str], close: &[&str]) -> String {
+    let mut out = html.to_string();
+    for (open, close) in open.iter().zip(close) {
+        while let Some(start) = out.find(open) {
+            let Some(end) = out[start..].find(close) else {
+                break;
+            };
+            out.replace_range(start..start + end + close.len(), "");
+        }
+    }
+    out
+}
+
+/// Removes the `<link rel="icon">` and friends a page declares for itself.
+fn strip_icon_links(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html;
+    while let Some(at) = rest.find("<link") {
+        let Some(len) = rest[at..].find('>') else {
+            break;
+        };
+        let tag = &rest[at..at + len + 1];
+        let is_icon = tag.contains("rel=\"icon\"")
+            || tag.contains("rel=\"shortcut icon\"")
+            || tag.contains("rel=\"apple-touch-icon\"");
+        out.push_str(&rest[..at]);
+        if !is_icon {
+            out.push_str(tag);
+        }
+        rest = &rest[at + len + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// The PNG behind an `/icon/...` path, if it names one of ours.
-pub fn icon_asset(path: &str) -> Option<Vec<u8>> {
-    let bytes: &[u8] = match path {
-        "/icon/preview-192.png" => include_bytes!("preview/icons/preview-192.png"),
-        "/icon/preview-512.png" => include_bytes!("preview/icons/preview-512.png"),
-        "/icon/annotate-192.png" => include_bytes!("preview/icons/annotate-192.png"),
-        "/icon/annotate-512.png" => include_bytes!("preview/icons/annotate-512.png"),
+///
+/// Icons are synthesised rather than stored: the glyph comes from the role in
+/// the path and the colour from the port this server is bound to, so two
+/// servers never wear the same icon in the Dock.
+pub fn icon_asset(path: &str, port: u16, identity: &WebAppIdentity) -> Option<Vec<u8>> {
+    // Browsers ask for /favicon.ico whatever the page says, and Safari caches
+    // what it gets per origin — so leaving this to fall through to the page
+    // meant a stale icon stuck to the port.
+    if path == "/favicon.ico" || path == "/favicon.png" {
+        return icons::icon_png(identity.role, port, 192, identity.color).ok();
+    }
+    let name = path.strip_prefix("/icon/")?.strip_suffix(".png")?;
+    let (role, size) = name.rsplit_once('-')?;
+    let role = match role {
+        "lsp" => icons::IconRole::Lsp,
+        "serve" => icons::IconRole::Serve,
+        "anno" => icons::IconRole::Annotate,
         _ => return None,
     };
-    Some(bytes.to_vec())
+    let size = match size {
+        "192" => 192,
+        "512" => 512,
+        _ => return None,
+    };
+    icons::icon_png(role, port, size, identity.color).ok()
 }
 
 /// The web app manifest for a mode's path, if it names one.
-pub fn web_manifest(path: &str) -> Option<String> {
-    let (name, short, start, scope, icon) = match path {
-        "/manifest.webmanifest" => ("Typst Preview", "Preview", "/", "/", "preview"),
+pub fn web_manifest(path: &str, port: u16, identity: &WebAppIdentity) -> Option<String> {
+    let (identity, start, scope) = match path {
+        "/manifest.webmanifest" => (identity.clone(), "/", "/"),
         "/annotate/manifest.webmanifest" => (
-            "Typst Annotate",
-            "Annotate",
+            identity.with_role(icons::IconRole::Annotate),
             "/annotate",
             "/annotate",
-            "annotate",
         ),
         _ => return None,
     };
+    let icon = match identity.role {
+        icons::IconRole::Lsp => "lsp",
+        icons::IconRole::Serve => "serve",
+        icons::IconRole::Annotate => "anno",
+    };
+    let (bg, _) = icons::colors_for(port, identity.color);
+    let background = format!("#{:02x}{:02x}{:02x}", bg[0], bg[1], bg[2]);
+    let name = identity.title(port);
+    let short = identity.role.title();
     Some(format!(
         r##"{{
   "name": "{name}",
@@ -355,7 +468,7 @@ pub fn web_manifest(path: &str) -> Option<String> {
   "start_url": "{start}",
   "scope": "{scope}",
   "display": "standalone",
-  "background_color": "#1f1f24",
+  "background_color": "{background}",
   "icons": [
     {{ "src": "/icon/{icon}-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable" }},
     {{ "src": "/icon/{icon}-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }}
@@ -455,6 +568,21 @@ impl ServerState {
                 .filter(|port| std::net::TcpListener::bind((host_base, *port)).is_ok())
                 .unwrap_or(0);
             *arg = format!("--data-plane-host={host_base}:{port}");
+        }
+
+        // The editor's preview follows whatever file has focus, so naming it
+        // after a file would be wrong a moment later. It is the project's
+        // window: name it after the project.
+        if !args.iter().any(|arg| arg.starts_with("--root-name")) {
+            if let Some(name) = root
+                .as_deref()
+                .and_then(|root| std::fs::canonicalize(root).ok())
+                .as_deref()
+                .and_then(Path::file_name)
+                .map(|name| name.to_string_lossy().into_owned())
+            {
+                args.push(format!("--root-name={name}"));
+            }
         }
 
         let res = self.start_preview(args, PreviewKind::Background);
@@ -586,9 +714,13 @@ impl ServerState {
 /// Derives a stable preview port in 23700..24000 from the workspace root, so
 /// each project maps to the same port across editor restarts.
 fn derive_preview_port(root: &Path) -> u16 {
+    // Canonical first: `/tmp/x` and `/private/tmp/x` are one project, as are
+    // two spellings of the same path on a case-insensitive filesystem, and a
+    // project that hashed two ways would own two ports and two dock apps.
+    let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     // FNV-1a, fixed here so ports never move across builds.
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in root.as_os_str().as_encoded_bytes() {
+    for byte in canonical.as_os_str().as_encoded_bytes() {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x100_0000_01b3);
     }
@@ -878,6 +1010,12 @@ impl PreviewState {
                 annot,
                 // The editor owns this one's lifetime.
                 false,
+                WebAppIdentity {
+                    role: icons::IconRole::Lsp,
+                    color: args.icon_color.as_deref().and_then(icons::parse_hex),
+                    // The project, supplied by whoever started this server.
+                    name: args.root_name.clone(),
+                },
             )
             .await;
             let addr = srv.addr;

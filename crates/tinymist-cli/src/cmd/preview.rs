@@ -43,6 +43,31 @@ pub async fn preview_main(args: PreviewCliArgs) -> Result<()> {
     exit_on_ctrl_c();
 
     let shutdown_on_last_client = args.shutdown_on_last_client;
+    // `annotate` and `preview` are the same server wearing different faces.
+    let cli_role = if args.annotate {
+        tinymist::tool::preview::icons::IconRole::Annotate
+    } else {
+        tinymist::tool::preview::icons::IconRole::Serve
+    };
+    let identity = tinymist::tool::preview::WebAppIdentity {
+        role: cli_role,
+        color: args
+            .icon_color
+            .as_deref()
+            .and_then(tinymist::tool::preview::icons::parse_hex),
+        // Falling back to the document's own name: a port tells nobody which
+        // project a window belongs to.
+        name: args.root_name.clone().or_else(|| {
+            args.compile
+                .input
+                .as_deref()
+                .and_then(|path| std::path::Path::new(path).file_name())
+                .map(|name| name.to_string_lossy().into_owned())
+        }),
+    };
+    if args.icon_color.is_some() && identity.color.is_none() {
+        log::warn!("--icon-color is not a hex colour; falling back to the port's");
+    }
     if !args.daemon {
         tinymist::tool::preview::exit_when_orphaned();
     }
@@ -176,6 +201,9 @@ pub async fn preview_main(args: PreviewCliArgs) -> Result<()> {
                 None,
                 // The control plane serves the editor, not a browser.
                 false,
+                tinymist::tool::preview::WebAppIdentity::new(
+                    tinymist::tool::preview::icons::IconRole::Serve,
+                ),
             )
             .await;
         log::info!(
@@ -301,6 +329,7 @@ pub async fn preview_main(args: PreviewCliArgs) -> Result<()> {
                 Some(diag_rx.clone()),
                 Some(annot.clone()),
                 shutdown_on_last_client,
+                identity.clone(),
             )
             .await,
         )
@@ -316,6 +345,7 @@ pub async fn preview_main(args: PreviewCliArgs) -> Result<()> {
             Some(diag_rx),
             Some(annot),
             shutdown_on_last_client,
+            identity.clone(),
         )
         .await;
     log::info!(
