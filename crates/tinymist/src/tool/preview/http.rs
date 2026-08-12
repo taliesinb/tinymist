@@ -133,6 +133,36 @@ pub async fn make_http_server(
                         .body(Body::new(Full::<Bytes>::from(super::overlay_js())))
                         .unwrap();
                     Ok(res)
+                } else if req.uri().path() == "/dev/clientlog" {
+                    // Frontend errors: logged to stderr and appended to a
+                    // well-known file so they can be found after the fact.
+                    use http_body_util::BodyExt;
+                    let body = req.into_body().collect().await?.to_bytes();
+                    let text = String::from_utf8_lossy(&body).to_string();
+                    log::error!(target: "tinymist::preview::client", "{text}");
+                    // A fixed, findable path (not the sandboxed per-user
+                    // temp dir): /tmp/tinymist-preview-client.log.
+                    let path = std::path::Path::new("/tmp/tinymist-preview-client.log");
+                    if let Ok(mut file) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(path)
+                    {
+                        use std::io::Write;
+                        let _ = writeln!(file, "{text}");
+                    }
+                    let res = hyper::Response::builder()
+                        .status(hyper::StatusCode::OK)
+                        .body(Body::new(Full::<Bytes>::default()))
+                        .unwrap();
+                    Ok(res)
+                } else if req.uri().path() == "/dev/annotations.js" && annot.is_some() {
+                    let res = hyper::Response::builder()
+                        .header(hyper::header::CONTENT_TYPE, "application/javascript")
+                        .header(hyper::header::CACHE_CONTROL, "no-cache")
+                        .body(Body::new(Full::<Bytes>::from(super::annotations_js())))
+                        .unwrap();
+                    Ok(res)
                 } else if req.uri().path().starts_with("/dev/annotate") && annot.is_some() {
                     // Annotation endpoints: POST /dev/annotate creates an
                     // annotation at a clicked position; POST
@@ -181,7 +211,9 @@ pub async fn make_http_server(
                                     hyper::StatusCode::OK,
                                     serde_json::json!({
                                         "ok": true,
+                                        "kind": pos.kind,
                                         "page": pos.page, "x": pos.x, "y": pos.y,
+                                        "y0": pos.y0, "y1": pos.y1,
                                     })
                                     .to_string(),
                                 ),

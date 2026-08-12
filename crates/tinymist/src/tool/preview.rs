@@ -6,8 +6,8 @@ pub use annotations::{
 };
 
 pub use error_overlay::{
-    cursor_overlay, diagnostics_payload, doc_is_dark, overlay_js, overlay_js_path, BlockExtent,
-    DiagRx, DiagTx, OverlayPayload,
+    annotations_js, annotations_js_path, cursor_overlay, diagnostics_payload, doc_is_dark,
+    overlay_js, overlay_js_path, BlockExtent, DiagRx, DiagTx, OverlayPayload,
 };
 pub use http::{make_http_server, HttpServer};
 
@@ -576,7 +576,7 @@ impl PreviewState {
             let poll_art = last_art.clone();
             self.client.handle.spawn(async move {
                 let mut last_mtime = None;
-                let mut js_mtime = None;
+                let mut js_mtime = (None, None);
                 let mut first = true;
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -585,9 +585,14 @@ impl PreviewState {
                     };
                     // Dev asset watching: reload connected pages when the
                     // overlay script changes on disk.
-                    let mtime = std::fs::metadata(error_overlay::overlay_js_path())
-                        .and_then(|m| m.modified())
-                        .ok();
+                    let mtime = (
+                        std::fs::metadata(error_overlay::overlay_js_path())
+                            .and_then(|m| m.modified())
+                            .ok(),
+                        std::fs::metadata(error_overlay::annotations_js_path())
+                            .and_then(|m| m.modified())
+                            .ok(),
+                    );
                     if mtime != js_mtime {
                         js_mtime = mtime;
                         if !first {
@@ -819,10 +824,9 @@ struct LspAnnotationServer {
 }
 
 impl LspAnnotationServer {
-    fn apply(&self, edit: &annotations::AnnotationEdit) -> Result<(), String> {
-        std::fs::write(&edit.sidecar, &edit.sidecar_content)
-            .map_err(|e| format!("failed to write {}: {e}", edit.sidecar.display()))?;
-
+    /// Applies the document half of an annotation edit (the sidecar half
+    /// goes through [`annotations::commit_sidecar`]).
+    fn apply_doc(&self, edit: &annotations::AnnotationEdit) -> Result<(), String> {
         if let Some(content) = &edit.disk_content {
             // Write the label straight to disk so external watchers (e.g.
             // agents) see it immediately. For a clean editor buffer this is
@@ -880,42 +884,53 @@ impl LspAnnotationServer {
             .ok_or_else(|| "no compiled artifact yet".to_owned())
     }
 
-    /// Writes a sidecar-only change and pushes refreshed pins over SSE.
-    fn write_sidecar(&self, path: &Path, content: &str) -> Result<(), String> {
-        std::fs::write(path, content)
-            .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
+    /// Pushes refreshed pins over SSE.
+    fn push_pins(&self) {
         if let (Ok(art), Some(diag_tx)) = (self.art(), self.watchers.diag_tx(&self.project_id)) {
             let pins = annotations::annotation_pins(&art);
             diag_tx.send_modify(|state| state.annotations = pins);
         }
-        Ok(())
     }
 }
 
 impl AnnotationServer for LspAnnotationServer {
     fn annotate(&self, req: annotations::AnnotateRequest) -> Result<String, String> {
         let art = self.art()?;
-        let edit = annotations::prepare_annotate(&art, &req, self.position_encoding)?;
-        self.apply(&edit)?;
+        let edit = annotations::commit_sidecar(&art, || {
+            let edit = annotations::prepare_annotate(&art, &req, self.position_encoding)?;
+            Ok((edit.sidecar.clone(), edit.sidecar_content.clone(), edit))
+        })?;
+        self.apply_doc(&edit)?;
         Ok(edit.uuid)
     }
 
     fn remove(&self, uuid: &str) -> Result<(), String> {
         let art = self.art()?;
-        let edit = annotations::prepare_delete(&art, uuid, self.position_encoding)?;
-        self.apply(&edit)
+        let edit = annotations::commit_sidecar(&art, || {
+            let edit = annotations::prepare_delete(&art, uuid, self.position_encoding)?;
+            Ok((edit.sidecar.clone(), edit.sidecar_content.clone(), edit))
+        })?;
+        self.apply_doc(&edit)
     }
 
     fn reply(&self, uuid: &str, text: &str) -> Result<(), String> {
         let art = self.art()?;
-        let (path, content) = annotations::prepare_reply(&art, uuid, text)?;
-        self.write_sidecar(&path, &content)
+        annotations::commit_sidecar(&art, || {
+            let (path, content) = annotations::prepare_reply(&art, uuid, text)?;
+            Ok((path, content, ()))
+        })?;
+        self.push_pins();
+        Ok(())
     }
 
     fn set_status(&self, uuid: &str, status: &str) -> Result<(), String> {
         let art = self.art()?;
-        let (path, content) = annotations::prepare_status(&art, uuid, status)?;
-        self.write_sidecar(&path, &content)
+        annotations::commit_sidecar(&art, || {
+            let (path, content) = annotations::prepare_status(&art, uuid, status)?;
+            Ok((path, content, ()))
+        })?;
+        self.push_pins();
+        Ok(())
     }
 
     fn probe(&self, page: usize, x: f64, y: f64) -> Result<annotations::ProbeResult, String> {
@@ -956,9 +971,9 @@ impl DiskAnnotationServer {
         }
     }
 
-    fn apply(&self, edit: &annotations::AnnotationEdit) -> Result<(), String> {
-        std::fs::write(&edit.sidecar, &edit.sidecar_content)
-            .map_err(|e| format!("failed to write {}: {e}", edit.sidecar.display()))?;
+    /// Applies the document half of an annotation edit (the sidecar half
+    /// goes through [`annotations::commit_sidecar`]).
+    fn apply_doc(&self, edit: &annotations::AnnotationEdit) -> Result<(), String> {
         let content = edit
             .disk_content
             .as_ref()
@@ -984,12 +999,15 @@ impl DiskAnnotationServer {
 impl AnnotationServer for DiskAnnotationServer {
     fn annotate(&self, req: annotations::AnnotateRequest) -> Result<String, String> {
         let art = self.art()?;
-        let edit = annotations::prepare_annotate(
-            &art,
-            &req,
-            tinymist_query::PositionEncoding::Utf16,
-        )?;
-        self.apply(&edit)?;
+        let edit = annotations::commit_sidecar(&art, || {
+            let edit = annotations::prepare_annotate(
+                &art,
+                &req,
+                tinymist_query::PositionEncoding::Utf16,
+            )?;
+            Ok((edit.sidecar.clone(), edit.sidecar_content.clone(), edit))
+        })?;
+        self.apply_doc(&edit)?;
         let record = annotations::parse_records(&edit.sidecar_content)
             .into_iter()
             .find(|rec| rec.uuid == edit.uuid);
@@ -1001,21 +1019,25 @@ impl AnnotationServer for DiskAnnotationServer {
 
     fn remove(&self, uuid: &str) -> Result<(), String> {
         let art = self.art()?;
-        let edit = annotations::prepare_delete(
-            &art,
-            uuid,
-            tinymist_query::PositionEncoding::Utf16,
-        )?;
-        self.apply(&edit)?;
+        let edit = annotations::commit_sidecar(&art, || {
+            let edit = annotations::prepare_delete(
+                &art,
+                uuid,
+                tinymist_query::PositionEncoding::Utf16,
+            )?;
+            Ok((edit.sidecar.clone(), edit.sidecar_content.clone(), edit))
+        })?;
+        self.apply_doc(&edit)?;
         self.emit(serde_json::json!({ "type": "annotation_deleted", "uuid": uuid }));
         Ok(())
     }
 
     fn reply(&self, uuid: &str, text: &str) -> Result<(), String> {
         let art = self.art()?;
-        let (path, content) = annotations::prepare_reply(&art, uuid, text)?;
-        std::fs::write(&path, &content)
-            .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
+        annotations::commit_sidecar(&art, || {
+            let (path, content) = annotations::prepare_reply(&art, uuid, text)?;
+            Ok((path, content, ()))
+        })?;
         self.push_pins();
         self.emit(serde_json::json!({
             "type": "discussion_extended",
@@ -1028,9 +1050,10 @@ impl AnnotationServer for DiskAnnotationServer {
 
     fn set_status(&self, uuid: &str, status: &str) -> Result<(), String> {
         let art = self.art()?;
-        let (path, content) = annotations::prepare_status(&art, uuid, status)?;
-        std::fs::write(&path, &content)
-            .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
+        annotations::commit_sidecar(&art, || {
+            let (path, content) = annotations::prepare_status(&art, uuid, status)?;
+            Ok((path, content, ()))
+        })?;
         self.push_pins();
         self.emit(serde_json::json!({
             "type": "annotation_status_changed",

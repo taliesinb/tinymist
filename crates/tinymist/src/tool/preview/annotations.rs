@@ -121,6 +121,13 @@ pub struct AnnotationPin {
     pub page_width: f64,
     /// The page height, in pt.
     pub page_height: f64,
+    /// "text" for a glyph-precise anchor, "block" when the anchor marks a
+    /// whole generated block (figure, `#lorem(..)` paragraph, ...).
+    pub kind: String,
+    /// For block anchors, the block's top edge, in pt.
+    pub y0: Option<f64>,
+    /// For block anchors, the block's bottom edge, in pt.
+    pub y1: Option<f64>,
 }
 
 /// A request to create an annotation at a clicked position.
@@ -364,6 +371,38 @@ pub fn format_record(rec: &AnnotationRecord) -> String {
         .replace("${discussion}", &discussion)
 }
 
+/// Serializes sidecar mutations in-process; external writers (agents
+/// editing the file directly) are detected via the mtime check below.
+static SIDECAR_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+fn sidecar_mtime(path: &std::path::Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+/// Commits a sidecar mutation with optimistic concurrency: runs `prepare`
+/// (which reads the sidecar), and writes its content only if the file's
+/// mtime is unchanged since just before the read — retrying the whole
+/// prepare a few times when an external writer (e.g. an agent editing the
+/// file) got in between. In-process callers are serialized by a lock.
+pub fn commit_sidecar<E>(
+    art: &LspCompiledArtifact,
+    mut prepare: impl FnMut() -> Result<(PathBuf, String, E), String>,
+) -> Result<E, String> {
+    let _guard = SIDECAR_LOCK.lock();
+    for _ in 0..3 {
+        let seen = sidecar_path(art).and_then(|p| sidecar_mtime(&p));
+        let (path, content, extra) = prepare()?;
+        if sidecar_path(art).and_then(|p| sidecar_mtime(&p)) != seen {
+            // The file changed while we were preparing; re-read and retry.
+            continue;
+        }
+        std::fs::write(&path, &content)
+            .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
+        return Ok(extra);
+    }
+    Err("the sidecar kept changing concurrently; giving up".into())
+}
+
 fn read_sidecar(path: &std::path::Path) -> (Vec<AnnotationRecord>, String) {
     match std::fs::read_to_string(path) {
         Ok(content) => {
@@ -400,6 +439,55 @@ pub fn annotation_pins(art: &LspCompiledArtifact) -> Vec<AnnotationPin> {
             // inter-character point. Fall back to the labeled element's
             // position (the start of its text run).
             let needle = anchor_text(&rec.uuid);
+            // An anchor placed after generated content marks that whole
+            // block; report its extent so the frontend can point at it.
+            let block = art.depended_files().iter().find_map(|&file| {
+                use typst_shim::syntax::LinkedNodeExt;
+                let source = world.source(file).ok()?;
+                let at = source.text().find(&needle)?;
+                // What precedes the anchor decides its kind: markup text
+                // means a word anchor, anything else (a call, a figure)
+                // means the anchor marks that whole block.
+                let node = typst::syntax::LinkedNode::new(source.root())
+                    .leaf_at_compat(at)?;
+                if node.kind() == SyntaxKind::Text {
+                    return None;
+                }
+                let mut cursor = node;
+                loop {
+                    let parent = cursor.parent().cloned();
+                    match parent {
+                        Some(parent) if parent.kind() != SyntaxKind::Markup => {
+                            cursor = parent
+                        }
+                        _ => break,
+                    }
+                }
+                let range = cursor.range();
+                let bbox = block_box(paged, file, &source, &range)?;
+                Some(bbox)
+            });
+            if let Some(bbox) = block {
+                let size = paged.pages().get(bbox.page - 1)?.frame.size();
+                return Some(AnnotationPin {
+                    rtype: rec.rtype.clone(),
+                    uuid: rec.uuid.clone(),
+                    letter: rec.letter.clone(),
+                    author: rec.author.clone(),
+                    content: rec.content.clone(),
+                    time: rec.time.clone(),
+                    status: rec.status.clone(),
+                    discussion: rec.discussion.clone(),
+                    page: bbox.page,
+                    x: bbox.x0,
+                    y: (bbox.y0 + bbox.y1) / 2.0,
+                    page_width: size.x.to_pt(),
+                    page_height: size.y.to_pt(),
+                    kind: "block".into(),
+                    y0: Some(bbox.y0),
+                    y1: Some(bbox.y1),
+                });
+            }
             let exact = art.depended_files().iter().find_map(|&file| {
                 let source = world.source(file).ok()?;
                 let at = source.text().find(&needle)?;
@@ -430,6 +518,9 @@ pub fn annotation_pins(art: &LspCompiledArtifact) -> Vec<AnnotationPin> {
                 y: pos.point.y.to_pt(),
                 page_width: size.x.to_pt(),
                 page_height: size.y.to_pt(),
+                kind: "text".into(),
+                y0: None,
+                y1: None,
             })
         })
         .collect()
@@ -717,24 +808,257 @@ fn best_effort_patch(
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProbeResult {
+    /// "text" for a glyph-precise anchor, "block" for one attached to a
+    /// whole generated block (a figure, a `#lorem(..)` paragraph, ...).
+    pub kind: String,
     /// The 1-based page number.
     pub page: usize,
     /// The x coordinate of the would-be anchor, in pt.
     pub x: f64,
     /// The y coordinate of the would-be anchor, in pt.
     pub y: f64,
+    /// For block anchors, the block's vertical extent, in pt.
+    pub y0: Option<f64>,
+    /// For block anchors, the block's bottom edge, in pt.
+    pub y1: Option<f64>,
+}
+
+/// The rendered extent of a source range on a page: the union of the boxes
+/// of every frame item whose span falls inside the range.
+#[derive(Debug, Clone, Copy)]
+pub struct BlockBox {
+    /// The 1-based page number.
+    pub page: usize,
+    /// The left edge, in pt.
+    pub x0: f64,
+    /// The top edge, in pt.
+    pub y0: f64,
+    /// The bottom edge, in pt.
+    pub y1: f64,
+}
+
+fn union_range_box(
+    frame: &typst::layout::Frame,
+    id: typst::syntax::FileId,
+    range: &std::ops::Range<usize>,
+    source: &typst::syntax::Source,
+    origin: Point,
+    out: &mut Option<(f64, f64, f64)>,
+    // The enclosing group's box, if any: a hit inside a group (a figure, a
+    // boxed diagram) marks that whole group rather than the single item,
+    // since the rest of the group usually has no spans of its own.
+    group: Option<(f64, f64, f64)>,
+) {
+    use typst::layout::FrameItem;
+    fn hit(
+        out: &mut Option<(f64, f64, f64)>,
+        id: typst::syntax::FileId,
+        range: &std::ops::Range<usize>,
+        source: &typst::syntax::Source,
+        pos: Point,
+        height: Abs,
+        item_span: typst::syntax::Span,
+        group: Option<(f64, f64, f64)>,
+    ) {
+        if item_span.id() != Some(id) {
+            return;
+        }
+        let Some(r) = typst_shim::syntax::source_range(source, item_span) else {
+            return;
+        };
+        if r.start < range.start || r.end > range.end {
+            return;
+        }
+        let (x, y0, y1) = match group {
+            Some(g) => g,
+            None => (pos.x.to_pt(), pos.y.to_pt() - height.to_pt(), pos.y.to_pt()),
+        };
+        *out = Some(match *out {
+            None => (x, y0, y1),
+            Some((ox, oy0, oy1)) => (ox.min(x), oy0.min(y0), oy1.max(y1)),
+        });
+    }
+    for &(pos, ref item) in frame.items() {
+        let at = origin + pos;
+        match item {
+            FrameItem::Group(inner) => {
+                let size = inner.frame.size();
+                let gb = Some((
+                    at.x.to_pt(),
+                    at.y.to_pt(),
+                    at.y.to_pt() + size.y.to_pt(),
+                ));
+                union_range_box(&inner.frame, id, range, source, at, out, group.or(gb))
+            }
+            FrameItem::Text(text) => {
+                for glyph in &text.glyphs {
+                    hit(out, id, range, source, at, text.size, glyph.span.0, group);
+                }
+            }
+            FrameItem::Shape(shape, span) => {
+                let h = match shape.geometry {
+                    typst::visualize::Geometry::Rect(size) => size.y,
+                    _ => Abs::zero(),
+                };
+                hit(out, id, range, source, at + Point::new(Abs::zero(), h), h, *span, group);
+            }
+            FrameItem::Image(_, size, span) => hit(
+                out, id, range, source,
+                at + Point::new(Abs::zero(), size.y), size.y, *span, group,
+            ),
+            _ => {}
+        }
+    }
+}
+
+/// The rendered extent of a source range, searched across all pages.
+fn block_box(
+    paged: &reflexo_typst::TypstPagedDocument,
+    id: typst::syntax::FileId,
+    source: &typst::syntax::Source,
+    range: &std::ops::Range<usize>,
+) -> Option<BlockBox> {
+    for (idx, page) in paged.pages().iter().enumerate() {
+        let mut out = None;
+        union_range_box(&page.frame, id, range, source, Point::zero(), &mut out, None);
+        if let Some((x0, y0, y1)) = out {
+            return Some(BlockBox {
+                page: idx + 1,
+                x0,
+                y0,
+                y1,
+            });
+        }
+    }
+    None
+}
+
+/// The first source span found anywhere in a frame.
+fn first_span(frame: &typst::layout::Frame) -> Option<typst::syntax::Span> {
+    use typst::layout::FrameItem;
+    for (_, item) in frame.items() {
+        let span = match item {
+            FrameItem::Group(group) => first_span(&group.frame),
+            FrameItem::Text(text) => text.glyphs.first().map(|g| g.span.0),
+            FrameItem::Shape(_, span) | FrameItem::Image(_, _, span) => Some(*span),
+            _ => None,
+        };
+        if let Some(span) = span {
+            if span.id().is_some() {
+                return Some(span);
+            }
+        }
+    }
+    None
+}
+
+/// Finds the text span closest to a click, with its distance in pt.
+fn nearest_text_span(
+    frame: &typst::layout::Frame,
+    click: Point,
+    origin: Point,
+    best: &mut Option<(f64, typst::syntax::Span)>,
+) {
+    use typst::layout::FrameItem;
+    for &(pos, ref item) in frame.items() {
+        let at = origin + pos;
+        match item {
+            FrameItem::Group(group) => nearest_text_span(&group.frame, click, at, best),
+            FrameItem::Text(text) => {
+                for glyph in &text.glyphs {
+                    if glyph.span.0.id().is_none() {
+                        continue;
+                    }
+                    let dx = (at.x - click.x).to_pt();
+                    let dy = (at.y - click.y).to_pt();
+                    let d = (dx * dx + dy * dy).sqrt();
+                    if best.map_or(true, |(bd, _)| d < bd) {
+                        *best = Some((d, glyph.span.0));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Finds the innermost frame item containing a click that carries a source
+/// span, for clicks that miss text (figures, shapes, images).
+fn span_under_click(
+    frame: &typst::layout::Frame,
+    click: Point,
+    origin: Point,
+    best: &mut Option<(f64, typst::syntax::Span)>,
+) {
+    use typst::layout::FrameItem;
+    for &(pos, ref item) in frame.items() {
+        let at = origin + pos;
+        match item {
+            FrameItem::Group(group) => {
+                span_under_click(&group.frame, click, at, best);
+                // A group (a figure, a box) is itself a candidate: its span
+                // stands in when nothing inside carries one.
+                let size = group.frame.size();
+                let inside = click.x >= at.x
+                    && click.x <= at.x + size.x
+                    && click.y >= at.y
+                    && click.y <= at.y + size.y;
+                let area = size.x.to_pt() * size.y.to_pt();
+                if inside {
+                    let span = first_span(&group.frame);
+                    if let Some(span) = span {
+                        if best.map_or(true, |(a, _)| area < a) {
+                            *best = Some((area, span));
+                        }
+                    }
+                }
+            }
+            FrameItem::Shape(shape, span) => {
+                if let typst::visualize::Geometry::Rect(size) = shape.geometry {
+                    let inside = click.x >= at.x
+                        && click.x <= at.x + size.x
+                        && click.y >= at.y
+                        && click.y <= at.y + size.y;
+                    let area = size.x.to_pt() * size.y.to_pt();
+                    if inside && span.id().is_some() && best.map_or(true, |(a, _)| area < a) {
+                        *best = Some((area, *span));
+                    }
+                }
+            }
+            FrameItem::Image(_, size, span) => {
+                let inside = click.x >= at.x
+                    && click.x <= at.x + size.x
+                    && click.y >= at.y
+                    && click.y <= at.y + size.y;
+                let area = size.x.to_pt() * size.y.to_pt();
+                if inside && span.id().is_some() && best.map_or(true, |(a, _)| area < a) {
+                    *best = Some((area, *span));
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Resolves a click to the source position where an anchor label would be
 /// inserted: the end of the clicked word. Errors when the click does not
 /// hit markup text (margins, whitespace past the end of the document, math,
 /// generated content).
+#[allow(clippy::type_complexity)]
 fn resolve_click(
     art: &LspCompiledArtifact,
     page_no: usize,
     x: f64,
     y: f64,
-) -> Result<(typst::syntax::FileId, typst::syntax::Source, usize), String> {
+) -> Result<
+    (
+        typst::syntax::FileId,
+        typst::syntax::Source,
+        usize,
+        Option<std::ops::Range<usize>>,
+    ),
+    String,
+> {
     let world = art.world();
     let Some(TypstDocument::Paged(doc)) = art.success_doc() else {
         return Err("no rendered document".into());
@@ -744,26 +1068,72 @@ fn resolve_click(
         .get(page_no.checked_sub(1).ok_or("bad page")?)
         .ok_or("no such page")?;
     let click = Point::new(Abs::pt(x), Abs::pt(y));
-    let (start, _) =
-        jump_from_click(world, &page.frame, click).ok_or("no text under the click")?;
+    // Text first; otherwise the innermost shape or image under the click
+    // (figures, diagrams), whose span points at the code that made it.
+    // `direct` means the click landed on real text; otherwise it was
+    // resolved via a shape, a group, or the nearest caption — in which case
+    // the annotation belongs to the whole block, not to that text.
+    let mut direct = true;
+    let span = match jump_from_click(world, &page.frame, click) {
+        Some((start, _)) => start.span,
+        None => {
+            direct = false;
+            let mut best = None;
+            span_under_click(&page.frame, click, Point::zero(), &mut best);
+            match best {
+                Some((_, span)) => span,
+                None => {
+                    // Figures and diagrams often carry no span on their
+                    // shapes; fall back to the nearest text nearby (a
+                    // caption, a label inside the drawing), whose enclosing
+                    // expression is the block the click meant.
+                    let mut near: Option<(f64, typst::syntax::Span)> = None;
+                    nearest_text_span(&page.frame, click, Point::zero(), &mut near);
+                    match near {
+                        Some((d, span)) if d < 120.0 => span,
+                        _ => return Err("nothing annotatable under the click".into()),
+                    }
+                }
+            }
+        }
+    };
+    let start = reflexo::debug_loc::SourceSpanOffset { span, offset: 0 };
     let id = start.span.id().ok_or("clicked text has no source")?;
     let source = world.source(id).map_err(|e| e.to_string())?;
     let node = source.find(start.span).ok_or("span not found in source")?;
-    if node.kind() != SyntaxKind::Text {
-        return Err("annotations can only anchor on markup text".into());
-    }
-    let node_range = node.range();
-    // Advance to the end of the clicked word: a label sticks to the element
-    // before it, and mid-word insertion would split the word.
-    let mut at = (node_range.start + start.offset).min(node_range.end);
-    let text = source.text();
-    while at < node_range.end {
-        match text[at..].chars().next() {
-            Some(c) if !c.is_whitespace() => at += c.len_utf8(),
-            _ => break,
+    let at = if direct && node.kind() == SyntaxKind::Text {
+        let node_range = node.range();
+        // Advance to the end of the clicked word: a label sticks to the
+        // element before it, and mid-word insertion would split the word.
+        let mut at = (node_range.start + start.offset).min(node_range.end);
+        let text = source.text();
+        while at < node_range.end {
+            match text[at..].chars().next() {
+                Some(c) if !c.is_whitespace() => at += c.len_utf8(),
+                _ => break,
+            }
         }
-    }
-    Ok((id, source, at))
+        return Ok((id, source, at, None));
+    } else {
+        // Generated content (`#lorem(60)`, math, figures, ...) has no
+        // markup text to carry a label; anchor after the whole expression
+        // that produced it, which is itself in markup.
+        let mut cursor = node;
+        loop {
+            let parent = cursor.parent().cloned();
+            match parent {
+                Some(parent) if parent.kind() != SyntaxKind::Markup => cursor = parent,
+                _ => break,
+            }
+        }
+        if cursor.parent().is_none() {
+            return Err("annotations can only anchor in markup".into());
+        }
+        let range = cursor.range();
+        return Ok((id, source, range.end, Some(range)));
+    };
+    #[allow(unreachable_code)]
+    Ok((id, source, at, None))
 }
 
 /// Resolves a click to the exact would-be anchor position, without editing
@@ -774,17 +1144,43 @@ pub fn probe_annotate(
     x: f64,
     y: f64,
 ) -> Result<ProbeResult, String> {
-    let (_, source, at) = resolve_click(art, page_no, x, y)?;
+    let (id, source, at, block) = resolve_click(art, page_no, x, y)?;
     let Some(TypstDocument::Paged(paged)) = art.success_doc() else {
         return Err("no rendered document".into());
     };
-    let pos = exact_anchor_position(&paged, &source, at)
-        .ok_or("cannot resolve the anchor position")?;
-    Ok(ProbeResult {
-        page: pos.page.into(),
-        x: pos.point.x.to_pt(),
-        y: pos.point.y.to_pt(),
-    })
+    // A block anchor marks the whole generated block: report its extent so
+    // the frontend can point at it from the left, rather than pretending to
+    // mark a position inside text that does not exist in the source.
+    if let Some(range) = block {
+        if let Some(bbox) = block_box(&paged, id, &source, &range) {
+            return Ok(ProbeResult {
+                kind: "block".into(),
+                page: bbox.page,
+                x: bbox.x0,
+                y: (bbox.y0 + bbox.y1) / 2.0,
+                y0: Some(bbox.y0),
+                y1: Some(bbox.y1),
+            });
+        }
+    }
+    match exact_anchor_position(&paged, &source, at) {
+        Some(pos) => Ok(ProbeResult {
+            kind: "text".into(),
+            page: pos.page.into(),
+            x: pos.point.x.to_pt(),
+            y: pos.point.y.to_pt(),
+            y0: None,
+            y1: None,
+        }),
+        None => Ok(ProbeResult {
+            kind: "text".into(),
+            page: page_no,
+            x,
+            y,
+            y0: None,
+            y1: None,
+        }),
+    }
 }
 
 /// Prepares the edits creating an annotation at a clicked position: an
@@ -796,7 +1192,7 @@ pub fn prepare_annotate(
     encoding: PositionEncoding,
 ) -> Result<AnnotationEdit, String> {
     let world = art.world();
-    let (id, source, at) = resolve_click(art, req.page, req.x, req.y)?;
+    let (id, source, at, _) = resolve_click(art, req.page, req.x, req.y)?;
 
     let path = world.path_for_id(id).map_err(|e| e.to_string())?;
     let path = path.to_err().map_err(|e| e.to_string())?;

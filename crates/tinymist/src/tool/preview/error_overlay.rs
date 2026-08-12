@@ -496,3 +496,14 @@ pub fn overlay_js() -> String {
 pub fn overlay_js_path() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tool/preview/error_overlay.js")
 }
+
+/// The annotation UI script, served separately (loaded only by /?annotate
+/// pages) and editable in the source tree like the overlay script.
+pub fn annotations_js() -> String {
+    super::annotations::dev_asset("annotations.js", include_str!("annotations.js"))
+}
+
+/// The source-tree path of the annotation script, for dev asset watching.
+pub fn annotations_js_path() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tool/preview/annotations.js")
+}
