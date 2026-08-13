@@ -1993,11 +1993,19 @@ fn snap_past_marker(text: &str, at: usize) -> usize {
     while i < bytes.len() && space(bytes[i]) {
         i += 1;
     }
-    // A list marker: "-", "+", "/", or an enumerator like "12." / "12)".
+    // A list marker: "-", "+", "/", a heading's run of "=", or an enumerator
+    // like "12." / "12)".
     let before_marker = i;
+    let mut heading = false;
     if i < bytes.len() {
         match bytes[i] {
             b'-' | b'+' | b'/' => i += 1,
+            b'=' => {
+                while i < bytes.len() && bytes[i] == b'=' {
+                    i += 1;
+                }
+                heading = true;
+            }
             b'0'..=b'9' => {
                 let mut j = i;
                 while j < bytes.len() && bytes[j].is_ascii_digit() {
@@ -2013,6 +2021,17 @@ fn snap_past_marker(text: &str, at: usize) -> usize {
     // Only a marker if a space follows it; otherwise it was ordinary text.
     if i > before_marker && !(i < bytes.len() && space(bytes[i])) {
         i = before_marker;
+        heading = false;
+    }
+    // A heading holds a label only at its end — one written into the middle
+    // closes the heading there and leaves the rest as a paragraph — so its
+    // anchor goes after the last word of the line.
+    if heading {
+        let mut end = text[i..].find('\n').map(|at| i + at).unwrap_or(text.len());
+        while end > i && space(bytes[end - 1]) {
+            end -= 1;
+        }
+        return end;
     }
     while i < bytes.len() && space(bytes[i]) {
         i += 1;
@@ -2048,7 +2067,10 @@ fn prepare_at(
     // Region scopes anchor at the region's start, which may sit before a list
     // marker or at a line head; move into the text so the label binds there.
     let at = match scope {
-        Scope::Item | Scope::Para => snap_past_marker(source.text(), at),
+        // Every region scope anchors at the head of the region it covers,
+        // which is where its marker lives — a bullet, an enumerator, the
+        // "=" of a heading. A label written there stops the marker being one.
+        Scope::Item | Scope::Para | Scope::Block => snap_past_marker(source.text(), at),
         _ => at,
     };
     let pos = to_lsp_position(at, encoding, &source);
@@ -2309,5 +2331,15 @@ mod anchor_tests {
         // an offset already inside the text is left alone
         let t = "- Agents watch\n";
         assert_eq!(snapped(t, 9), "- Agents <L>watch\n");
+        // A heading takes its label at the end of the line, where Typst binds
+        // it to the heading instead of ending it.
+        let t = "= A short document\n";
+        assert_eq!(snapped(t, 0), "= A short document<L>\n");
+        let t = "== A second heading   \n";
+        assert_eq!(snapped(t, 0), "== A second heading<L>   \n");
+        // "=" without a space after it is an equation or plain text, not a
+        // heading, and nothing is skipped
+        let t = "=x is not a heading\n";
+        assert_eq!(snapped(t, 0), "=x<L> is not a heading\n");
     }
 }
