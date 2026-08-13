@@ -31,6 +31,7 @@ pub async fn make_http_server(
     annot: Option<std::sync::Arc<dyn super::AnnotationServer>>,
     shutdown_on_last_client: bool,
     identity: super::WebAppIdentity,
+    html: Option<std::sync::Arc<dyn super::html_annotations::HtmlAnnotationServer>>,
 ) -> HttpServer {
     use futures::StreamExt;
     use http_body_util::{Full, StreamBody};
@@ -76,6 +77,7 @@ pub async fn make_http_server(
         let static_file_addr = static_file_addr.clone();
         let diag_rx = diag_rx.clone();
         let annot = annot.clone();
+        let html = html.clone();
         let live = live.clone();
         let served_anyone = served_anyone.clone();
         let identity = identity.clone();
@@ -86,6 +88,7 @@ pub async fn make_http_server(
             let static_file_addr = static_file_addr.clone();
             let diag_rx = diag_rx.clone();
             let annot = annot.clone();
+            let html = html.clone();
             let live = live.clone();
             let served_anyone = served_anyone.clone();
             async move {
@@ -237,6 +240,56 @@ pub async fn make_http_server(
                     let res = hyper::Response::builder()
                         .status(hyper::StatusCode::OK)
                         .body(Body::new(Full::<Bytes>::default()))
+                        .unwrap();
+                    Ok(res)
+                } else if req.uri().path().starts_with("/dev/html/") && html.is_some() {
+                    // HTML mode's own endpoints. The document arrives as a
+                    // fragment with every piece labelled with the source range
+                    // it came from; the annotations arrive as source offsets.
+                    // Geometry is the browser's business here, so none is sent.
+                    let html = html.unwrap();
+                    let (body, mime) = match req.uri().path() {
+                        "/dev/html/annotate.js" => (
+                            super::html_annotations::client_js(),
+                            "application/javascript",
+                        ),
+                        "/dev/html/annotate.css" => {
+                            (super::html_annotations::client_css(), "text/css")
+                        }
+                        "/dev/html/doc" => {
+                            let payload = match html.document() {
+                                Ok(doc) => {
+                                    let frag = super::html_annotations::fragment(&doc);
+                                    serde_json::json!({
+                                        "ok": true,
+                                        "title": frag.title,
+                                        "body": frag.body,
+                                    })
+                                }
+                                Err(err) => serde_json::json!({"ok": false, "error": err}),
+                            };
+                            (payload.to_string(), "application/json")
+                        }
+                        "/dev/html/pins" => {
+                            let payload = serde_json::json!({
+                                "ok": true,
+                                "pins": html.pins(),
+                            });
+                            (payload.to_string(), "application/json")
+                        }
+                        other => (
+                            serde_json::json!({
+                                "ok": false,
+                                "error": format!("unknown endpoint: {other}"),
+                            })
+                            .to_string(),
+                            "application/json",
+                        ),
+                    };
+                    let res = hyper::Response::builder()
+                        .header(hyper::header::CONTENT_TYPE, mime)
+                        .header(hyper::header::CACHE_CONTROL, "no-cache")
+                        .body(Body::new(Full::<Bytes>::from(body)))
                         .unwrap();
                     Ok(res)
                 } else if req.uri().path() == "/dev/annotations.js" && annot.is_some() {

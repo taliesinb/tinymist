@@ -374,9 +374,17 @@ pub fn diagnostics_payload(
             });
             // The trace frames, innermost first; the last one points at the
             // document-level code that triggered the failing call.
+            // The wrapper that installs the HTML export shims is not a file
+            // anyone wrote, and "while including doc.typ" from a file the
+            // reader has never heard of only obscures the error under it.
+            let generated = |id: Option<typst::syntax::FileId>| {
+                id.and_then(|id| id.vpath().file_name().map(|n| n.starts_with(".talimist-html.")))
+                    .unwrap_or(false)
+            };
             let trace: Vec<_> = diag
                 .trace
                 .iter()
+                .filter(|point| !generated(point.span.id()))
                 .map(|point| {
                     let span = point.span;
                     (

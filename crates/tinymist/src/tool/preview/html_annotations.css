@@ -1,0 +1,243 @@
+/* The page an HTML-mode document is annotated on. The document itself is
+   styled as little as possible — it brings its own markup and the point is to
+   read it — so almost everything here belongs to the annotation UI. */
+
+:root {
+  color-scheme: light dark;
+  --tm-bg: #ffffff;
+  --tm-fg: #1a1a1a;
+  --tm-rule: rgba(0, 0, 0, 0.12);
+  --tm-halo: #ffffff;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --tm-bg: #1b1b1d;
+    --tm-fg: #e6e6e6;
+    --tm-rule: rgba(255, 255, 255, 0.16);
+    --tm-halo: #0e0e0e;
+  }
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background: var(--tm-bg);
+  color: var(--tm-fg);
+}
+
+body {
+  font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+}
+
+/* The document reads as a document. Typst's own defaults are serif, and the
+   families these documents ask for are installed on this machine already —
+   they had to be, or the document would not have compiled — so they can simply
+   be named. A font the document sets on a *run* is carried through by the
+   export shims; this is the ground it sits on. */
+.tm-doc {
+  font-family: "New Computer Modern", "Latin Modern Roman", "Libertinus Serif",
+    "TeX Gyre Pagella", Georgia, "Times New Roman", serif;
+}
+
+/* A column of comfortable measure, with room on the left for the marks that
+   hang off the text: strips, chips and letters all live in that margin. */
+.tm-doc {
+  max-width: 46rem;
+  margin: 0 auto;
+  padding: 3rem 2rem 6rem 5.5rem;
+}
+
+.tm-doc img,
+.tm-doc svg {
+  max-width: 100%;
+}
+
+.tm-doc table {
+  border-collapse: collapse;
+}
+
+.tm-doc td,
+.tm-doc th {
+  border: 1px solid var(--tm-rule);
+  padding: 0.25rem 0.5rem;
+}
+
+.tm-doc pre {
+  overflow-x: auto;
+}
+
+/* Math arrives as MathML. Browsers have a math font of their own, but the
+   documents this serves are usually set in Computer Modern, so it is asked for
+   first — by name, from the reader's own machine, since the same font had to be
+   installed for Typst to compile the document at all. */
+math {
+  font-family: "New Computer Modern Math", "Latin Modern Math", "STIX Two Math",
+    "Cambria Math", math;
+  font-size: 1.05em;
+}
+
+/* A browser puts a margin above every paragraph, including the first one
+   inside a box; Typst does not, and the difference shows as a gap between a
+   callout's edge and its own first line. */
+.tm-doc :is(div, figure, blockquote, li, td, th) > :first-child {
+  margin-top: 0;
+}
+
+.tm-doc :is(div, figure, blockquote, li, td, th) > :last-child {
+  margin-bottom: 0;
+}
+
+/* Nothing in the document may swallow a click meant for annotating: the whole
+   UI hit-tests against text, and a link would navigate away. */
+.tm-annotate .tm-doc,
+.tm-annotate .tm-doc * {
+  cursor: text;
+}
+
+.tm-annotate .tm-doc a {
+  pointer-events: none;
+}
+
+.tm-annotate[data-tm-cursor="block"] .tm-doc,
+.tm-annotate[data-tm-cursor="block"] .tm-doc * {
+  cursor: pointer;
+}
+
+/* The overlay every mark is drawn in: fixed to the viewport, so marks track
+   scrolling with the text they name and nothing in the document shifts to make
+   room for them. */
+#tinymist-marks {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 2147483645;
+}
+
+#tinymist-marks .tm-mark {
+  position: absolute;
+  pointer-events: none;
+  border-radius: 1.5px;
+}
+
+#tinymist-marks .tm-hit {
+  position: absolute;
+  pointer-events: auto;
+  cursor: pointer;
+  background: transparent;
+}
+
+#tinymist-marks .tm-glyph,
+#tinymist-marks .tm-chip {
+  position: absolute;
+  line-height: 0;
+}
+
+#tinymist-marks .tm-chip {
+  pointer-events: auto;
+  cursor: pointer;
+}
+
+#tinymist-marks .tm-edge {
+  position: absolute;
+  display: block;
+  min-width: 22px;
+  height: 20px;
+  padding: 0 4px;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  pointer-events: auto;
+  color: white;
+  font: bold 11px ui-monospace, monospace;
+  text-transform: uppercase;
+  transition: left 0.25s ease, top 0.25s ease;
+}
+
+/* The annotation window: docked bottom-left, coloured by status. */
+#tinymist-annot-box {
+  position: fixed;
+  left: 12px;
+  bottom: 12px;
+  width: 280px;
+  border-radius: 8px;
+  overflow: hidden;
+  z-index: 2147483647;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.5);
+  font: 13px/1.45 system-ui, sans-serif;
+}
+
+#tinymist-annot-box .ta-title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 4px 10px;
+  min-height: 20px;
+}
+
+#tinymist-annot-box .ta-acts {
+  display: none;
+  gap: 5px;
+  color: rgba(255, 255, 255, 0.92);
+}
+
+#tinymist-annot-box .ta-title:hover .ta-acts {
+  display: inline-flex;
+}
+
+#tinymist-annot-box .ta-acts [data-act] {
+  cursor: pointer;
+  text-decoration: underline;
+}
+
+#tinymist-annot-box .ta-body {
+  padding: 10px 12px 12px;
+}
+
+#tinymist-annot-box textarea {
+  width: 100%;
+  box-sizing: border-box;
+  background: rgba(255, 255, 255, 0.07);
+  border: none;
+  outline: none;
+  resize: none;
+  overflow: hidden;
+  display: block;
+  border-radius: 5px;
+  padding: 6px 66px 6px 8px;
+  font: 12.5px/1.4 system-ui, sans-serif;
+}
+
+#tinymist-annot-box textarea::placeholder {
+  color: rgba(255, 255, 255, 0.35);
+}
+
+/* Compile errors and connection trouble, stated plainly rather than left to a
+   blank page. */
+.tm-status {
+  cursor: copy;
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  max-height: 40vh;
+  overflow: auto;
+  margin: 0;
+  padding: 10px 14px;
+  background: #2a1416;
+  color: #ffd7d7;
+  font: 12px/1.5 ui-monospace, monospace;
+  white-space: pre-wrap;
+  z-index: 2147483646;
+}
+
+.tm-status-copied {
+  position: sticky;
+  bottom: 0;
+  float: right;
+  padding: 1px 6px;
+  border-radius: 3px;
+  background: rgba(255, 215, 215, 0.16);
+  font: 11px/1.4 system-ui, sans-serif;
+}

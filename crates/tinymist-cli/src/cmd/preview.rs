@@ -89,14 +89,29 @@ pub async fn preview_main(mut args: PreviewCliArgs) -> Result<()> {
     if !args.daemon {
         tinymist::tool::preview::exit_when_orphaned();
     }
-    let preview_target = args.preview.format;
+    let preview_target = args.preview.export_target();
+    let html_mode = matches!(preview_target, ExportTarget::Html);
     if matches!(preview_target, ExportTarget::Bundle) {
         bail!("bundle export target is not supported by preview");
     }
-    let verse = args.compile.resolve()?;
+    let mut verse = args.compile.resolve()?;
+    // HTML export drops whole elements (`align`, `grid`, `place`, ...) and the
+    // appearance of others; the shims put that back by compiling the document
+    // through a generated wrapper that installs show rules in front of it.
+    let shims = if html_mode {
+        match tinymist::tool::preview::html_annotations::install_shims(&mut verse) {
+            Ok(entry) => Some(entry),
+            Err(err) => {
+                log::warn!("serving without the HTML export shims: {err}");
+                None
+            }
+        }
+    } else {
+        None
+    };
     let previewer = PreviewBuilder::new(config);
 
-    let (service, handle, diag_rx, annot) = {
+    let (service, handle, diag_rx, annot, html_server) = {
         let preview_state = ProjectPreviewState::default();
         let last_art = Arc::new(parking_lot::Mutex::default());
         let mut opts = ProjectOpts {
@@ -158,21 +173,25 @@ pub async fn preview_main(mut args: PreviewCliArgs) -> Result<()> {
             let poll_art = last_art.clone();
             tokio::spawn(async move {
                 let mut last_mtime = None;
-                let mut js_mtime = (None, None);
+                let mut js_mtime = Vec::new();
                 let mut first = true;
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                     let Some(diag_tx) = watchers.diag_tx(&poll_id) else {
                         break;
                     };
-                    let mtime = (
+                    let mut stamps = vec![
                         std::fs::metadata(tinymist::tool::preview::overlay_js_path())
                             .and_then(|m| m.modified())
                             .ok(),
                         std::fs::metadata(tinymist::tool::preview::annotations_js_path())
                             .and_then(|m| m.modified())
                             .ok(),
-                    );
+                    ];
+                    for path in tinymist::tool::preview::html_annotations::asset_paths() {
+                        stamps.push(std::fs::metadata(path).and_then(|m| m.modified()).ok());
+                    }
+                    let mtime = stamps;
                     if mtime != js_mtime {
                         js_mtime = mtime;
                         if !first {
@@ -202,8 +221,46 @@ pub async fn preview_main(mut args: PreviewCliArgs) -> Result<()> {
             client: Box::new(intr_tx),
         });
 
-        (service, handle, diag_rx, annot)
+        // HTML mode answers from the same artifact, through its own endpoints.
+        let html_server: Option<
+            Arc<dyn tinymist::tool::preview::html_annotations::HtmlAnnotationServer>,
+        > = html_mode.then(|| {
+            Arc::new(tinymist::tool::preview::html_annotations::ArtifactHtmlServer {
+                last_art: last_art.clone(),
+            }) as Arc<_>
+        });
+
+        (service, handle, diag_rx, annot, html_server)
     };
+
+    // A shim edit is not a compile dependency — the wrapper holds a copy of the
+    // text — so the wrapper is rewritten when the file changes, which is what
+    // the compiler notices.
+    if let Some(shims) = shims.clone() {
+        let handle = handle.clone();
+        tokio::spawn(async move {
+            use tinymist::tool::preview::html_annotations;
+            use tinymist_preview::EditorServer;
+            let mut last = None;
+            loop {
+                let stamp = std::fs::metadata(html_annotations::shims_path())
+                    .and_then(|meta| meta.modified())
+                    .ok();
+                if last.is_some() && stamp != last {
+                    log::info!("reloading the HTML export shims");
+                    let files = tinymist_preview::MemoryFiles {
+                        files: std::collections::HashMap::from([(
+                            shims.path.clone(),
+                            html_annotations::wrapper_source(&shims.main_name),
+                        )]),
+                    };
+                    let _ = handle.update_memory_files(files, false).await;
+                }
+                last = stamp;
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        });
+    }
 
     let (lsp_tx, mut lsp_rx) = ControlPlaneTx::new(true);
 
@@ -222,6 +279,7 @@ pub async fn preview_main(mut args: PreviewCliArgs) -> Result<()> {
                 tinymist::tool::preview::WebAppIdentity::new(
                     tinymist::tool::preview::icons::IconRole::Serve,
                 ),
+                None,
             )
             .await;
         log::info!(
@@ -309,17 +367,29 @@ pub async fn preview_main(mut args: PreviewCliArgs) -> Result<()> {
         args.preview.page_title.as_deref(),
         args.compile.input.as_deref(),
     );
-    let mut frontend_html = frontend_html(
-        TYPST_PREVIEW_HTML,
-        args.preview.preview_mode,
-        "/",
-        &page_title,
-    );
-    let early = format!(
-        "<script>{}</script>",
-        tinymist::tool::preview::EARLY_ERROR_JS
-    );
-    frontend_html = match frontend_html.find("<head>") {
+    // HTML mode brings its own page: the paged frontend is a renderer for a
+    // document this mode does not produce, and nothing in it applies here.
+    let mut frontend_html = if html_mode {
+        tinymist::tool::preview::html_annotations::shell_html()
+    } else {
+        frontend_html(
+            TYPST_PREVIEW_HTML,
+            args.preview.preview_mode,
+            "/",
+            &page_title,
+        )
+    };
+    // The early trap watches for a paged render that never arrives, and would
+    // call an HTML-mode page broken for want of pages it never has.
+    let early = if html_mode {
+        String::new()
+    } else {
+        format!(
+            "<script>{}</script>",
+            tinymist::tool::preview::EARLY_ERROR_JS
+        )
+    };
+    frontend_html = match frontend_html.find("<head>").filter(|_| !early.is_empty()) {
         Some(at) => {
             let mut html = frontend_html.clone();
             html.insert_str(at + "<head>".len(), &early);
@@ -327,8 +397,13 @@ pub async fn preview_main(mut args: PreviewCliArgs) -> Result<()> {
         }
         None => format!("{early}{frontend_html}"),
     };
-    let script = "<script src=\"/dev/overlay.js\"></script>";
-    if frontend_html.contains("</body>") {
+    let script = if html_mode {
+        ""
+    } else {
+        "<script src=\"/dev/overlay.js\"></script>"
+    };
+    if script.is_empty() {
+    } else if frontend_html.contains("</body>") {
         frontend_html = frontend_html.replace("</body>", &format!("{script}</body>"));
     } else {
         frontend_html.push_str(script);
@@ -348,6 +423,7 @@ pub async fn preview_main(mut args: PreviewCliArgs) -> Result<()> {
                 Some(annot.clone()),
                 shutdown_on_last_client,
                 identity.clone(),
+                html_server.clone(),
             )
             .await,
         )
@@ -364,6 +440,7 @@ pub async fn preview_main(mut args: PreviewCliArgs) -> Result<()> {
             Some(annot),
             shutdown_on_last_client,
             identity.clone(),
+            html_server,
         )
         .await;
     log::info!(

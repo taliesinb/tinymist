@@ -11,6 +11,7 @@ pub use error_overlay::{
 };
 pub use http::{make_http_server, HttpServer};
 
+pub mod html_annotations;
 pub mod icons;
 pub mod open;
 mod annotations;
@@ -86,6 +87,11 @@ pub struct PreviewArgs {
     #[clap(long = "format", default_value = "paged", value_name = "FORMAT")]
     pub format: ExportTarget,
 
+    /// Preview the document as HTML rather than as pages. Shorthand for
+    /// `--format=html`, and the same spelling `talimist-serve` uses.
+    #[clap(long = "html")]
+    pub html: bool,
+
     /// Configure the preview mode.
     #[clap(long = "preview-mode", default_value = "document", value_name = "MODE")]
     pub preview_mode: PreviewMode,
@@ -155,10 +161,16 @@ pub fn resolve_page_title(page_title: Option<&str>, input: Option<&str>) -> Stri
 }
 
 impl PreviewArgs {
+    /// The compilation target the preview runs on, with the `--html`
+    /// shorthand folded in.
+    pub fn export_target(&self) -> ExportTarget {
+        if self.html { ExportTarget::Html } else { self.format }
+    }
+
     /// Get the configuration for the preview.
     pub fn config(&self, config: &PreviewConfig) -> PreviewConfig {
         PreviewConfig {
-            format: self.format,
+            format: self.export_target(),
             enable_partial_rendering: self
                 .enable_partial_rendering
                 .unwrap_or(config.enable_partial_rendering),
@@ -1020,6 +1032,8 @@ impl PreviewState {
                     // The project, supplied by whoever started this server.
                     name: args.root_name.clone(),
                 },
+                // The editor-driven preview is paged; HTML mode is a CLI mode.
+                None,
             )
             .await;
             let addr = srv.addr;

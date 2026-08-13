@@ -57,6 +57,11 @@ struct ServeArgs {
     #[clap(long = "anno")]
     anno: bool,
 
+    /// Serve the document as HTML rather than as pages. The export shims are
+    /// installed with it, so what Typst's HTML export drops is recovered.
+    #[clap(long = "html")]
+    html: bool,
+
     /// The address to bind. Loopback by default: reaching this server from
     /// elsewhere should be a decision, not an accident, because the annotation
     /// routes write to the files under the served path.
@@ -67,6 +72,20 @@ struct ServeArgs {
     /// the role, so a given document always answers on the same URL.
     #[clap(long = "port", value_name = "PORT")]
     port: Option<u16>,
+
+    /// The project root, so imports that reach outside the document's own
+    /// directory resolve. Defaults to the directory the document is in.
+    #[clap(long = "root", value_name = "DIR")]
+    root: Option<PathBuf>,
+
+    /// A `key=value` pair the document can read through `sys.inputs`. Repeat
+    /// for several.
+    #[clap(long = "input", value_name = "KEY=VALUE")]
+    inputs: Vec<String>,
+
+    /// Print the URL this document is served at and exit, without serving it.
+    #[clap(long = "print-url")]
+    print_url: bool,
 
     /// What to call the thing being served, in the web app's name.
     #[clap(long = "root-name", value_name = "NAME")]
@@ -109,6 +128,55 @@ struct ServeArgs {
     /// this server's port. Chrome only.
     #[clap(long = "open-cdp", value_name = "PORT")]
     open_cdp: Option<String>,
+}
+
+/// Whether something is already listening on this address.
+fn is_live(host: &str, port: u16) -> bool {
+    use std::net::{TcpStream, ToSocketAddrs};
+    let timeout = std::time::Duration::from_millis(300);
+    (host, port)
+        .to_socket_addrs()
+        .into_iter()
+        .flatten()
+        .any(|addr| TcpStream::connect_timeout(&addr, timeout).is_ok())
+}
+
+/// Opens a URL as the arguments ask, the same way the preview does.
+fn open_url(url: &str, args: &ServeArgs, port: u16) {
+    use tinymist::tool::preview::open;
+    let identity = tinymist::tool::preview::WebAppIdentity {
+        role: if args.anno {
+            IconRole::Annotate
+        } else {
+            IconRole::Serve
+        },
+        color: args
+            .icon_color
+            .as_deref()
+            .and_then(tinymist::tool::preview::icons::parse_hex),
+        name: args.root_name.clone().or_else(|| {
+            args.path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        }),
+    };
+    open::open(
+        url,
+        &open::OpenOptions {
+            browser: args
+                .open_in
+                .as_deref()
+                .map(open::Browser::parse)
+                .unwrap_or(open::Browser::Default),
+            isolated: args.open_isolated,
+            cdp_port: args
+                .open_cdp
+                .as_deref()
+                .and_then(|spec| open::parse_cdp_port(spec, port)),
+            app_title: identity.short_title(port),
+            key: port,
+        },
+    );
 }
 
 /// The port for a path and role.
@@ -154,6 +222,22 @@ pub fn documents_in(dir: &Path) -> Vec<PathBuf> {
 /// anchor label — ends the title.
 pub fn document_title(path: &Path) -> Option<String> {
     let text = std::fs::read_to_string(path).ok()?;
+    // A document that names itself is naming itself: `#set document(title: ..)`
+    // wins over the first heading, which is often just section one.
+    if let Some(at) = text.find("#set document(") {
+        let rest = &text[at..];
+        if let Some(key) = rest.find("title:") {
+            let after = &rest[key + "title:".len()..];
+            if let Some(open) = after.find('"') {
+                if let Some(close) = after[open + 1..].find('"') {
+                    let title = after[open + 1..open + 1 + close].trim();
+                    if !title.is_empty() {
+                        return Some(title.to_owned());
+                    }
+                }
+            }
+        }
+    }
     for line in text.lines() {
         let Some(rest) = line.strip_prefix("= ") else {
             continue;
@@ -199,6 +283,24 @@ fn main() -> Result<()> {
     };
     let port = args.port.unwrap_or_else(|| derive_port(&canonical, role));
 
+    let path = if args.anno { "/annotate" } else { "/" };
+    let url = format!("http://{}:{port}{path}", args.host);
+    if args.print_url {
+        println!("{url}");
+        return Ok(());
+    }
+    // A document that is already being served is served: the port is derived
+    // from the path for exactly this reason, and a server whose binary has been
+    // replaced has already exited on its own. Asking for it again means "show
+    // it to me", not "bind this port twice".
+    if is_live(&args.host, port) {
+        eprintln!("already serving {url}");
+        if args.open {
+            open_url(&url, &args, port);
+        }
+        return Ok(());
+    }
+
     // A directory serves its index; the rest of directory mode — a listing, and
     // a document per path — comes next.
     let (entry, root) = if canonical.is_dir() {
@@ -226,6 +328,7 @@ fn main() -> Result<()> {
             .unwrap_or_else(|| canonical.clone());
         (canonical.clone(), root)
     };
+    let root = args.root.clone().unwrap_or(root);
 
     let name = args.root_name.clone().or_else(|| {
         document_title(&entry).or_else(|| {
@@ -243,6 +346,9 @@ fn main() -> Result<()> {
         "--invert-colors=smart".into(),
         format!("--root={}", root.display()),
     ];
+    if args.html {
+        argv.push("--format=html".into());
+    }
     if args.anno {
         argv.push("--annotate".into());
     }
@@ -274,6 +380,9 @@ fn main() -> Result<()> {
     }
     if let Some(color) = &args.icon_color {
         argv.push(format!("--icon-color={color}"));
+    }
+    for input in &args.inputs {
+        argv.push(format!("--input={input}"));
     }
     argv.push(entry.display().to_string());
 

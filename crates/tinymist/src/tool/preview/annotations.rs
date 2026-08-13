@@ -267,7 +267,7 @@ impl Scope {
         })
     }
 
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Scope::Point => "point",
             Scope::Word => "word",
@@ -290,7 +290,7 @@ fn anchor_text(uuid: &str, scope: Scope) -> String {
 
 /// Finds every anchor of an annotation in a source: their byte offsets and
 /// scopes, in document order.
-fn find_anchors(text: &str, uuid: &str) -> Vec<(usize, Scope, String)> {
+pub fn find_anchors(text: &str, uuid: &str) -> Vec<(usize, Scope, String)> {
     let prefix = format!("<{uuid}.");
     let mut out = vec![];
     let mut from = 0;
@@ -308,11 +308,35 @@ fn find_anchors(text: &str, uuid: &str) -> Vec<(usize, Scope, String)> {
     out
 }
 
+/// The file being served, which is not always the file being compiled: HTML
+/// mode compiles a generated wrapper that installs export shims and includes
+/// the real document, and every annotation belongs to the document, not to the
+/// wrapper. Set once at startup by whoever arranges that.
+static DOC_FILE: std::sync::RwLock<Option<typst::syntax::FileId>> =
+    std::sync::RwLock::new(None);
+
+/// Declares which file annotations belong to, when it is not the compile's
+/// main file.
+pub fn set_doc_file(id: typst::syntax::FileId) {
+    if let Ok(mut slot) = DOC_FILE.write() {
+        *slot = Some(id);
+    }
+}
+
+/// The file annotations belong to: the served document.
+pub fn doc_file<W: World + ?Sized>(world: &W) -> typst::syntax::FileId {
+    DOC_FILE
+        .read()
+        .ok()
+        .and_then(|slot| *slot)
+        .unwrap_or_else(|| world.main())
+}
+
 /// The sidecar path for the current main file, e.g. `typing.annos.typ`
 /// next to `typing.typ`.
 pub fn sidecar_path(art: &LspCompiledArtifact) -> Option<PathBuf> {
     let world = art.world();
-    let main = world.main();
+    let main = doc_file(world);
     let path = world.path_for_id(main).ok()?.to_err().ok()?;
     let stem = path.file_stem()?.to_string_lossy().into_owned();
     Some(path.with_file_name(format!("{stem}.annos.typ")))
@@ -507,7 +531,7 @@ pub fn commit_sidecar<E>(
     Err("the sidecar kept changing concurrently; giving up".into())
 }
 
-fn read_sidecar(path: &std::path::Path) -> (Vec<AnnotationRecord>, String) {
+pub fn read_sidecar(path: &std::path::Path) -> (Vec<AnnotationRecord>, String) {
     match std::fs::read_to_string(path) {
         Ok(content) => {
             let records = parse_records(&content);
@@ -1643,7 +1667,7 @@ pub fn layout_map(art: &LspCompiledArtifact) -> LayoutMap {
     let TypstDocument::Paged(paged) = &doc else {
         return LayoutMap { blocks: vec![] };
     };
-    let id = world.main();
+    let id = doc_file(world);
     let Ok(source) = world.source(id) else {
         return LayoutMap { blocks: vec![] };
     };
@@ -1744,7 +1768,7 @@ pub fn words_in_range(art: &LspCompiledArtifact, range: std::ops::Range<usize>) 
     let TypstDocument::Paged(paged) = &doc else {
         return vec![];
     };
-    let id = world.main();
+    let id = doc_file(world);
     let Ok(source) = world.source(id) else {
         return vec![];
     };
@@ -2059,7 +2083,7 @@ fn prepare_at(
     encoding: PositionEncoding,
 ) -> Result<AnnotationEdit, String> {
     let world = art.world();
-    let id = world.main();
+    let id = doc_file(world);
     let source = world.source(id).map_err(|e| e.to_string())?;
     let path = world.path_for_id(id).map_err(|e| e.to_string())?;
     let path = path.to_err().map_err(|e| e.to_string())?;
@@ -2126,7 +2150,7 @@ fn prepare_span_range(
     encoding: PositionEncoding,
 ) -> Result<AnnotationEdit, String> {
     let world = art.world();
-    let id = world.main();
+    let id = doc_file(world);
     let source = world.source(id).map_err(|e| e.to_string())?;
     if range.is_empty() {
         return Err("empty span".into());
@@ -2331,6 +2355,8 @@ mod anchor_tests {
         // an offset already inside the text is left alone
         let t = "- Agents watch\n";
         assert_eq!(snapped(t, 9), "- Agents <L>watch\n");
+        // a heading: the "=" run is a marker too, and a label before it turns
+        // the heading into a paragraph that starts with "=".
         // A heading takes its label at the end of the line, where Typst binds
         // it to the heading instead of ending it.
         let t = "= A short document\n";
