@@ -46,7 +46,11 @@ typst-svg.workspace = true
 
 [features]
 
-default = ["pdf", "text"]
+# `no-content-hint` by default: the content hint is a patch this fork's typst
+# does not carry, so `Frame::content_hint` is not a method that exists here and
+# the code that reads it cannot compile. Anyone building against a patched
+# typst can turn it back off with `--no-default-features`.
+default = ["pdf", "text", "no-content-hint"]
 no-content-hint = []
 
 pdf = ["dep:chrono"]

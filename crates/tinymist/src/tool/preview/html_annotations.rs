@@ -28,6 +28,11 @@ use super::annotations::{
 /// offsets into the file being served.
 pub const SRC_ATTR: &str = "data-typst-src";
 
+/// The attribute marking a run that cannot take an annotation inside it: its
+/// value is the offset just past the expression that produced it, which is
+/// where an annotation on the whole thing anchors.
+pub const ATOM_ATTR: &str = "data-typst-atom";
+
 /// The attribute carrying the range of a run of *text*, which is what
 /// annotations actually land on. It sits on the element that holds the run
 /// where there is one, so the document's structure is left as the exporter
@@ -259,18 +264,29 @@ fn label_within(element: &mut HtmlElement, source: &Source, main: FileId, in_mat
         return;
     }
 
+    // An equation is one thing, not a run of words: its parts are operators
+    // and identifiers whose separate positions mean nothing to a reader, and
+    // labelling them only offers to annotate half an arrow. The `<math>`
+    // element keeps its own range, and that is what an annotation on an
+    // equation attaches to.
+    if in_math {
+        for child in element.children.make_mut() {
+            if let HtmlNode::Element(child) = child {
+                label_within(child, source, main, true);
+            }
+        }
+        return;
+    }
+
     // An element holding nothing but one run of text can say where that run
     // came from itself; a wrapper would only be somewhere to hang an attribute
-    // that already has a home. This is not merely tidier: inside MathML the
-    // children of an element are characters, and a `<span>` among them stops
-    // the browser reading it as math.
+    // that already has a home.
     if element.children.len() == 1 {
         if let HtmlNode::Text(_, span) = &element.children[0] {
             if let Some(range) = span_range(*span, source, main) {
-                if let Ok(attr) = typst_html::HtmlAttr::intern(TEXT_ATTR) {
-                    element
-                        .attrs
-                        .push(attr, format!("{}:{}", range.start, range.end));
+                let (name, value) = run_attr(source, &range);
+                if let Ok(attr) = typst_html::HtmlAttr::intern(name) {
+                    element.attrs.push(attr, value);
                 }
             }
             return;
@@ -280,29 +296,78 @@ fn label_within(element: &mut HtmlElement, source: &Source, main: FileId, in_mat
     for child in element.children.make_mut() {
         match child {
             HtmlNode::Element(child) => label_within(child, source, main, in_math),
-            // A run with siblings has nowhere of its own to keep its range, so
-            // it gets a wrapper — except in math, where the structure is the
-            // meaning and the equation is left whole.
-            HtmlNode::Text(text, span) if !in_math => {
+            // A run with siblings has nowhere of its own to keep its range,
+            // so it gets a wrapper.
+            HtmlNode::Text(text, span) => {
                 let Some(range) = span_range(*span, source, main) else {
                     continue;
                 };
+                let (name, value) = run_attr(source, &range);
                 let (Ok(tag), Ok(attr)) = (
                     typst_html::HtmlTag::intern("span"),
-                    typst_html::HtmlAttr::intern(TEXT_ATTR),
+                    typst_html::HtmlAttr::intern(name),
                 ) else {
                     continue;
                 };
                 let inner = HtmlNode::Text(text.clone(), *span);
                 *child = HtmlNode::Element(
                     HtmlElement::new(tag)
-                        .with_attr(attr, format!("{}:{}", range.start, range.end))
+                        .with_attr(attr, value)
                         .with_children(std::iter::once(inner).collect())
                         .spanned(*span),
                 );
             }
             _ => {}
         }
+    }
+}
+
+/// How a run says where it came from: its range, or — where a label cannot go
+/// inside it — the end of the expression that produced it.
+fn run_attr(source: &Source, range: &std::ops::Range<usize>) -> (&'static str, String) {
+    match atom_end(source, range) {
+        Some(end) => (ATOM_ATTR, end.to_string()),
+        None => (TEXT_ATTR, format!("{}:{}", range.start, range.end)),
+    }
+}
+
+/// Where a run of text can take a label beside it, and where it cannot.
+///
+/// Text written as markup can: a label goes next to the word it names. Text
+/// that came out of code cannot — `#src("proof.rs")` renders its argument, and
+/// a label written into that range would land inside the string and break the
+/// call. What can be annotated there is the expression itself, so this returns
+/// the offset just past it, and the run is marked as one thing rather than as
+/// a row of words.
+fn atom_end(source: &Source, range: &std::ops::Range<usize>) -> Option<usize> {
+    use typst::syntax::SyntaxKind;
+    use typst_shim::syntax::LinkedNodeExt;
+
+    // Asked at a boundary, the tree answers with whichever side it likes — the
+    // closing paren of the call before this text as readily as the text — so
+    // the question is asked from inside the run.
+    let text = source.text();
+    let mut at = range.start + (range.end - range.start) / 2;
+    while at > range.start && !text.is_char_boundary(at) {
+        at -= 1;
+    }
+    let root = typst::syntax::LinkedNode::new(source.root());
+    let leaf = root.leaf_at_compat(at)?;
+    if matches!(
+        leaf.kind(),
+        SyntaxKind::Text | SyntaxKind::Space | SyntaxKind::Parbreak | SyntaxKind::SmartQuote
+    ) {
+        return None;
+    }
+    // Out to the expression that markup contains: `#src("proof.rs")` as a
+    // whole, not the string inside it.
+    let mut cursor = leaf;
+    loop {
+        let parent = cursor.parent()?;
+        if parent.kind() == SyntaxKind::Markup {
+            return Some(cursor.range().end);
+        }
+        cursor = parent.clone();
     }
 }
 
@@ -337,15 +402,21 @@ pub fn html_pins(art: &LspCompiledArtifact) -> Vec<HtmlPin> {
 
 fn pin_for(rec: &AnnotationRecord, text: &str) -> Option<HtmlPin> {
     let anchors = find_anchors(text, &rec.uuid);
-    let (start, scope, label) = anchors.first().cloned()?;
-    let end = match scope {
-        Scope::Span => anchors
-            .iter()
-            .rev()
-            .find(|(off, _, l)| *off > start && l.ends_with(".end>"))
-            .map(|(off, _, _)| *off)
-            .unwrap_or(start + label.len()),
-        _ => start,
+    let (at, scope, label) = anchors.first().cloned()?;
+    // A span's text lies *between* its two labels, so it starts past the first
+    // one: the label itself is not part of what was annotated, and a range that
+    // includes it reaches back into whatever came before.
+    let (start, end) = match scope {
+        Scope::Span => (
+            at + label.len(),
+            anchors
+                .iter()
+                .rev()
+                .find(|(off, _, l)| *off > at && l.ends_with(".end>"))
+                .map(|(off, _, _)| *off)
+                .unwrap_or(at + label.len()),
+        ),
+        _ => (at, at),
     };
     Some(HtmlPin {
         rtype: rec.rtype.clone(),

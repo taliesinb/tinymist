@@ -25,6 +25,10 @@ body {
   padding: 0;
   background: var(--tm-bg);
   color: var(--tm-fg);
+  /* No rubber-banding at the edges: the marks are drawn in viewport
+     coordinates and the document slides out from under them, which looks like
+     the annotations coming loose. */
+  overscroll-behavior: none;
 }
 
 body {
@@ -41,17 +45,88 @@ body {
     "TeX Gyre Pagella", Georgia, "Times New Roman", serif;
 }
 
-/* A column of comfortable measure, with room on the left for the marks that
-   hang off the text: strips, chips and letters all live in that margin. */
+/* A column of comfortable measure between two reserved margins: the left one
+   holds the marks that hang off the text — strips, item chips, letters — and
+   the right one is the lane the annotation chips ride. Neither is decoration,
+   so neither is allowed to collapse; the text gives up width instead. */
 .tm-doc {
-  max-width: 46rem;
+  /* Equal, so the text sits in the middle of the window rather than pushed to
+     one side: the left margin has to hold an item's chip and its marker (the
+     widest thing either margin carries), and the right one matches it. */
+  --tm-mark-gutter: 4.5rem;
+  --tm-chip-lane: 4.5rem;
+  box-sizing: border-box;
+  width: 100%;
+  max-width: 54rem;
   margin: 0 auto;
-  padding: 3rem 2rem 6rem 5.5rem;
+  padding: 3rem var(--tm-chip-lane) 6rem var(--tm-mark-gutter);
+}
+
+/* A predictable place for list markers: the annotation for an item is drawn
+   around its marker, and has to know where the marker is. A browser's own
+   bullet is placed by the browser — Safari and Chrome disagree by a few pixels
+   — so bulleted lists get a bullet of the page's own, at a stated distance
+   from the text. Enumerations keep the browser's numbering, which knows about
+   `start` and nesting; their mark is drawn around the whole reserved space,
+   which is measurable whatever is in it. */
+.tm-doc ul,
+.tm-doc ol {
+  padding-left: 1.5em;
+}
+
+.tm-doc ul {
+  list-style: none;
+}
+
+.tm-doc ul > li {
+  position: relative;
+}
+
+.tm-doc ul > li::before {
+  content: "•";
+  position: absolute;
+  right: calc(100% + 0.5em);
+  width: 0.5em;
+  text-align: center;
 }
 
 .tm-doc img,
 .tm-doc svg {
   max-width: 100%;
+}
+
+/* Drawings are laid out the paged way and embedded as SVG, so they arrive in
+   the document's own palette — dark ink on white boxes, chosen for paper. On a
+   dark page that is a hole burnt in it, so they are inverted the way the paged
+   preview inverts a light document: `invert(1) hue-rotate(180deg)` is its own
+   inverse, so hues survive and only the lightness turns over. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .tm-doc svg {
+    filter: invert(1) hue-rotate(180deg);
+  }
+}
+
+/* A framed drawing is an inline SVG sized in `em` against the exporter's idea
+   of the text size, which is not the browser's: it comes out a little narrower
+   than the column it sits in, and flush left, while everything around it is
+   centred. Auto margins put it back in the middle. */
+.tm-doc svg {
+  display: block;
+  max-width: 100%;
+  margin-inline: auto;
+}
+
+/* A figure's caption is centred under it in the paged rendering, and so is
+   whatever it holds — but only what a figure holds *as a picture*: a table, a
+   drawing, an image. Prose is not centred, because a figure is also how a
+   numbered block of text is built (a definition, a theorem), and centring
+   there would rewrap every paragraph in it. */
+.tm-doc figcaption {
+  text-align: center;
+}
+
+.tm-doc figure > :is(table, img, svg) {
+  margin-inline: auto;
 }
 
 .tm-doc table {
@@ -89,19 +164,36 @@ math {
   margin-bottom: 0;
 }
 
+/* An item's own text is a paragraph as far as the exporter is concerned, so a
+   browser puts paragraph spacing between it and the list nested under it —
+   which Typst does not: the nested items belong to the line above them. Two
+   real paragraphs inside one item keep their gap. */
+.tm-doc li > p {
+  margin-block: 0;
+}
+
+.tm-doc li > p + p {
+  margin-top: 0.5em;
+}
+
 /* Nothing in the document may swallow a click meant for annotating: the whole
    UI hit-tests against text, and a link would navigate away. */
+/* Two cursors, and they mean two things: a crosshair over the document says
+   "a click here makes an annotation", a finger over a mark says "a click here
+   opens the one that is already there". Nothing says "type". */
 .tm-annotate .tm-doc,
 .tm-annotate .tm-doc * {
-  cursor: text;
+  cursor: crosshair;
+  /* Dragging means "annotate this span" here, and the browser's own selection
+     highlight fighting the mark underneath it helps nobody. */
+  user-select: none;
+  -webkit-user-select: none;
 }
 
+/* A link is something to annotate, not to follow — but it still has to be
+   hit-testable, or the pointer cannot find it. The click is intercepted in the
+   script instead. */
 .tm-annotate .tm-doc a {
-  pointer-events: none;
-}
-
-.tm-annotate[data-tm-cursor="block"] .tm-doc,
-.tm-annotate[data-tm-cursor="block"] .tm-doc * {
   cursor: pointer;
 }
 
@@ -119,6 +211,73 @@ math {
   position: absolute;
   pointer-events: none;
   border-radius: 1.5px;
+  /* The halo behind a mark is set with the mark, in a dark tint of its own
+     colour: it can land on a filled callout as easily as on the page, and a
+     line the tone of its ground is no line at all. */
+}
+
+/* Transient marks crawl: the dots travel along the mark, slowly and forever,
+   which says "being drawn" in a way that no static pattern does. The period is
+   5px, so one step of 5px returns the pattern to where it started and the loop
+   is seamless. */
+@keyframes tm-crawl-h {
+  to {
+    background-position-x: 5px;
+  }
+}
+
+@keyframes tm-crawl-v {
+  to {
+    background-position-y: 5px;
+  }
+}
+
+/* Clockwise around a box: top rightwards, right downwards, bottom leftwards,
+   left upwards. */
+@keyframes tm-crawl-box {
+  to {
+    background-position: 5px 0, 100% 5px, -5px 100%, 0 -5px;
+  }
+}
+
+#tinymist-marks .tm-crawl-h {
+  animation: tm-crawl-h 0.6s linear infinite;
+}
+
+#tinymist-marks .tm-crawl-v {
+  animation: tm-crawl-v 0.6s linear infinite;
+}
+
+/* The same crawl along a path: a chip's outline, which cannot carry a
+   gradient, travels by its dash offset instead. */
+@keyframes tm-crawl-stroke {
+  to {
+    stroke-dashoffset: -5px;
+  }
+}
+
+#tinymist-marks .tm-crawl-stroke {
+  animation: tm-crawl-stroke 0.6s linear infinite;
+}
+
+#tinymist-marks .tm-crawl-box {
+  border: none;
+  /* No halo while it travels: the dots leave gaps, and a halo shows through
+     them as a solid dark ring — which is exactly what the dots are not. */
+  box-shadow: none;
+  background-repeat: no-repeat;
+  background-size: 100% 2px, 2px 100%, 100% 2px, 2px 100%;
+  background-position: 0 0, 100% 0, 0 100%, 0 0;
+  animation: tm-crawl-box 0.6s linear infinite;
+}
+
+/* A box drawn around something that stands on its own — a block equation —
+   rather than beside it. */
+#tinymist-marks .tm-box {
+  position: absolute;
+  pointer-events: none;
+  box-sizing: border-box;
+  border-radius: 4px;
 }
 
 #tinymist-marks .tm-hit {
@@ -132,6 +291,24 @@ math {
 #tinymist-marks .tm-chip {
   position: absolute;
   line-height: 0;
+  /* Under the frames: a letter's halo keeps it legible over text, and would
+     otherwise take a bite out of the frame it labels. */
+  z-index: 0;
+}
+
+#tinymist-marks .tm-glyph.tm-over {
+  z-index: 2;
+}
+
+/* Underlines over frames: a word's mark is about a few words, a frame is about
+   a whole region, and the smaller thing should not be buried by the larger. */
+#tinymist-marks .tm-mark {
+  z-index: 2;
+}
+
+#tinymist-marks .tm-box {
+  z-index: 1;
+  /* The halo is set per mark, in a dark tint of that mark's own colour. */
 }
 
 #tinymist-marks .tm-chip {
@@ -139,12 +316,24 @@ math {
   cursor: pointer;
 }
 
+/* The gaps between stacked chips are a few pixels wide, and a click that
+   lands in one goes to the document, which reads it as "dismiss" — so a near
+   miss silently closes the window instead of opening the chip. Each chip
+   claims the slack around it. */
+#tinymist-marks .tm-edge::after {
+  content: "";
+  position: absolute;
+  inset: -4px;
+}
+
 #tinymist-marks .tm-edge {
   position: absolute;
-  display: block;
+  display: grid;
+  place-items: center;
+  box-sizing: border-box;
   min-width: 22px;
   height: 20px;
-  padding: 0 4px;
+  padding: 0 3px;
   border: none;
   border-radius: 4px;
   cursor: pointer;
@@ -159,7 +348,7 @@ math {
 #tinymist-annot-box {
   position: fixed;
   left: 12px;
-  bottom: 12px;
+  bottom: 44px;
   width: 280px;
   border-radius: 8px;
   overflow: hidden;
@@ -240,4 +429,35 @@ math {
   border-radius: 3px;
   background: rgba(255, 215, 215, 0.16);
   font: 11px/1.4 system-ui, sans-serif;
+}
+
+/* Reading mode: the marks stay, but nothing under them takes a click, and the
+   document behaves as a page again. */
+.tm-reading #tinymist-marks {
+  pointer-events: none;
+}
+
+/* The switch between the two, kept out of the way in the corner the annotation
+   window opens above. */
+#tinymist-annotate-toggle {
+  position: fixed;
+  left: 12px;
+  bottom: 12px;
+  z-index: 2147483647;
+  padding: 3px 9px;
+  border: 1px solid var(--tm-rule);
+  border-radius: 999px;
+  background: color-mix(in oklab, var(--tm-bg) 82%, var(--tm-fg));
+  color: var(--tm-fg);
+  opacity: 0.55;
+  font: 11px/1.4 system-ui, sans-serif;
+  cursor: pointer;
+}
+
+#tinymist-annotate-toggle:hover {
+  opacity: 1;
+}
+
+#tinymist-annotate-toggle[data-on] {
+  opacity: 0.85;
 }

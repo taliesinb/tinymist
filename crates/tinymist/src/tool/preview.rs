@@ -311,6 +311,14 @@ pub struct PreviewCliArgs {
     /// following or click-to-jump).
     #[clap(long = "annotate")]
     pub annotate: bool,
+
+    /// An extra browser origin to accept, such as `http://typst` when this
+    /// server sits behind `tailscale serve`. Loopback is always accepted; the
+    /// check exists to stop a random web page reaching a loopback server, so
+    /// naming the origins that may reach this one is the whole relaxation.
+    /// Repeat the flag for more than one.
+    #[clap(long = "allowed-origin", value_name = "ORIGIN")]
+    pub allowed_origins: Vec<String>,
 }
 
 impl PreviewCliArgs {
@@ -368,6 +376,32 @@ impl WebAppIdentity {
             icons::IconRole::Annotate => format!("{subject} (Annotator)"),
         }
     }
+}
+
+/// A stamp for the running binary: when it was last written. Two servers with
+/// the same stamp are the same build; a different one means the binary has
+/// been replaced since, and the older server is on its way out.
+/// Reads it now, while the binary on disk is still the one running: asked for
+/// the first time after a rebuild, the answer would be the *new* binary's
+/// stamp, and a server on its way out would claim to be the one taking over.
+pub fn note_build_stamp() {
+    let _ = build_stamp();
+}
+
+pub fn build_stamp() -> String {
+    use std::time::UNIX_EPOCH;
+    static STAMP: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    STAMP
+        .get_or_init(|| {
+            std::env::current_exe()
+                .and_then(std::fs::metadata)
+                .and_then(|meta| meta.modified())
+                .ok()
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .map(|since| since.as_nanos().to_string())
+                .unwrap_or_else(|| "unknown".into())
+        })
+        .clone()
 }
 
 /// The web-app furniture: each mode is a page of its own, with its own name,
@@ -1034,6 +1068,7 @@ impl PreviewState {
                 },
                 // The editor-driven preview is paged; HTML mode is a CLI mode.
                 None,
+                args.allowed_origins.clone(),
             )
             .await;
             let addr = srv.addr;
@@ -1229,10 +1264,10 @@ impl AnnotationServer for LspAnnotationServer {
         self.apply_doc(&edit)
     }
 
-    fn reply(&self, uuid: &str, text: &str) -> Result<(), String> {
+    fn reply(&self, uuid: &str, text: &str, author: Option<&str>) -> Result<(), String> {
         let art = self.art()?;
         annotations::commit_sidecar(&art, || {
-            let (path, content) = annotations::prepare_reply(&art, uuid, text)?;
+            let (path, content) = annotations::prepare_reply(&art, uuid, text, author)?;
             Ok((path, content, ()))
         })?;
         self.push_pins();
@@ -1364,10 +1399,10 @@ impl AnnotationServer for DiskAnnotationServer {
         Ok(())
     }
 
-    fn reply(&self, uuid: &str, text: &str) -> Result<(), String> {
+    fn reply(&self, uuid: &str, text: &str, author: Option<&str>) -> Result<(), String> {
         let art = self.art()?;
         annotations::commit_sidecar(&art, || {
-            let (path, content) = annotations::prepare_reply(&art, uuid, text)?;
+            let (path, content) = annotations::prepare_reply(&art, uuid, text, author)?;
             Ok((path, content, ()))
         })?;
         self.push_pins();

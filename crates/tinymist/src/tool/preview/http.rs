@@ -32,6 +32,7 @@ pub async fn make_http_server(
     shutdown_on_last_client: bool,
     identity: super::WebAppIdentity,
     html: Option<std::sync::Arc<dyn super::html_annotations::HtmlAnnotationServer>>,
+    allowed_origins: Vec<String>,
 ) -> HttpServer {
     use futures::StreamExt;
     use http_body_util::{Full, StreamBody};
@@ -43,10 +44,17 @@ pub async fn make_http_server(
     /// count is the honest measure of "is anyone there": a browser keeps idle
     /// TCP connections pooled long after the tab that opened them is gone, but
     /// it tears down the event stream immediately.
-    struct ClientGuard(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+    struct ClientGuard(std::sync::Arc<std::sync::atomic::AtomicUsize>, usize);
     impl Drop for ClientGuard {
         fn drop(&mut self) {
-            self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            let left = self
+                .0
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst)
+                .saturating_sub(1);
+            tinymist_project::announce(
+                "client_disconnected",
+                &[("id", self.1.into()), ("connected", left.into())],
+            );
         }
     }
 
@@ -67,11 +75,17 @@ pub async fn make_http_server(
     let live = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let served_anyone = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let identity = std::sync::Arc::new(identity);
+    let allowed_origins = std::sync::Arc::new(allowed_origins);
+    // Clients are numbered from zero as they arrive, so the line that says one
+    // has gone can name which one it was.
+    let next_client = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let make_service = {
         let live = live.clone();
         let served_anyone = served_anyone.clone();
         let identity = identity.clone();
-        move || {
+        let allowed_origins = allowed_origins.clone();
+        let next_client = next_client.clone();
+        move |peer: std::net::SocketAddr| {
         let frontend_html = frontend_html.clone();
         let websocket_tx = websocket_tx.clone();
         let static_file_addr = static_file_addr.clone();
@@ -81,14 +95,18 @@ pub async fn make_http_server(
         let live = live.clone();
         let served_anyone = served_anyone.clone();
         let identity = identity.clone();
+        let allowed_origins = allowed_origins.clone();
+        let next_client = next_client.clone();
         service_fn(move |mut req: hyper::Request<Incoming>| {
             let identity = identity.clone();
+            let allowed_origins = allowed_origins.clone();
             let frontend_html = frontend_html.clone();
             let websocket_tx = websocket_tx.clone();
             let static_file_addr = static_file_addr.clone();
             let diag_rx = diag_rx.clone();
             let annot = annot.clone();
             let html = html.clone();
+            let next_client = next_client.clone();
             let live = live.clone();
             let served_anyone = served_anyone.clone();
             async move {
@@ -107,9 +125,9 @@ pub async fn make_http_server(
                 // http / websocket server towards a legitimate frontend/html client.
                 // This requires additional protection that may be added in the future.
                 let origin_header = req.headers().get("Origin");
-                if origin_header
-                    .is_some_and(|h| !is_valid_origin(h, &static_file_addr, addr.port()))
-                {
+                if origin_header.is_some_and(|h| {
+                    !is_valid_origin(h, &static_file_addr, addr.port(), &allowed_origins)
+                }) {
                     anyhow::bail!(
                         "Connection with unexpected `Origin` header. Closing connection."
                     );
@@ -177,9 +195,42 @@ pub async fn make_http_server(
                     let rx = diag_rx.unwrap();
                     let init = rx.borrow().clone();
                     use std::sync::atomic::Ordering::SeqCst;
-                    live.fetch_add(1, SeqCst);
+                    let now = live.fetch_add(1, SeqCst) + 1;
                     served_anyone.store(true, SeqCst);
-                    let guard = ClientGuard(live.clone());
+                    let id = next_client.fetch_add(1, SeqCst);
+                    let guard = ClientGuard(live.clone(), id);
+                    if tinymist_project::announcing() {
+                        // Who, from the same header the annotations take their
+                        // author from: behind `tailscale serve` that is the
+                        // tailnet login, and on loopback it is whoever is
+                        // running the server.
+                        let headers = req.headers();
+                        let name =
+                            super::annotations::author_or_local(request_author(headers).as_deref());
+                        let agent = headers
+                            .get(hyper::header::USER_AGENT)
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or("")
+                            .to_owned();
+                        // The address the request came from: a proxy's own, if
+                        // one forwarded it, else the connection's far end.
+                        let ip = headers
+                            .get("X-Forwarded-For")
+                            .and_then(|value| value.to_str().ok())
+                            .and_then(|value| value.split(',').next())
+                            .map(|value| value.trim().to_owned())
+                            .unwrap_or_else(|| peer.ip().to_string());
+                        tinymist_project::announce(
+                            "client_connected",
+                            &[
+                                ("id", id.into()),
+                                ("name", name.into()),
+                                ("useragent", agent.into()),
+                                ("ip", ip.into()),
+                                ("connected", now.into()),
+                            ],
+                        );
+                    }
                     // A comment line every few seconds. Nothing reads it: it
                     // exists so writing to a browser that has gone away fails,
                     // which is the only way this connection learns it is dead
@@ -217,6 +268,17 @@ pub async fn make_http_server(
                         .header(hyper::header::CONTENT_TYPE, "application/javascript")
                         .header(hyper::header::CACHE_CONTROL, "no-cache")
                         .body(Body::new(Full::<Bytes>::from(super::overlay_js())))
+                        .unwrap();
+                    Ok(res)
+                } else if req.uri().path() == "/dev/build" {
+                    // Which build is answering. A server whose binary has been
+                    // replaced is on its way out but still holds its socket for
+                    // a moment; whoever is starting up needs to know that the
+                    // address it just probed is not the one it would reuse.
+                    let res = hyper::Response::builder()
+                        .header(hyper::header::CONTENT_TYPE, "text/plain")
+                        .header(hyper::header::CACHE_CONTROL, "no-store")
+                        .body(Body::new(Full::<Bytes>::from(super::build_stamp())))
                         .unwrap();
                     Ok(res)
                 } else if req.uri().path() == "/dev/clientlog" {
@@ -314,6 +376,10 @@ pub async fn make_http_server(
                     }
                     let path = req.uri().path().to_owned();
                     let annot = annot.unwrap();
+                    // Resolved before the body is consumed, and imposed on the
+                    // request afterwards: whatever the client claimed about
+                    // authorship is not consulted.
+                    let author = request_author(req.headers());
                     let body = req.into_body().collect().await?.to_bytes();
                     let parse_uuid = || {
                         serde_json::from_slice::<UuidReq>(&body).map_err(|e| e.to_string())
@@ -321,11 +387,16 @@ pub async fn make_http_server(
                     let outcome = match path.as_str() {
                         "/dev/annotate" => serde_json::from_slice::<super::AnnotateRequest>(&body)
                             .map_err(|e| e.to_string())
-                            .and_then(|req| annot.annotate(req)),
+                            .and_then(|mut req| {
+                                req.author = author.clone();
+                                annot.annotate(req)
+                            }),
                         "/dev/annotate/delete" => parse_uuid()
                             .and_then(|req| annot.remove(&req.uuid).map(|()| String::new())),
                         "/dev/annotate/reply" => parse_uuid().and_then(|req| {
-                            annot.reply(&req.uuid, &req.text).map(|()| String::new())
+                            annot
+                                .reply(&req.uuid, &req.text, author.as_deref())
+                                .map(|()| String::new())
                         }),
                         "/dev/annotate/status" => parse_uuid().and_then(|req| {
                             annot
@@ -508,7 +579,7 @@ pub async fn make_http_server(
     }
 
     let serve_conn = move |server: &Server, graceful: &GracefulShutdown, conn| {
-        let (stream, _peer_addr) = match conn {
+        let (stream, peer_addr) = match conn {
             Ok(conn) => conn,
             Err(e) => {
                 log::error!("accept error: {e}");
@@ -516,10 +587,13 @@ pub async fn make_http_server(
             }
         };
 
-        let conn = server.serve_connection_with_upgrades(TokioIo::new(stream), make_service());
+        let conn =
+            server.serve_connection_with_upgrades(TokioIo::new(stream), make_service(peer_addr));
         let conn = graceful.watch(conn.into_owned());
         tokio::spawn(async move {
-            conn.await.log_error("cannot serve http");
+            if let Err(err) = conn.await {
+                log_connection_error(err.as_ref());
+            }
         });
     };
 
@@ -562,7 +636,79 @@ pub async fn make_http_server(
     }
 }
 
-fn is_valid_origin(h: &HeaderValue, static_file_addr: &str, expected_port: u16) -> bool {
+/// Logs how a connection ended, at a level that says whose fault it was.
+///
+/// A client may hang up mid-response, speak TLS to a plaintext port, or send a
+/// header this server cannot parse. None of those is this server failing, and
+/// reporting them all at `ERROR` buries the ones that are — a refused `Origin`
+/// hid among exactly this noise once already.
+fn log_connection_error(err: &(dyn std::error::Error + 'static)) {
+    let mut cause = Some(err);
+    while let Some(err) = cause {
+        if let Some(err) = err.downcast_ref::<hyper::Error>() {
+            // The client's side of the conversation ended badly. Nothing here
+            // is actionable, but it is worth having under `-v`.
+            if err.is_incomplete_message()
+                || err.is_parse()
+                || err.is_canceled()
+                || err.is_closed()
+                || err.is_body_write_aborted()
+            {
+                log::debug!(
+                    target: crate::PREVIEW_COMPAT_LOG_TARGET,
+                    "connection ended early: {err}"
+                );
+                return;
+            }
+            break;
+        }
+        cause = err.source();
+    }
+    log::error!("cannot serve http: {err}");
+}
+
+/// The identity a request carries, when it has one.
+///
+/// `tailscale serve` authenticates the caller against the tailnet and injects
+/// the result, so a document served that way knows who is writing without
+/// asking anyone to log in. A direct loopback request has no such header, and
+/// the caller is whoever is running the server — see `author_or_local`.
+///
+/// Read from the headers and never from the body: the point of the header is
+/// that a proxy the client cannot forge sets it.
+fn request_author(headers: &hyper::HeaderMap) -> Option<String> {
+    headers
+        .get("Tailscale-User-Login")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|login| !login.is_empty())
+        .map(str::to_owned)
+}
+
+/// Whether a configured origin is the one the browser sent.
+///
+/// Configured values are normalised through `Url::origin`, so `http://typst`,
+/// `http://typst/`, and `http://typst:80` name one origin — which is what a
+/// person writing the flag means by them, and what the browser means too.
+fn origin_allows(configured: &str, origin_header: &HeaderValue) -> bool {
+    let Ok(sent) = origin_header.to_str() else {
+        return false;
+    };
+    if configured == sent {
+        return true;
+    }
+    match (Url::parse(configured), Url::parse(sent)) {
+        (Ok(configured), Ok(sent)) => configured.origin() == sent.origin(),
+        _ => false,
+    }
+}
+
+fn is_valid_origin(
+    h: &HeaderValue,
+    static_file_addr: &str,
+    expected_port: u16,
+    allowed: &[String],
+) -> bool {
     static GITPOD_ID_AND_HOST: LazyLock<Option<(String, String)>> = LazyLock::new(|| {
         let workspace_id = std::env::var("GITPOD_WORKSPACE_ID").ok();
         let cluster_host = std::env::var("GITPOD_WORKSPACE_CLUSTER_HOST").ok();
@@ -577,6 +723,7 @@ fn is_valid_origin(h: &HeaderValue, static_file_addr: &str, expected_port: u16) 
         expected_port,
         &GITPOD_ID_AND_HOST,
         &VSCODE_PROXY_URI,
+        allowed,
     )
 }
 
@@ -588,6 +735,7 @@ fn is_valid_origin_impl(
     expected_port: u16,
     gitpod_id_and_host: &Option<(String, String)>,
     vscode_proxy_url: &Option<String>,
+    allowed: &[String],
 ) -> bool {
     let Ok(Ok(origin_url)) = origin_header.to_str().map(Url::parse) else {
         return false;
@@ -644,6 +792,10 @@ fn is_valid_origin_impl(
         // We can detect this by looking at the env variables (see `GITPOD_ID_AND_HOST` in `is_valid_origin(..)`)
         || gitpod_expected_origin.is_some_and(|o| o == *origin_header)
         || vscode_expected_origin.is_some_and(|o| o == *origin_header)
+        // Origins named explicitly on the command line, for the case this
+        // whole check did not anticipate: a server deliberately reachable at
+        // some other name, e.g. behind `tailscale serve`.
+        || allowed.iter().any(|a| origin_allows(a, origin_header))
 }
 
 #[cfg(test)]
@@ -651,7 +803,75 @@ mod tests {
     use super::*;
 
     fn check_origin(origin: &'static str, static_file_addr: &str, port: u16) -> bool {
-        is_valid_origin(&HeaderValue::from_static(origin), static_file_addr, port)
+        is_valid_origin(&HeaderValue::from_static(origin), static_file_addr, port, &[])
+    }
+
+    fn check_origin_allowed(
+        origin: &'static str,
+        static_file_addr: &str,
+        port: u16,
+        allowed: &[&str],
+    ) -> bool {
+        let allowed: Vec<String> = allowed.iter().map(|a| (*a).to_owned()).collect();
+        is_valid_origin(
+            &HeaderValue::from_static(origin),
+            static_file_addr,
+            port,
+            &allowed,
+        )
+    }
+
+    #[test]
+    fn test_allowed_origin_flag() {
+        // The name a tailnet reaches this server by is not loopback and has no
+        // port, so nothing but the flag can admit it.
+        assert!(!check_origin("http://typst", "127.0.0.1:42", 42));
+        assert!(check_origin_allowed(
+            "http://typst",
+            "127.0.0.1:42",
+            42,
+            &["http://typst"]
+        ));
+        // Written with a trailing slash, or with the port the scheme implies:
+        // one origin either way.
+        assert!(check_origin_allowed(
+            "http://typst",
+            "127.0.0.1:42",
+            42,
+            &["http://typst/"]
+        ));
+        assert!(check_origin_allowed(
+            "http://typst",
+            "127.0.0.1:42",
+            42,
+            &["http://typst:80"]
+        ));
+        // Several origins, and only the ones named.
+        assert!(check_origin_allowed(
+            "http://tbwork",
+            "127.0.0.1:42",
+            42,
+            &["http://typst", "http://tbwork"]
+        ));
+        assert!(!check_origin_allowed(
+            "http://elsewhere",
+            "127.0.0.1:42",
+            42,
+            &["http://typst", "http://tbwork"]
+        ));
+        // A different scheme or host is a different origin, not a near miss.
+        assert!(!check_origin_allowed(
+            "https://typst",
+            "127.0.0.1:42",
+            42,
+            &["http://typst"]
+        ));
+        assert!(!check_origin_allowed(
+            "http://typst.evil.com",
+            "127.0.0.1:42",
+            42,
+            &["http://typst"]
+        ));
     }
 
     #[test]
@@ -760,6 +980,7 @@ mod tests {
                 port,
                 &Some((workspace.to_owned(), cluster_host.to_owned())),
                 &None,
+                &[],
             )
         }
 
@@ -804,6 +1025,7 @@ mod tests {
                 port,
                 &None,
                 &Some(proxy_url.to_owned()),
+                &[],
             )
         }
 

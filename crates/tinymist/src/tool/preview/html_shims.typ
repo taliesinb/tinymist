@@ -158,7 +158,108 @@
 // relative to the parent element — and this is what it is a ratio of.
 #let _base-size = state("talimist-base-size", 11pt)
 
+// Drawings — cetz canvases, fletcher diagrams, anything that puts shapes on a
+// coordinate grid — are laid out rather than written, and HTML export drops
+// every piece of them: a diagram becomes an empty box. `html.frame` lays
+// content out the paged way and embeds the result as inline SVG, which is
+// exactly what a drawing wants, so a block that contains shapes is framed
+// whole rather than translated.
+#let _shapes = (curve, polygon, circle, ellipse, rect, square, move, place)
+
+#let _sole-child(it) = {
+  let fields = it.fields()
+  if "body" in fields and type(fields.body) == content { return fields.body }
+  if "children" in fields and type(fields.children) == array and fields.children.len() == 1 {
+    return fields.children.first()
+  }
+  none
+}
+
+// What "100%" means once a drawing is framed. A frame is laid out with no page
+// to be a fraction of, so a container asking for 70% of the width would get 70%
+// of nothing; this is the width it is measured against instead, and it matches
+// the text column the stylesheet sets.
+#let _column = 34em
+
+// Inside a frame the content is laid out the paged way, and `html.elem` is not
+// something that can be made there — an element handed to the paged exporter is
+// dropped, taking whatever it wrapped with it, which is how a drawing becomes
+// an empty box. The target does not say so (`target()` still reports "html",
+// since that is what is being exported *to*), so the frame says it itself, with
+// a set rule rather than with state: styles reach into the frame's layout,
+// while introspection does not — a state update written beside the framed
+// content is not visible from inside it. `zxx` is the language code for "no
+// linguistic content", which is what a drawing is.
+#let _drawing-lang = "zxx"
+
+/// Lays a drawing out the paged way, in a region wide enough to hold it, and
+/// centred there: a picture in flowing text sits in the middle of its column,
+/// which is what the paged rendering does with one.
+#let _frame-drawing(it) = html.frame(
+  block(width: _column, {
+    set text(lang: _drawing-lang)
+    align(center, it)
+  }),
+)
+
+/// Whether an `html.elem` can be made here at all.
+#let _html-here() = target() == "html" and text.lang != _drawing-lang
+
+// `sole` says whether everything seen so far has been the only thing in its
+// container. A cetz canvas or a fletcher diagram is a `context` and nothing
+// else — that is the only way to recognise one, since `context` is not an
+// element function that can be named — but a `context` in the middle of a
+// paragraph is a counter reading a number, and a callout that numbers itself
+// is prose, not a picture. Framing prose turns it into an image: unselectable,
+// unannotatable, and re-wrapped to a width that is not the column's.
+#let _draws(it, depth, sole: true) = {
+  if depth <= 0 or type(it) != content { return false }
+  if it.func() in _shapes { return true }
+  if sole and repr(it.func()) == "context" { return true }
+  let only = _sole-child(it)
+  if only != none { return _draws(only, depth - 1, sole: sole) }
+  // Across children, not only down a spine: a picture made by hand is a stack
+  // of shapes or a heap of `place`d pieces, and either way there are several —
+  // so none of them is the only thing in its container.
+  let fields = it.fields()
+  if "children" in fields and type(fields.children) == array {
+    for child in fields.children.slice(0, calc.min(fields.children.len(), 32)) {
+      if _draws(child, depth - 1, sole: false) { return true }
+    }
+  }
+  false
+}
+
+// Whether a drawing has already been through one of these rules. Realization
+// runs inwards-out, so by the time an outer block is asked about, the box
+// inside it may already be a frame — and a frame put inside another frame is an
+// element in a paged layout again, dropped along with everything it holds. The
+// inner rule saw the drawing more closely, so the outer one stands down.
+#let _made-html(it, depth) = {
+  if depth <= 0 or type(it) != content { return false }
+  // Neither is an element function that can be named, only recognised.
+  if repr(it.func()) in ("frame", "elem") { return true }
+  let fields = it.fields()
+  for key in ("body", "child") {
+    if key in fields and _made-html(fields.at(key), depth - 1) { return true }
+  }
+  if "children" in fields and type(fields.children) == array {
+    for child in fields.children.slice(0, calc.min(fields.children.len(), 32)) {
+      if _made-html(child, depth - 1) { return true }
+    }
+  }
+  false
+}
+
+/// Whether this content is a drawing that still wants a frame around it.
+#let _wants-frame(it, depth) = _draws(it, depth) and not _made-html(it, depth)
+
 // -- the rules ---------------------------------------------------------------
+//
+// Every rule below asks the target first. Inside `html.frame` — where drawings
+// are laid out the paged way — `html.elem` is not a thing that can be made,
+// and a rule that reaches for one there loses the content it was given. The
+// answer is only knowable in context, which is why each rule is one.
 
 // `align` is dropped whole, title blocks and all. Its horizontal component is
 // the part CSS can honour; the vertical one has no meaning in flow layout.
@@ -170,6 +271,23 @@
 }
 
 #show align: it => context {
+  if not _html-here() { return it }
+  // The frame goes around the drawing, not around the container: a container
+  // is often `width: 100%`, and a frame has no width for that to be a
+  // percentage of. The div keeps the alignment; the frame keeps the drawing.
+  if _wants-frame(it, 5) {
+    // A framed drawing is a block-level element, which `text-align` cannot
+    // move; a flex row can.
+    let side = _text-align(it.alignment)
+    let justify = if side == "center" {
+      "center"
+    } else if side == "right" { "flex-end" } else { "flex-start" }
+    return html.elem(
+      "div",
+      attrs: (style: "display: flex; justify-content: " + justify),
+      html.frame(it.body),
+    )
+  }
   // A centred title is sized against the text around the block it sits in,
   // not against the last paragraph before it.
   _base-size.update(text.size)
@@ -240,7 +358,14 @@
   // A block is a place where the surrounding text size is settled, so it is
   // also a place to record it: a title inside one is sized against the block,
   // not against whatever paragraph came before.
+  if not _html-here() { return it }
   _base-size.update(text.size)
+  // A drawing inside an `align` is left to the align rule: it knows which way
+  // to put the drawing, and a frame made here would take that decision away
+  // and leave it flush left.
+  let child = _sole-child(it)
+  let aligned = child != none and child.func() == align
+  if not aligned and _wants-frame(it, 6) { return _frame-drawing(it) }
   let style = _container-style(it)
   // Left alone, a block still becomes a `<div>`; only its appearance is lost,
   // and only that is worth a wrapper.
@@ -263,7 +388,9 @@
   out
 }
 
-#show box: it => {
+#show box: it => context {
+  if not _html-here() { return it }
+  if _wants-frame(it, 5) { return _frame-drawing(it) }
   // Inline, deliberately: `inline-block` would make the chip's own padding
   // grow the line box, and the paragraph would open up around every fragment
   // of code in it.
@@ -341,6 +468,7 @@
 )
 
 #show text: it => context {
+  if not _html-here() { return it }
   let style = _text-style()
   if style == "" { it } else { html.elem("span", attrs: (style: style), it) }
 }
@@ -358,7 +486,8 @@
 }
 
 // Vertical space is dropped; a div of that height says the same thing.
-#show v: it => {
+#show v: it => context {
+  if not _html-here() { return it }
   let amount = _len(it.amount)
   if amount == none { none } else {
     html.elem("div", attrs: (style: "height: " + amount), [])
@@ -369,33 +498,33 @@
 // rules above fall back to `currentColor` rather than dropping the border.
 
 // A rule across the page.
-#show line: it => html.elem(
-  "hr",
-  attrs: (style: _style(_prop("border-top", _one-stroke(it.stroke)))),
-  [],
-)
+#show line: it => context {
+  if not _html-here() { return it }
+  html.elem("hr", attrs: (style: _style(_prop("border-top", _one-stroke(it.stroke)))), [])
+}
 
 // `pad`, `place` and `stack` lose their children. Padding becomes CSS;
 // placement cannot be honoured in flow, so the content is kept in place;
 // a horizontal stack becomes a flex row, a vertical one plain flow.
-#show pad: it => _wrap(
-  "div",
-  _style(
-    _prop("padding-left", _len(it.left))
-      + _prop("padding-right", _len(it.right))
-      + _prop("padding-top", _len(it.top))
-      + _prop("padding-bottom", _len(it.bottom)),
-  ),
-  it.body,
-)
+#show pad: it => context if not _html-here() { it } else {
+  _wrap(
+    "div",
+    _style(
+      _prop("padding-left", _len(it.left))
+        + _prop("padding-right", _len(it.right))
+        + _prop("padding-top", _len(it.top))
+        + _prop("padding-bottom", _len(it.bottom)),
+    ),
+    it.body,
+  )
+}
 
-#show place: it => _wrap(
-  "div",
-  _style(_prop("text-align", _text-align(it.alignment))),
-  it.body,
-)
+#show place: it => context if not _html-here() { it } else {
+  _wrap("div", _style(_prop("text-align", _text-align(it.alignment))), it.body)
+}
 
-#show stack: it => {
+#show stack: it => context {
+  if not _html-here() { return it }
   let sideways = it.dir == ltr or it.dir == rtl
   let gap = _len(it.spacing)
   _wrap(
@@ -413,7 +542,8 @@
 // the exporter exactly as `grid` is.
 #let _cell-body(cell) = if "body" in cell.fields() { cell.body } else { cell }
 
-#show grid: it => {
+#show grid: it => context {
+  if not _html-here() { return it }
   let cells = it.children.filter(c => c.func() == grid.cell)
   let columns = if type(it.columns) == array { it.columns.len() } else { 1 }
   let columns = calc.max(columns, 1)

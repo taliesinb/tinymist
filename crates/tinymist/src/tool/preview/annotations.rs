@@ -175,6 +175,11 @@ pub struct AnnotateRequest {
     /// The y coordinate of the drag end, in pt.
     #[serde(default)]
     pub y2: Option<f64>,
+    /// Who to record as the author. Resolved by the server from the request
+    /// itself, never deserialized from the body: a client that could name its
+    /// own author could sign a colleague's name to a comment.
+    #[serde(skip)]
+    pub author: Option<String>,
 }
 
 /// The edits needed to create or delete an annotation. When the target file
@@ -214,8 +219,9 @@ pub trait AnnotationServer: Send + Sync {
     fn annotate(&self, req: AnnotateRequest) -> Result<String, String>;
     /// Deletes an annotation by uuid.
     fn remove(&self, uuid: &str) -> Result<(), String>;
-    /// Appends a reply to an annotation's discussion.
-    fn reply(&self, uuid: &str, text: &str) -> Result<(), String>;
+    /// Appends a reply to an annotation's discussion. `author` is the identity
+    /// the server resolved for the request, if it found one.
+    fn reply(&self, uuid: &str, text: &str, author: Option<&str>) -> Result<(), String>;
     /// Sets an annotation's status.
     fn set_status(&self, uuid: &str, status: &str) -> Result<(), String>;
     /// Resolves a click to the exact would-be anchor position.
@@ -251,6 +257,24 @@ pub enum Scope {
     Item,
     /// The paragraph containing the anchor; marked in the gutter.
     Para,
+    /// An inline equation, annotated whole: `$x + y$`. Typst calls these
+    /// inline equations, as against block ones.
+    Math,
+    /// A block equation — `$ x + y $` on its own — which is a region of the
+    /// document rather than a phrase in one, and is marked like a block.
+    DisplayMath,
+    /// A link, annotated whole: its text is one destination, not a run of
+    /// words that happen to be underlined.
+    Link,
+    /// A fragment of raw text — `` `code` `` — annotated whole, for the same
+    /// reason: it is one name, not a phrase.
+    Raw,
+    /// Anything else inline that a label cannot go inside: text a call
+    /// produced from its arguments, where the annotation is about the call.
+    Inline,
+    /// A drawing — a cetz canvas, a fletcher diagram — which reaches HTML as
+    /// one picture and is annotated as one.
+    Svg,
 }
 
 impl Scope {
@@ -263,6 +287,12 @@ impl Scope {
             "block" => Scope::Block,
             "item" => Scope::Item,
             "para" => Scope::Para,
+            "math" => Scope::Math,
+            "math.block" => Scope::DisplayMath,
+            "link" => Scope::Link,
+            "raw" => Scope::Raw,
+            "inline" => Scope::Inline,
+            "svg" => Scope::Svg,
             _ => return None,
         })
     }
@@ -276,6 +306,12 @@ impl Scope {
             Scope::Block => "block",
             Scope::Item => "item",
             Scope::Para => "para",
+            Scope::Math => "math",
+            Scope::DisplayMath => "math.block",
+            Scope::Link => "link",
+            Scope::Raw => "raw",
+            Scope::Inline => "inline",
+            Scope::Svg => "svg",
         }
     }
 }
@@ -459,13 +495,51 @@ pub fn parse_records(content: &str) -> Vec<AnnotationRecord> {
 /// to keep that uuid after the entry's closing `))`.
 fn entry_span(content: &str, uuid: &str) -> Option<std::ops::Range<usize>> {
     let note = format!("<note-{uuid}>");
-    let note_at = content.find(&note)?;
-    let start = content[..note_at].rfind("#metadata((")?;
+    let note_at = find_in_code(content, &note, 0)?;
+    let start = rfind_in_code(content, "#metadata((", note_at)?;
     let mut end = note_at + note.len();
     if content[end..].starts_with('\n') {
         end += 1;
     }
     Some(start..end)
+}
+
+/// Whether an offset is inside a line comment. The prelude at the top of every
+/// sidecar shows what an entry looks like — a whole `#metadata` block, uuid and
+/// all — and an entry that happened to be named after the one in the example
+/// would otherwise be "found" there, and the explanation rewritten in its
+/// place. Only line comments matter: the prelude is written in them, and a
+/// sidecar is a list of entries rather than a program with block comments in
+/// it.
+fn commented(content: &str, at: usize) -> bool {
+    let line_start = content[..at].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    content[line_start..at].contains("//")
+}
+
+/// The first occurrence of `needle` at or after `from` that is not commented
+/// out.
+fn find_in_code(content: &str, needle: &str, from: usize) -> Option<usize> {
+    let mut at = from;
+    while let Some(rel) = content[at..].find(needle) {
+        let hit = at + rel;
+        if !commented(content, hit) {
+            return Some(hit);
+        }
+        at = hit + needle.len();
+    }
+    None
+}
+
+/// The last occurrence of `needle` before `before` that is not commented out.
+fn rfind_in_code(content: &str, needle: &str, before: usize) -> Option<usize> {
+    let mut end = before;
+    while let Some(hit) = content[..end].rfind(needle) {
+        if !commented(content, hit) {
+            return Some(hit);
+        }
+        end = hit;
+    }
+    None
 }
 
 /// Formats one annotation record as a sidecar entry, using the editable
@@ -576,6 +650,16 @@ pub fn annotation_pins(art: &LspCompiledArtifact) -> Vec<AnnotationPin> {
             let range = match scope {
                 Scope::Point => None,
                 Scope::Word => Some(word_range(text, at)),
+                // Anchored after the thing they name: the equation or the
+                // link that ends where the label was written.
+                Scope::Math
+                | Scope::DisplayMath
+                | Scope::Link
+                | Scope::Raw
+                | Scope::Inline
+                | Scope::Svg => {
+                    Some(anchored_node_range(&source, at))
+                }
                 Scope::Sentence => Some(sentence_range(text, at)),
                 Scope::Para => Some(paragraph_range(text, at)),
                 Scope::Span => {
@@ -631,7 +715,10 @@ pub fn annotation_pins(art: &LspCompiledArtifact) -> Vec<AnnotationPin> {
             };
             let mut rects = range
                 .as_ref()
-                .map(|range| range_rects(paged, file, &source, range, scope == Scope::Block))
+                .map(|range| {
+                    let region = matches!(scope, Scope::Block | Scope::DisplayMath);
+                    range_rects(paged, file, &source, range, region)
+                })
                 .unwrap_or_default();
 
             // The marker's own position: the anchor point for scopes that
@@ -645,7 +732,7 @@ pub fn annotation_pins(art: &LspCompiledArtifact) -> Vec<AnnotationPin> {
                         // An item is marked beside its bullet, which is not
                         // part of its boxes.
                         Scope::Item => (first.page, gutter_x, (first.y0 + first.y1) / 2.0),
-                        Scope::Block | Scope::Para => {
+                        Scope::Block | Scope::Para | Scope::DisplayMath => {
                             (first.page, first.x0, (first.y0 + last.y1) / 2.0)
                         }
                         _ => (last.page, (last.x0 + last.x1) / 2.0, last.y1),
@@ -825,38 +912,27 @@ fn anchor_in_frame(
     None
 }
 
-/// The current time as an ISO 8601 UTC string, e.g. "2026-08-11T01:12:40Z".
-pub fn iso_now() -> String {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let days = (secs / 86400) as i64;
-    let rem = secs % 86400;
-    // Civil-from-days (Howard Hinnant's algorithm).
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let year = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = if month <= 2 { year + 1 } else { year };
-    format!(
-        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
-        rem / 3600,
-        (rem % 3600) / 60,
-        rem % 60
-    )
-}
+pub use tinymist_project::iso_now;
 
 /// The author name recorded for annotations created via the preview.
 pub fn local_author() -> String {
     std::env::var("USER")
         .or_else(|_| std::env::var("USERNAME"))
         .unwrap_or_else(|_| "user".into())
+}
+
+/// The author to record for one write.
+///
+/// A server reached over a network resolves this per request, from an identity
+/// the request carries. Falling back to the local user is right rather than
+/// merely convenient: a loopback visitor has no other identity, and is the
+/// person running the server.
+pub fn author_or_local(author: Option<&str>) -> String {
+    author
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(local_author)
 }
 
 /// Computes the new on-disk content carrying the edit, and whether the edit
@@ -1999,6 +2075,31 @@ pub fn prepare_annotate(
     prepare_at(art, req, at, scope, encoding)
 }
 
+/// The range of the syntax node that ends where an anchor was written: the
+/// equation, the link, whatever the label was attached to. Scopes that name a
+/// whole element put their anchor immediately after it, so this is what the
+/// annotation refers to; a label that follows nothing falls back to the word.
+fn anchored_node_range(source: &typst::syntax::Source, at: usize) -> std::ops::Range<usize> {
+    use typst_shim::syntax::LinkedNodeExt;
+    if at > 0 {
+        let root = typst::syntax::LinkedNode::new(source.root());
+        if let Some(leaf) = root.leaf_at_compat(at - 1) {
+            let mut cursor = leaf;
+            loop {
+                let range = cursor.range();
+                if range.end == at && range.start < at {
+                    return range;
+                }
+                match cursor.parent() {
+                    Some(parent) => cursor = parent.clone(),
+                    None => break,
+                }
+            }
+        }
+    }
+    word_range(source.text(), at)
+}
+
 /// A label placed where content has not started yet — at the head of a line,
 /// or before a list marker — attaches to whatever came *before* it: the
 /// previous item, or nothing at all, and a marker pushed off the line start
@@ -2105,7 +2206,7 @@ fn prepare_at(
         rtype: "comment".into(),
         uuid: fresh_label(&records, req.uuid.as_deref()),
         letter: next_letter(&records),
-        author: local_author(),
+        author: author_or_local(req.author.as_deref()),
         content: req.text.clone(),
         time: iso_now(),
         status: "created".into(),
@@ -2165,7 +2266,7 @@ fn prepare_span_range(
         rtype: "comment".into(),
         uuid: fresh_label(&records, req.uuid.as_deref()),
         letter: next_letter(&records),
-        author: local_author(),
+        author: author_or_local(req.author.as_deref()),
         content: req.text.clone(),
         time: iso_now(),
         status: "created".into(),
@@ -2296,10 +2397,11 @@ pub fn prepare_reply(
     art: &LspCompiledArtifact,
     uuid: &str,
     text: &str,
+    author: Option<&str>,
 ) -> Result<(PathBuf, String), String> {
     modify_record(art, uuid, |record| {
         record.discussion.push(AnnotationReply {
-            author: local_author(),
+            author: author_or_local(author),
             time: iso_now(),
             content: text.to_owned(),
         });
@@ -2367,5 +2469,25 @@ mod anchor_tests {
         // heading, and nothing is skipped
         let t = "=x is not a heading\n";
         assert_eq!(snapped(t, 0), "=x<L> is not a heading\n");
+    }
+
+    #[test]
+    fn entry_span_ignores_the_prelude_example() {
+        // The prelude shows what an entry looks like, uuid and all. An entry
+        // that shares that uuid must still be found where it actually is —
+        // not in the explanation, which was how a sidecar lost its header.
+        let content = concat!(
+            "// Entry shape:\n",
+            "//\n",
+            "//   #metadata((\n",
+            "//     uuid: str,\n",
+            "//   )) <note-7C42>\n",
+            "#metadata((\n",
+            "  uuid: \"7C42\",\n",
+            ")) <note-7C42>\n",
+        );
+        let span = super::entry_span(content, "7C42").expect("the real entry");
+        assert_eq!(&content[span.clone()], "#metadata((\n  uuid: \"7C42\",\n)) <note-7C42>\n");
+        assert!(super::entry_span(content, "0000").is_none());
     }
 }

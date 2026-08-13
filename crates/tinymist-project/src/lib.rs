@@ -11,11 +11,13 @@ pub mod mock;
 
 #[cfg(feature = "lsp")]
 mod lsp;
+mod announce;
 #[cfg(feature = "system")]
 mod watch;
 
 pub mod world;
 
+pub use announce::*;
 pub use args::*;
 pub use compiler::*;
 pub use entry::*;

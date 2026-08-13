@@ -95,6 +95,13 @@ struct ServeArgs {
     #[clap(long = "icon-color", value_name = "HEX")]
     icon_color: Option<String>,
 
+    /// An origin to accept besides loopback, e.g. `http://typst` when this
+    /// server is reached through `tailscale serve`. Without it the browser's
+    /// `Origin` on the annotation websocket does not match the address this
+    /// server bound, and the connection is refused. Repeat for more than one.
+    #[clap(long = "allowed-origin", value_name = "ORIGIN")]
+    allowed_origins: Vec<String>,
+
     /// Keep running after the process that started this one goes away.
     #[clap(long = "daemon")]
     daemon: bool,
@@ -130,15 +137,59 @@ struct ServeArgs {
     open_cdp: Option<String>,
 }
 
-/// Whether something is already listening on this address.
+/// Whether a document server is already answering on this address.
+///
+/// A connection that opens is not enough: a server on its way out — one whose
+/// binary has just been replaced — still holds its socket for a moment, and
+/// handing the URL to a browser then leaves nothing behind it. Only an answer
+/// counts.
 fn is_live(host: &str, port: u16) -> bool {
+    matches!(probe(host, port).as_deref(), Some(stamp)
+        if stamp == tinymist::tool::preview::build_stamp())
+}
+
+/// Which build is answering on this address, if anything is.
+///
+/// A connection that opens is not enough, and neither is an answer: a server
+/// whose binary has just been replaced still answers for a moment before it
+/// notices and exits. Handing the URL to a browser then leaves nothing behind
+/// it, so what counts is an answer from *this* build.
+fn probe(host: &str, port: u16) -> Option<String> {
+    use std::io::{Read, Write};
     use std::net::{TcpStream, ToSocketAddrs};
-    let timeout = std::time::Duration::from_millis(300);
-    (host, port)
-        .to_socket_addrs()
-        .into_iter()
-        .flatten()
-        .any(|addr| TcpStream::connect_timeout(&addr, timeout).is_ok())
+
+    let timeout = std::time::Duration::from_millis(400);
+    for addr in (host, port).to_socket_addrs().ok()? {
+        let Ok(mut sock) = TcpStream::connect_timeout(&addr, timeout) else {
+            continue;
+        };
+        let _ = sock.set_read_timeout(Some(timeout));
+        let _ = sock.set_write_timeout(Some(timeout));
+        let request = format!("GET /dev/build HTTP/1.0\r\nHost: {host}:{port}\r\n\r\n");
+        if sock.write_all(request.as_bytes()).is_err() {
+            continue;
+        }
+        let mut buf = String::new();
+        if sock.take(4096).read_to_string(&mut buf).is_err() {
+            continue;
+        }
+        let (head, body) = buf.split_once("\r\n\r\n")?;
+        if !head.starts_with("HTTP/1.") || !head.contains(" 200") {
+            continue;
+        }
+        return Some(body.trim().to_owned());
+    }
+    None
+}
+
+/// Waits for a server of an older build to let go of the port it holds.
+fn wait_for_port(host: &str, port: u16) {
+    for _ in 0..40 {
+        if probe(host, port).is_none() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 }
 
 /// Opens a URL as the arguments ask, the same way the preview does.
@@ -267,6 +318,11 @@ fn main() -> Result<()> {
         filter: (!args.verbose).then(|| "tinymist::compat::preview=warn".to_string()),
         output: None,
     });
+    tinymist::tool::preview::note_build_stamp();
+    // A person is watching this in a terminal, so it narrates: what changed on
+    // disk, and who is connected. The LSP shares its streams with the editor
+    // and stays silent.
+    tinymist_project::ANNOUNCE_ACTIVITY.store(true, std::sync::atomic::Ordering::Relaxed);
     // The serve binary is as long-lived as the LSP: a replaced binary is a
     // reason to stop, unless it was asked to outlive its parent.
     if !args.daemon {
@@ -293,12 +349,18 @@ fn main() -> Result<()> {
     // from the path for exactly this reason, and a server whose binary has been
     // replaced has already exited on its own. Asking for it again means "show
     // it to me", not "bind this port twice".
-    if is_live(&args.host, port) {
-        eprintln!("already serving {url}");
-        if args.open {
-            open_url(&url, &args, port);
+    match probe(&args.host, port) {
+        Some(stamp) if stamp == tinymist::tool::preview::build_stamp() => {
+            eprintln!("already serving {url}");
+            if args.open {
+                open_url(&url, &args, port);
+            }
+            return Ok(());
         }
-        return Ok(());
+        // An older build is still there: it has been told to stop and is about
+        // to, so this one waits for its address rather than taking its place.
+        Some(_) => wait_for_port(&args.host, port),
+        None => {}
     }
 
     // A directory serves its index; the rest of directory mode — a listing, and
@@ -380,6 +442,9 @@ fn main() -> Result<()> {
     }
     if let Some(color) = &args.icon_color {
         argv.push(format!("--icon-color={color}"));
+    }
+    for origin in &args.allowed_origins {
+        argv.push(format!("--allowed-origin={origin}"));
     }
     for input in &args.inputs {
         argv.push(format!("--input={input}"));

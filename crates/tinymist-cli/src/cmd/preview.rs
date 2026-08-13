@@ -58,6 +58,7 @@ pub async fn preview_main(mut args: PreviewCliArgs) -> Result<()> {
             None
         };
 
+    tinymist::tool::preview::note_build_stamp();
     exit_on_ctrl_c();
 
     let shutdown_on_last_client = args.shutdown_on_last_client;
@@ -280,6 +281,10 @@ pub async fn preview_main(mut args: PreviewCliArgs) -> Result<()> {
                     tinymist::tool::preview::icons::IconRole::Serve,
                 ),
                 None,
+                // The control plane serves the editor over loopback, so the
+                // origins a browser might reach the data plane by are none of
+                // its business.
+                Vec::new(),
             )
             .await;
         log::info!(
@@ -409,6 +414,10 @@ pub async fn preview_main(mut args: PreviewCliArgs) -> Result<()> {
         frontend_html.push_str(script);
     }
 
+    // Bound once: `args` is partially moved into the servers below, and both
+    // of them accept the same origins.
+    let allowed_origins = args.allowed_origins.clone();
+
     let static_server = if let Some(static_file_host) = static_file_host {
         log::warn!(
             "--static-file-host is deprecated, which will be removed in the future. Use --data-plane-host instead."
@@ -424,6 +433,7 @@ pub async fn preview_main(mut args: PreviewCliArgs) -> Result<()> {
                 shutdown_on_last_client,
                 identity.clone(),
                 html_server.clone(),
+                allowed_origins.clone(),
             )
             .await,
         )
@@ -441,6 +451,7 @@ pub async fn preview_main(mut args: PreviewCliArgs) -> Result<()> {
             shutdown_on_last_client,
             identity.clone(),
             html_server,
+            allowed_origins,
         )
         .await;
     log::info!(

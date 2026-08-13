@@ -846,14 +846,25 @@ impl CompileHandler<LspCompilerFeat, ProjectInsStateExt> for CompileHandlerImpl 
 
         // Prints the diagnostics when we are running the compilation in standalone
         // CLI.
+        //
+        // Errors only. A watched document recompiles on every edit, and its
+        // warnings are identical every time — reprinting them buries whatever
+        // just changed under a screenful of what did not. They remain visible
+        // in the editor and in the preview's own error overlay.
         #[cfg(feature = "system")]
         if self.is_standalone {
-            crate::project::system::print_diagnostics(
-                art.world(),
-                art.diagnostics(),
-                reflexo_typst::DiagnosticFormat::Human,
-            )
-            .log_error("failed to print diagnostics");
+            let mut errors = art
+                .diagnostics()
+                .filter(|diag| diag.severity == typst::diag::Severity::Error)
+                .peekable();
+            if errors.peek().is_some() {
+                crate::project::system::print_diagnostics(
+                    art.world(),
+                    errors,
+                    reflexo_typst::DiagnosticFormat::Human,
+                )
+                .log_error("failed to print diagnostics");
+            }
         }
 
         #[cfg(feature = "export")]

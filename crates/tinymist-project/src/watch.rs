@@ -13,6 +13,8 @@ use std::{collections::HashMap, fmt, path::Path};
 
 use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
 use tinymist_std::{ImmutPath, error::IgnoreLogging};
+
+use crate::announcing;
 use tinymist_world::vfs::notify::NotifyDeps;
 use tokio::sync::mpsc;
 use typst::diag::{FileError, FileResult};
@@ -514,6 +516,17 @@ impl<F: FnMut(FilesystemEvent) + Send + Sync> NotifyActor<F> {
 
         // Send file updates.
         if !changeset.is_empty() {
+            if announcing() {
+                // The paths, not a count: when a rebuild is unexpected the
+                // whole question is which file moved, and a sidecar the server
+                // wrote itself is the usual answer.
+                for path in event.paths.iter() {
+                    crate::announce(
+                        "recompile",
+                        &[("file", path.display().to_string().into())],
+                    );
+                }
+            }
             (self.interrupted_by_events)(FilesystemEvent::Update(changeset, false));
         }
     }
