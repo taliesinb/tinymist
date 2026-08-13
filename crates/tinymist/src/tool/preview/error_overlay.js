@@ -299,6 +299,329 @@
   };
   window.__tinymistReport = report;
 
+  // WebKit paints an off-screen page's canvas snapshot without the transform
+  // of the `<g>` that holds it: with partial rendering every snapshot lands at
+  // the top-left of the document at a fraction of its size, stacked on the
+  // others, so the last page of the document is drawn over the first. The DOM
+  // is correct throughout, which is why nothing short of a screenshot reveals
+  // it.
+  //
+  // Measured on the document itself rather than on a synthetic case (which the
+  // bug does not reproduce) or a browser name (which rots): a snapshot whose
+  // painted box disagrees with its own page's transform is the fault. Hiding
+  // them costs only that a page scrolled into view very fast may be blank for a
+  // frame rather than showing a stale image of itself.
+  (() => {
+    const misplaced = () => {
+      const page = document.querySelector('g.typst-page[data-dummy="1"]');
+      const fo = page && page.querySelector("foreignObject");
+      if (!page || !fo) return null;
+      const ctm = page.getScreenCTM();
+      const box = fo.getBoundingClientRect();
+      if (!ctm || !box.width) return null;
+      const expectedWidth = parseFloat(page.dataset.pageWidth) * ctm.a;
+      const wrongSize = Math.abs(box.width - expectedWidth) > expectedWidth * 0.1;
+      const wrongPlace = Math.abs(box.top - ctm.f) > 20;
+      return wrongSize || wrongPlace;
+    };
+    const forced = new URLSearchParams(location.search).has("no-page-snapshots");
+    const apply = () => {
+      if (document.getElementById("tinymist-foreignobject-workaround")) return;
+      if (!forced && misplaced() !== true) return;
+      const style = document.createElement("style");
+      style.id = "tinymist-foreignobject-workaround";
+      style.textContent =
+        'svg.typst-doc g.typst-page[data-dummy="1"] foreignObject' +
+        " { display: none !important; }";
+      document.head.appendChild(style);
+      console.log(
+        "tinymist: this browser paints page snapshots without their transform;" +
+          " hiding them (pages render as they scroll in)",
+      );
+    };
+    // Checked for as long as the page lives, not once at startup: the fault is
+    // intermittent, appearing on some loads and after some re-layouts, and one
+    // wrong frame is all it takes to show the wrong page.
+    apply();
+    setInterval(apply, 700);
+  })();
+
+
+
+
+  // ?diag — a recorder for "something flashes and I cannot say what".
+  // Watches the things that could repaint the whole view (the invert style
+  // going on or off, page groups being swapped, the document's own attributes
+  // changing) and posts a summary every two seconds, so a session in a real
+  // window can be read back from the server's client log afterwards.
+  if (new URLSearchParams(location.search).has("diag")) {
+    // The renderer narrates the window it is asked to draw. Those numbers say
+    // whether the viewport rectangle it computes is sane, which no amount of
+    // inspecting the finished DOM can reveal.
+    const renderLines = [];
+    const origLog = console.log;
+    console.log = function (...args) {
+      const text = args
+        .map((a) => {
+          if (typeof a === "object" && a !== null) {
+            try {
+              return JSON.stringify(a);
+            } catch {
+              return "[object]";
+            }
+          }
+          return String(a);
+        })
+        .join(" ");
+      if (/render_in_window|rerender/.test(text) && renderLines.length < 8) {
+        renderLines.push(text.slice(0, 160));
+      }
+      return origLog.apply(this, args);
+    };
+
+    const counts = {};
+    const bump = (key) => (counts[key] = (counts[key] || 0) + 1);
+    const svg = () => document.querySelector("svg.typst-doc");
+    new MutationObserver((ms) => {
+      for (const m of ms) {
+        for (const n of m.addedNodes) {
+          if (n.id === SMART_INVERT_ID) bump("invert-style-added");
+        }
+        for (const n of m.removedNodes) {
+          if (n.id === SMART_INVERT_ID) bump("invert-style-removed");
+        }
+      }
+    }).observe(document.head, { childList: true });
+
+    const watchDoc = () => {
+      const el = svg();
+      if (!el || el.__tinymistDiag) return;
+      el.__tinymistDiag = true;
+      new MutationObserver((ms) => {
+        for (const m of ms) {
+          if (m.type === "attributes") {
+            bump(`doc-attr:${m.attributeName}`);
+          } else if (m.target.classList && m.target.classList.contains("typst-page")) {
+            bump("page-content-swap");
+          } else {
+            bump("doc-child-change");
+          }
+        }
+      }).observe(el, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ["style", "class", "transform", "data-dummy", "width", "height"],
+      });
+    };
+    watchDoc();
+    setInterval(watchDoc, 1000);
+
+    let moves = 0;
+    window.addEventListener("mousemove", () => moves++, true);
+
+    // Sample fast enough to catch the document going away and coming back:
+    // a flash is over long before a two-second report would notice it.
+    let lastPages = -1;
+    let vanished = 0;
+    let returned = 0;
+    setInterval(() => {
+      const n = document.querySelectorAll("g.typst-page").length;
+      if (lastPages > 0 && n === 0) vanished++;
+      if (lastPages === 0 && n > 0) returned++;
+      lastPages = n;
+    }, 50);
+    // Page geometry, for "the document is drawn at two scales at once": each
+    // page's own transform against the size the document says it has, plus the
+    // canvas a dummy page carries, whose intrinsic size and CSS size have to
+    // agree or the snapshot lands at the wrong scale.
+    const geometry = () => {
+      const el = svg();
+      if (!el) return null;
+      const applied = parseFloat(el.getAttribute("data-applied-width"));
+      const declared = parseFloat(el.getAttribute("data-width"));
+      return {
+        docScale: +(applied / declared).toFixed(3),
+        dpr: window.devicePixelRatio,
+        // Every page, not the first few: a document drawn at two scales has
+        // them somewhere, and it will not be at the top.
+        scales: [
+          ...new Set(
+            [...document.querySelectorAll("g.typst-page")]
+              .map((p) => {
+                const m = p.getScreenCTM();
+                return m ? m.a.toFixed(3) : "none";
+              }),
+          ),
+        ],
+        boxes: [
+          ...new Set(
+            [...document.querySelectorAll("g.typst-page")].map((p) => {
+              const r = p.getBoundingClientRect();
+              return `${Math.round(r.width)}`;
+            }),
+          ),
+        ],
+        pages: [...document.querySelectorAll("g.typst-page")].slice(0, 4).map((p) => {
+          const ctm = p.getScreenCTM();
+          const canvas = p.querySelector("canvas");
+          return {
+            n: p.dataset.pageNumber,
+            dummy: p.dataset.dummy === "1",
+            ctm: ctm ? `${ctm.a.toFixed(2)}@${Math.round(ctm.f)}` : null,
+            canvas: canvas
+              ? `${canvas.width}x${canvas.height} css ${Math.round(
+                  canvas.getBoundingClientRect().width,
+                )}x${Math.round(canvas.getBoundingClientRect().height)}`
+              : null,
+          };
+        }),
+      };
+    };
+
+    // Sampling on a timer walks past a transient: watch for the geometry
+    // changing instead, and keep every change since the last report.
+    let lastSig = "";
+    const changes = [];
+    setInterval(() => {
+      const g = geometry();
+      if (!g) return;
+      const sig = JSON.stringify(g);
+      if (sig === lastSig) return;
+      lastSig = sig;
+      if (changes.length < 12) {
+        changes.push({ at: Math.round(performance.now()), ...g });
+      }
+    }, 80);
+
+    // Where the ink actually sits inside a dummy page's canvas. The canvas
+    // element can be the right size while its contents were drawn for a
+    // narrower layout — a small page in a large frame, which is what "the
+    // document shrank" looks like.
+    const inkExtent = (canvas) => {
+      if (!canvas || !canvas.width) return null;
+      let ctx;
+      try {
+        ctx = canvas.getContext("2d", { willReadFrequently: true });
+        if (!ctx) return null;
+      } catch {
+        return null;
+      }
+      const step = 16;
+      let right = 0;
+      let bottom = 0;
+      try {
+        const data = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+        // the page ground is whatever the top-left corner is
+        const bg = [data[0], data[1], data[2], data[3]];
+        for (let y = 0; y < canvas.height; y += step) {
+          for (let x = 0; x < canvas.width; x += step) {
+            const i = (y * canvas.width + x) * 4;
+            if (
+              Math.abs(data[i] - bg[0]) > 12 ||
+              Math.abs(data[i + 1] - bg[1]) > 12 ||
+              Math.abs(data[i + 2] - bg[2]) > 12 ||
+              Math.abs(data[i + 3] - bg[3]) > 12
+            ) {
+              if (x > right) right = x;
+              if (y > bottom) bottom = y;
+            }
+          }
+        }
+      } catch (err) {
+        return "unreadable: " + err.name;
+      }
+      return {
+        canvas: `${canvas.width}x${canvas.height}`,
+        inkTo: `${right}x${bottom}`,
+        fills: `${(right / canvas.width).toFixed(2)}x${(bottom / canvas.height).toFixed(2)}`,
+      };
+    };
+
+    setInterval(() => {
+      const el = svg();
+      const summary = {
+        render: renderLines.splice(0, renderLines.length),
+        viewport: (() => {
+          const el = svg();
+          if (!el) return null;
+          const r = el.getBoundingClientRect();
+          return `svg ${Math.round(r.width)}x${Math.round(r.height)} at ${Math.round(r.left)},${Math.round(r.top)} | win ${innerWidth}x${innerHeight} dpr ${devicePixelRatio}`;
+        })(),
+        // Every canvas in the document, wherever it lives. A snapshot surface
+        // that is not inside a page group has no business being visible, and a
+        // visible one at the top-left is the page drawn over page 1.
+        loose: [...document.querySelectorAll("canvas")].map((c) => {
+          const r = c.getBoundingClientRect();
+          const inPage = !!c.closest("g.typst-page");
+          const cs = getComputedStyle(c);
+          return [
+            inPage ? "page" : "LOOSE",
+            `${c.width}x${c.height}`,
+            `at ${Math.round(r.left)},${Math.round(r.top)}`,
+            `${Math.round(r.width)}x${Math.round(r.height)}`,
+            cs.display === "none" ? "hidden" : `vis:${cs.visibility}`,
+            `op:${cs.opacity}`,
+            `z:${cs.zIndex}`,
+            `pos:${cs.position}`,
+          ].join(" ");
+        }).filter((row) => row.startsWith("LOOSE") || row.includes("at 0,")).slice(0, 8),
+
+        // The last page, named because that is where it goes wrong, plus any
+        // page whose transform disagrees with the rest.
+        last: (() => {
+          const pages = [...document.querySelectorAll("g.typst-page")];
+          const p = pages[pages.length - 1];
+          if (!p) return null;
+          const m = p.getScreenCTM();
+          const r = p.getBoundingClientRect();
+          const canvas = p.querySelector("canvas");
+          const e = canvas ? inkExtent(canvas) : null;
+          return {
+            n: p.dataset.pageNumber,
+            dummy: p.dataset.dummy === "1",
+            scale: m ? +m.a.toFixed(3) : null,
+            at: m ? `${Math.round(m.e)},${Math.round(m.f)}` : null,
+            box: `${Math.round(r.width)}x${Math.round(r.height)}`,
+            declared: `${p.dataset.pageWidth}x${p.dataset.pageHeight}`,
+            canvas: e ? `${e.canvas} ink ${e.fills}` : canvas ? "unmeasured" : "svg",
+          };
+        })(),
+        odd: (() => {
+          const pages = [...document.querySelectorAll("g.typst-page")];
+          const scales = pages.map((p) => {
+            const m = p.getScreenCTM();
+            return m ? +m.a.toFixed(3) : 0;
+          });
+          const common = scales.sort()[Math.floor(scales.length / 2)];
+          return pages
+            .map((p, i) => ({ p, i }))
+            .filter(({ p }) => {
+              const m = p.getScreenCTM();
+              return m && Math.abs(m.a - common) > 0.01;
+            })
+            .map(({ p }) => `${p.dataset.pageNumber}@${p.getScreenCTM().a.toFixed(3)}`);
+        })(),
+        changes: changes.splice(0, changes.length),
+        moves,
+        invertOn: !!document.getElementById(SMART_INVERT_ID),
+        docFilter: el ? getComputedStyle(el).filter.slice(0, 40) : null,
+        pages: document.querySelectorAll("g.typst-page").length,
+        dummies: document.querySelectorAll('g.typst-page[data-dummy="1"]').length,
+        canvases: document.querySelectorAll("canvas").length,
+        vanished,
+        returned,
+        ...counts,
+      };
+      vanished = 0;
+      returned = 0;
+      moves = 0;
+      for (const k of Object.keys(counts)) delete counts[k];
+      report("diag", JSON.stringify(summary));
+    }, 2000);
+  }
+
+
   // Minimal API for the annotation layer, which is loaded only on
   // /?annotate pages; plain previews carry no annotation UI at all.
   window.__tinymist = {

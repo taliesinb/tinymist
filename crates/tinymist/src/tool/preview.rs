@@ -12,6 +12,7 @@ pub use error_overlay::{
 pub use http::{make_http_server, HttpServer};
 
 pub mod icons;
+pub mod open;
 mod annotations;
 mod compile;
 mod error_overlay;
@@ -218,6 +219,16 @@ pub struct PreviewCliArgs {
     #[clap(long = "root-name", value_name = "NAME")]
     pub root_name: Option<String>,
 
+    /// Give the document a window of its own: a web app installed from this
+    /// URL if there is one, else the nearest thing the browser offers.
+    #[clap(long = "open-isolated")]
+    pub open_isolated: bool,
+
+    /// Expose a debugging port on the opened window, so it can be inspected
+    /// from outside. `auto` derives one from the server's port. Chrome only.
+    #[clap(long = "open-cdp", value_name = "PORT")]
+    pub open_cdp: Option<String>,
+
     /// Keep running after the process that started this one goes away.
     /// Without it the server exits when it is orphaned, so closing the editor
     /// (or the terminal) that launched it does not leave a server behind.
@@ -296,15 +307,6 @@ impl PreviewCliArgs {
         !self.no_open && (self.open || default)
     }
 
-    /// The application to open with: whatever `--open-in` said, else the web
-    /// app for this mode.
-    pub fn open_in_app(&self) -> &str {
-        match self.open_in.as_deref() {
-            Some(app) => app,
-            None if self.annotate => "Typst Annotate",
-            None => "Typst Preview",
-        }
-    }
 }
 
 /// What a server calls itself in the Dock: its role, and the two things an
@@ -331,12 +333,27 @@ impl WebAppIdentity {
         Self { role, ..self.clone() }
     }
 
-    /// The web app's name: "Typst Server: Foo", falling back to the port when
-    /// nobody has said what is being served.
+    /// What is being served, as a person would name it.
+    fn subject(&self, port: u16) -> String {
+        self.name.clone().unwrap_or_else(|| port.to_string())
+    }
+
+    /// The long name, for the browser's tab and the manifest's `name`.
     pub fn title(&self, port: u16) -> String {
-        match &self.name {
-            Some(name) => format!("{} ({name})", self.role.title()),
-            None => format!("{} ({port})", self.role.title()),
+        format!("{}: {}", self.role.title(), self.subject(port))
+    }
+
+    /// The name a Dock app takes, which is the manifest's `short_name`.
+    ///
+    /// Subject first, because that is what distinguishes one app from the next
+    /// once there are several — and a plain document server needs no suffix at
+    /// all, being the ordinary way to look at a document.
+    pub fn short_title(&self, port: u16) -> String {
+        let subject = self.subject(port);
+        match self.role {
+            icons::IconRole::Serve => subject,
+            icons::IconRole::Lsp => format!("{subject} (LSP)"),
+            icons::IconRole::Annotate => format!("{subject} (Annotator)"),
         }
     }
 }
@@ -460,7 +477,7 @@ pub fn web_manifest(path: &str, port: u16, identity: &WebAppIdentity) -> Option<
     let (bg, _) = icons::colors_for(port, identity.color);
     let background = format!("#{:02x}{:02x}{:02x}", bg[0], bg[1], bg[2]);
     let name = identity.title(port);
-    let short = identity.role.title();
+    let short = identity.short_title(port);
     Some(format!(
         r##"{{
   "name": "{name}",
@@ -495,9 +512,9 @@ pub fn exit_when_orphaned() {
             log::info!("started detached: not watching for an orphaning parent");
             return;
         }
-        tokio::spawn(async move {
+        std::thread::spawn(move || {
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                std::thread::sleep(std::time::Duration::from_secs(2));
                 if std::os::unix::process::parent_id() != original {
                     log::info!(
                         target: crate::PREVIEW_COMPAT_LOG_TARGET,
@@ -508,19 +525,6 @@ pub fn exit_when_orphaned() {
             }
         });
     }
-}
-
-/// Opens the preview URL, preferring the application named by `--open-in` and
-/// falling back to the default browser.
-#[cfg(feature = "open")]
-pub fn open_preview_url(url: String, open_in: Option<&str>) {
-    if let Some(app) = open_in {
-        if open::with_detached(&url, app).is_ok() {
-            return;
-        }
-        log::warn!("failed to open preview in {app}, falling back to the default browser");
-    }
-    open::that_detached(url).log_error("failed to open browser for preview");
 }
 
 /// Response for starting a preview instance.
@@ -1033,9 +1037,27 @@ impl PreviewState {
 
             #[cfg(feature = "open")]
             if open_in_browser {
-                open_preview_url(
-                    format!("http://127.0.0.1:{}", addr.port()),
-                    args.open_in.as_deref(),
+                let identity = WebAppIdentity {
+                    role: icons::IconRole::Lsp,
+                    color: None,
+                    name: args.root_name.clone(),
+                };
+                open::open(
+                    &format!("http://127.0.0.1:{}", addr.port()),
+                    &open::OpenOptions {
+                        browser: args
+                            .open_in
+                            .as_deref()
+                            .map(open::Browser::parse)
+                            .unwrap_or(open::Browser::Default),
+                        isolated: args.open_isolated,
+                        cdp_port: args
+                            .open_cdp
+                            .as_deref()
+                            .and_then(|spec| open::parse_cdp_port(spec, addr.port())),
+                        app_title: identity.short_title(addr.port()),
+                        key: addr.port(),
+                    },
                 );
             }
 

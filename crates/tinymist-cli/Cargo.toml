@@ -19,6 +19,14 @@ name = "talimist"
 path = "src/main.rs"
 doc = false
 
+[[bin]]
+# The document server: no editor attached, so restarting it never disturbs a
+# session.
+name = "talimist-serve"
+path = "src/serve.rs"
+required-features = ["preview"]
+doc = false
+
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true

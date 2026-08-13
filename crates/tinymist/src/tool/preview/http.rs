@@ -56,7 +56,7 @@ pub async fn make_http_server(
 
     let listener = tokio::net::TcpListener::bind(&static_file_addr)
         .await
-        .unwrap();
+        .unwrap_or_else(|err| panic!("cannot bind {static_file_addr}: {err}"));
     let addr = listener.local_addr().unwrap();
     log::info!("preview server listening on http://{addr}");
 

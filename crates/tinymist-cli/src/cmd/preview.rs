@@ -22,17 +22,35 @@ use tokio::sync::mpsc;
 use crate::utils::exit_on_ctrl_c;
 
 /// Entry point of the preview tool.
-pub async fn preview_main(args: PreviewCliArgs) -> Result<()> {
+pub async fn preview_main(mut args: PreviewCliArgs) -> Result<()> {
     log::info!("Arguments: {args:#?}");
     let handle = tokio::runtime::Handle::current();
 
+    // Render only the visible pages unless asked otherwise. A 24-page document
+    // otherwise puts its whole self in the DOM — measured at 104k SVG elements,
+    // 72k of them <use>, and 7.9MB of markup, which Safari cannot scroll
+    // smoothly; with partial rendering the same document is 4.5k elements and
+    // every frame lands in 17ms.
+    // Annotation included: without it the renderer re-renders the whole
+    // document on every scroll (`render_in_window ... 0 0 1e33 1e33`, hundreds
+    // of milliseconds a time), which repaints the view and reads as flashing.
+    // Page groups keep their DOM position and their number under partial
+    // rendering — the off-screen ones become canvas-backed dummies — so the
+    // overlay's page lookup is unaffected.
+    if args.preview.enable_partial_rendering.is_none() {
+        args.preview.enable_partial_rendering = Some(true);
+    }
     let config = args.preview.config(&PreviewConfig::default());
     #[cfg(feature = "open")]
     // `preview` is usually run to look at something now; `annotate` is
     // typically driven by an editor task that opens its own window.
     let open_in_browser = args.open_in_browser(!args.annotate);
     #[cfg(feature = "open")]
-    let open_in_app = args.open_in_app().to_string();
+    let open_in_override = args.open_in.clone();
+    #[cfg(feature = "open")]
+    let open_isolated = args.open_isolated;
+    #[cfg(feature = "open")]
+    let open_cdp = args.open_cdp.clone();
     let static_file_host =
         if args.static_file_host == args.data_plane_host || !args.static_file_host.is_empty() {
             Some(args.static_file_host)
@@ -360,18 +378,52 @@ pub async fn preview_main(args: PreviewCliArgs) -> Result<()> {
         "Static file server listening on: {static_server_addr}"
     );
 
-    // Printed, not logged: the whole URL, so it can be clicked out of a
-    // terminal rather than reassembled from a log line.
-    let path = if args.annotate { "/annotate" } else { "/" };
-    println!("http://{static_server_addr}{path}");
+
 
     #[cfg(feature = "open")]
     if open_in_browser {
         let path = if args.annotate { "/annotate" } else { "/" };
-        tinymist::tool::preview::open_preview_url(
-            format!("http://{static_server_addr}{path}"),
-            Some(open_in_app.as_str()),
+        // The app to look for is the one this server would be added to the
+        // Dock as — its manifest's short name — so opening lands in the window
+        // that already belongs to this document rather than a stray browser
+        // tab. Falls back to the plain browser, and then to the system
+        // default, rather than failing.
+        use tinymist::tool::preview::open;
+        let port = static_server_addr.port();
+        open::open(
+            &format!("http://{static_server_addr}{path}"),
+            &open::OpenOptions {
+                browser: open_in_override
+                    .as_deref()
+                    .map(open::Browser::parse)
+                    .unwrap_or(open::Browser::Default),
+                isolated: open_isolated,
+                cdp_port: open_cdp
+                    .as_deref()
+                    .and_then(|spec| open::parse_cdp_port(spec, port)),
+                app_title: identity.short_title(port),
+                key: port,
+            },
         );
+    }
+
+    // Printed rather than logged, and printed last: this process binds two
+    // ports and only one of them is meant for a person. A log line for each is
+    // how the wrong one gets copied.
+    {
+        let path = if args.annotate { "/annotate" } else { "/" };
+        let port = static_server_addr.port();
+        println!();
+        println!("{}", identity.title(port));
+        println!("  document  http://{static_server_addr}{path}");
+        #[cfg(feature = "open")]
+        if let Some(cdp) = open_cdp
+            .as_deref()
+            .and_then(|spec| tinymist::tool::preview::open::parse_cdp_port(spec, port))
+        {
+            println!("  devtools  http://127.0.0.1:{cdp}");
+        }
+        println!();
     }
 
     let _ = tokio::join!(previewer.join(), srv.join, control_plane_server_handle);

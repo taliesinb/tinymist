@@ -1205,6 +1205,8 @@
   // x of its bullet or number, which is not part of its own boxes) and the
   // page's rail (its leftmost ink). The client only adds its own chip size.
   const STRIP_W = 3;
+  // How far a block's strip sits from the content it marks.
+  const STRIP_GAP = 10;
   const CHIP_W = 22;
   const CHIP_GAP = 7;
   // The paragraph rail clears a full item chip, so the two never overlap.
@@ -1440,7 +1442,7 @@
       if (scope === "block") {
         const top = Math.min(...boxes.map((b) => b.y0));
         const bot = Math.max(...boxes.map((b) => b.y1));
-        const left = Math.min(...boxes.map((b) => b.x0)) - 6;
+        const left = Math.min(...boxes.map((b) => b.x0)) - STRIP_GAP;
         const el = stripFor(host, pin.uuid + ":block", color);
         el.style.width = STRIP_W + "px";
         el.style.left = left + "px";
@@ -1617,14 +1619,15 @@
           .filter(Boolean);
         if (boxes.length) {
           if (pin.scope === "block" || pin.scope === "para") {
-            // The strip runs down the rect's left edge; sit left of it.
+            // Right-aligned against the strip, so the letter reads as the
+            // strip's label rather than as something floating beside it.
             const top = Math.min(...boxes.map((b) => b.y0));
             const bot = Math.max(...boxes.map((b) => b.y1));
-            const left =
+            const stripLeft =
               pin.scope === "para"
-                ? bandOf(boxes, pin.rects[0].page, pin.gutterX, pin.railX).left + STRIP_W
-                : Math.min(...boxes.map((b) => b.x0));
-            el.style.left = left - 10 - el.__w + "px";
+                ? bandOf(boxes, pin.rects[0].page, pin.gutterX, pin.railX).left
+                : Math.min(...boxes.map((b) => b.x0)) - STRIP_GAP;
+            el.style.left = stripLeft - 3 - el.__w + "px";
             el.style.top = (top + bot) / 2 - el.__h / 2 + "px";
           } else {
             // Underline: tuck the letter below the strip, right-aligned
