@@ -81,6 +81,10 @@ pub struct OverlayPayload {
     /// Bumped when a dev asset (the overlay script) changes on disk; the
     /// frontend reloads the page when it sees a new version.
     pub asset_version: u64,
+    /// Which rendering of the document is on disk. A page fetches the body
+    /// again when this moves, and stays where it is otherwise: a compile that
+    /// produced the same page is not a reason to redraw one.
+    pub doc_version: u64,
 }
 
 /// The vertical extent of a block on a page.
@@ -112,6 +116,7 @@ impl Default for OverlayPayload {
             doc_dark: None,
             annotations: vec![],
             asset_version: 0,
+            doc_version: 0,
         }
     }
 }
@@ -489,6 +494,7 @@ pub fn diagnostics_payload(
         doc_dark: None,
         annotations: vec![],
         asset_version: 0,
+        doc_version: 0,
     }
 }
 

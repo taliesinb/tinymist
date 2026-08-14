@@ -19,7 +19,9 @@
   const BOX_ID = "tinymist-annot-box";
   const STATUS_ID = "tinymist-status";
   const TOGGLE_ID = "tinymist-annotate-toggle";
-  const ANNOTATE = location.pathname.replace(/\/+$/, "") === "/annotate";
+  // Which face this page wears rides in the URL's first segment: `/a/` is the
+  // annotator, `/v/` a document served to be read, `/p/` an editor's preview.
+  const ANNOTATE = /^\/a(\/|$)/.test(location.pathname);
 
   // ---------------------------------------------------------------- palette
   // An annotation is coloured by its letter, not by its state: A is always the
@@ -71,10 +73,13 @@
   };
   // The colour a pin is drawn in: its letter's, lifted while its window is
   // open so the one being read stands out from the rest.
+  // The colour an annotation was made in, which the sidecar keeps: the palette
+  // can change, and a letter can be reassigned, without an annotation changing
+  // colour under someone who has been looking at it. Only one without a stored
+  // colour falls back to the palette.
+  const ownColor = (pin) => pin.color || letterColor(pin.letter);
   const pinColor = (pin) =>
-    pin.uuid === openUuid
-      ? lighten(letterColor(pin.letter), 0.28)
-      : letterColor(pin.letter);
+    pin.uuid === openUuid ? lighten(ownColor(pin), 0.28) : ownColor(pin);
   // What a new annotation here would be called, and therefore what colour it
   // would be: a preview is the annotation you are about to make.
   const nextColor = () => letterColor(nextLetter());
@@ -112,8 +117,14 @@
   const haloColor = () => (pageIsDark() ? "#0e0e0e" : "#ffffff");
 
   // ------------------------------------------------------------------- http
+  // Every endpoint sits under the page that uses it: one server can serve a
+  // whole directory, and `/a/paper/dev/html/doc` is that document's, while
+  // `/a/dev/html/doc` would be nobody's. The page's own URL ends in a slash, so
+  // it is the base to resolve them against.
+  const BASE = location.pathname.replace(/[^/]*$/, "");
+  const url = (path) => BASE + path.replace(/^\/?(dev\/)?/, "dev/");
   const post = (path, payload) =>
-    fetch(path, { method: "POST", body: JSON.stringify(payload) })
+    fetch(url(path), { method: "POST", body: JSON.stringify(payload) })
       .then((r) => r.json())
       .then((r) => {
         if (!r.ok) console.warn("tinymist annotation:", r.error);
@@ -124,7 +135,7 @@
         return { ok: false, error: String(e) };
       });
   const getJson = (path) =>
-    fetch(path)
+    fetch(url(path))
       .then((r) => r.json())
       .catch((e) => ({ ok: false, error: String(e) }));
 
@@ -687,7 +698,10 @@
     // pointer lands on the innermost, so walk out until something is known.
     while (el) {
       const atom = atoms.find((known) => known.el === el);
-      if (atom) return atom;
+      // One that is already annotated is not offered again: the ground around
+      // an equation belongs to the mark already on it, and a click there opens
+      // that annotation rather than starting a second one over it.
+      if (atom) return takenBlocks.has(atom.el) ? null : atom;
       el = el.parentElement && el.parentElement.closest(ATOM_SELECTOR);
     }
     return null;
@@ -825,6 +839,19 @@
     return boxes.length ? boxes : [el.getBoundingClientRect()];
   };
 
+  // What a region annotation is drawn around: the ink of the element, not its
+  // border box. A block is as wide as the column whatever is in it, so a
+  // figure holding a centred drawing would otherwise be marked — and offered —
+  // with a rectangle reaching far past the picture on both sides.
+  const blockBox = (el) => {
+    const boxes = inkOf(el);
+    const top = Math.min(...boxes.map((b) => b.top));
+    const bottom = Math.max(...boxes.map((b) => b.bottom));
+    const left = Math.min(...boxes.map((b) => b.left));
+    const right = Math.max(...boxes.map((b) => b.right));
+    return { top, bottom, left, right, width: right - left, height: bottom - top };
+  };
+
   const geometryOf = (pin) => {
     const scope = pin.scope || "point";
     if (scope === "span") {
@@ -836,7 +863,7 @@
     }
     if (scope === "math" || scope === "link" || scope === "raw" || scope === "inline") {
       const atom = atomEndingAt(pin.start, scope);
-      return atom ? { scope, boxes: atomBoxes(atom) } : null;
+      return atom ? { scope, boxes: atomBoxes(atom), el: atom.el } : null;
     }
     if (scope === "svg") {
       // A drawing is a picture, marked as one: a frame around all of it.
@@ -870,11 +897,13 @@
       const box = gapBox(point.node, point.index);
       return { scope, boxes: [box], caret: box };
     }
-    // A region: the box of the element the anchor landed in, of the kind the
-    // annotation was made on.
+    // A region: the ink of the element the anchor landed in, of the kind the
+    // annotation was made on. Its border box is the width of the column
+    // whatever is in it, so a figure holding a centred drawing would be marked
+    // with a rectangle reaching far past the picture on both sides.
     const block = blockCovering(pin.start, scope);
     if (!block) return null;
-    return { scope, boxes: [block.el.getBoundingClientRect()], block };
+    return { scope, boxes: inkOf(block.el), block };
   };
 
   // Where an item's bullet is, and the line it is on. A list marker is drawn
@@ -1304,7 +1333,7 @@
       el.style.color = darkTint(pinColor(pin));
       el.style.opacity = pinOpacity(pin);
       el.style.boxShadow = selected
-        ? `0 0 6px 2px ${letterColor(pin.letter)}, 0 0 12px 3px ${letterColor(pin.letter)}66`
+        ? `0 0 6px 2px ${ownColor(pin)}, 0 0 12px 3px ${ownColor(pin)}66`
         : "";
       // A chip in the lane follows its text frame by frame and must not lag
       // behind it; the turns onto and off the rows are what the animation is
@@ -1383,14 +1412,24 @@
   // The whole overlay, redrawn from the pins and the document's current
   // geometry. Cheap enough to run on every scroll: it is a few dozen boxes.
   let ghost = null;
+  // Which regions already carry a mark, by element and kind, so that the
+  // margin that offers a new annotation stops offering one over an old.
+  const takenBlocks = new Map();
   const render = () => {
     const host = marksHost();
     for (const el of host.children) el.dataset.seen = "";
     const list = ghost ? pins.concat([ghost]) : pins;
     const marked = [];
+    takenBlocks.clear();
     for (const pin of list) {
       const geom = geometryOf(pin);
       if (!geom || !geom.boxes.length) continue;
+      const on = (geom.block && geom.block.el) || geom.el;
+      if (on) {
+        let kinds = takenBlocks.get(on);
+        if (!kinds) takenBlocks.set(on, (kinds = new Set()));
+        kinds.add((geom.block && geom.block.kind) || geom.scope);
+      }
       const top = Math.min(...geom.boxes.map((b) => b.top));
       const bot = Math.max(...geom.boxes.map((b) => b.bottom));
       // The mark itself is only drawn where its text is; the chip is drawn
@@ -1432,8 +1471,7 @@
     clearHover();
     const host = marksHost();
     const drawing = block.el.localName === "math" || block.el.localName === "svg";
-    const box =
-      block.el.localName === "math" ? inkOf(block.el)[0] : block.el.getBoundingClientRect();
+    const box = blockBox(block.el);
     if (drawing) {
       const el = hoverMark(host, "tm-box");
       crawlBox(el, nextColor());
@@ -1516,7 +1554,12 @@
   const regionZoneAt = (x, y) => {
     let best = null;
     for (const block of blocks) {
-      const box = block.el.getBoundingClientRect();
+      // A region that already carries an annotation of this kind is not
+      // offered a second one: the ground under the pointer belongs to the mark
+      // that is already there, which is what a click there opens.
+      const taken = takenBlocks.get(block.el);
+      if (taken && taken.has(block.kind)) continue;
+      const box = blockBox(block.el);
       if (block.kind === "item") {
         // The marker's own ground: the ring around it, and the room its letter
         // takes to the left — and only on the item's first line, where the
@@ -1731,7 +1774,7 @@
     if (!parts) return;
     openUuid = pin.uuid;
     openSig = pinSig(pin);
-    const hue = letterColor(pin.letter);
+    const hue = ownColor(pin);
     parts.content.append(msgRow(hue, pin.author, pin.time, pin.content, true));
     for (const reply of pin.discussion || []) {
       parts.content.append(msgRow(hue, reply.author, reply.time, reply.content, false));
@@ -1791,7 +1834,7 @@
     const submit = (field) => {
       const text = field.value.trim();
       if (text) {
-        post("/dev/annotate", { uuid: freshUuid(), text, ...payload }).then(refresh);
+        post("/dev/annotate", { uuid: freshUuid(), text, color: nextColor(), ...payload }).then(refresh);
       }
       closeBox(true);
     };
@@ -2074,25 +2117,32 @@
   // story.
   let compileErrors = null;
 
+  // The rendering this page is showing, as it was fetched. The document is a
+  // file on the server — written when it compiled, not made afresh for each
+  // reader — so this is a plain fetch with the browser's own revalidation
+  // behind it, and the body is only replaced when it actually differs:
+  // rewriting it drops the selection, and every compile would otherwise
+  // flicker the page.
+  let shownBody = null;
   const loadDocument = () =>
-    getJson("/dev/html/doc").then((res) => {
-      if (!res || !res.ok) {
-        if (!compileErrors) {
-          showStatus([res && res.error ? res.error : "cannot load the document"]);
+    fetch(BASE + "body.html", { cache: "no-cache" })
+      .then((r) => (r.ok ? r.text() : null))
+      .then((body) => {
+        if (body === null) {
+          if (!compileErrors) showStatus(["cannot load the document"]);
+          return;
         }
-        return;
-      }
-      const doc = document.getElementById(DOC_ID);
-      if (!doc) return;
-      // Only replace the document when it actually changed: rewriting it drops
-      // the selection, and every compile would otherwise flicker the page.
-      if (doc.dataset.sig !== res.body) {
-        doc.dataset.sig = res.body;
-        doc.innerHTML = res.body;
-        indexDocument();
-      }
-      if (res.title) document.title = res.title;
-    });
+        const doc = document.getElementById(DOC_ID);
+        if (!doc) return;
+        if (shownBody !== body) {
+          shownBody = body;
+          doc.innerHTML = body;
+          indexDocument();
+        }
+      })
+      .catch(() => {
+        if (!compileErrors) showStatus(["cannot load the document"]);
+      });
 
   const loadPins = () =>
     getJson("/dev/html/pins").then((res) => {
@@ -2105,8 +2155,9 @@
   });
 
   let assetVersion = null;
+  let docVersion = null;
   const listen = () => {
-    const sse = new EventSource("/dev/diagnostics");
+    const sse = new EventSource(url("/dev/diagnostics"));
     sse.onmessage = (ev) => {
       let data = null;
       try {
@@ -2118,6 +2169,17 @@
       else if (data.assetVersion !== assetVersion) return void location.reload();
       compileErrors = data.ok ? null : data.messages;
       showStatus(compileErrors);
+      // A compile that produced the same page is not a reason to fetch it
+      // again: the annotations may have moved, the document has not.
+      const version = data.docVersion;
+      if (docVersion !== null && version === docVersion) {
+        loadPins().then(() => {
+          render();
+          refreshOpen();
+        });
+        return;
+      }
+      docVersion = version === undefined ? docVersion : version;
       refresh();
     };
     sse.onerror = () => {

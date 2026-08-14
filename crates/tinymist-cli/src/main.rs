@@ -16,6 +16,10 @@ mod cmd {
     pub mod package;
     #[cfg(feature = "preview")]
     pub mod preview;
+    #[cfg(feature = "preview")]
+    pub mod docsite;
+    #[cfg(feature = "preview")]
+    pub mod serve;
     pub mod query;
     pub mod test;
     pub mod trace_lsp;
@@ -94,14 +98,12 @@ enum Commands {
     #[clap(hide(true))] // still in development
     #[clap(subcommand)]
     Query(crate::query::QueryCommands),
+    /// Serve a file or directory as HTML
+    #[cfg(feature = "preview")]
+    Serve(crate::serve::ServeArgs),
     /// Run preview server
     #[cfg(feature = "preview")]
     Preview(tinymist::tool::preview::PreviewCliArgs),
-    /// Run preview server in annotation mode: the web view is locked to
-    /// reading and writing annotations (plain click annotates; no editor
-    /// following or click-to-jump).
-    #[cfg(feature = "preview")]
-    Annotate(tinymist::tool::preview::PreviewCliArgs),
     /// Run compile command like `typst-cli compile`
     #[cfg(feature = "export")]
     #[clap(alias = "c")]
@@ -172,7 +174,7 @@ fn main() -> Result<()> {
         #[cfg(feature = "preview")]
         Commands::Preview(preview) => preview.verbose,
         #[cfg(feature = "preview")]
-        Commands::Annotate(preview) => preview.verbose,
+        Commands::Serve(serve) => serve.verbose,
 
         // Long-running commands, usually run from an editor.
         Commands::Lsp(..) => true,
@@ -189,9 +191,18 @@ fn main() -> Result<()> {
         #[cfg(feature = "lock")]
         Commands::Task(..) => true,
     };
+    // Serving prints its own address block; the preview server's own address
+    // logging would arrive alongside it as two decoys for the one line worth
+    // copying, so that target is turned down unless asked for.
+    #[cfg(feature = "preview")]
+    let quiet_preview = !verbose && matches!(cmd, Commands::Serve(..));
+    #[cfg(not(feature = "preview"))]
+    let quiet_preview = false;
     let _ = tinymist::init_log(tinymist::InitLogOpts {
         verbose,
-        filter: args.log_filter,
+        filter: args.log_filter.or_else(|| {
+            quiet_preview.then(|| "tinymist::compat::preview=warn".to_string())
+        }),
         output: None,
     });
 
@@ -212,10 +223,7 @@ fn main() -> Result<()> {
         #[cfg(feature = "preview")]
         Commands::Preview(args) => block_on(crate::preview::preview_main(args)),
         #[cfg(feature = "preview")]
-        Commands::Annotate(mut args) => {
-            args.annotate = true;
-            block_on(crate::preview::preview_main(args))
-        }
+        Commands::Serve(args) => crate::serve::serve_main(args),
         #[cfg(feature = "export")]
         Commands::Compile(args) => block_on(crate::compile::compile_main(args)),
         Commands::Lint(args) => crate::lint::lint_main(args),

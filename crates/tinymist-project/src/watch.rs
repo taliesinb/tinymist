@@ -519,11 +519,13 @@ impl<F: FnMut(FilesystemEvent) + Send + Sync> NotifyActor<F> {
             if announcing() {
                 // The paths, not a count: when a rebuild is unexpected the
                 // whole question is which file moved, and a sidecar the server
-                // wrote itself is the usual answer.
+                // wrote itself is the usual answer. Said the moment the change
+                // is seen; the compile it causes says so itself, later.
                 for path in event.paths.iter() {
+                    crate::note_change();
                     crate::announce(
-                        "recompile",
-                        &[("file", path.display().to_string().into())],
+                        "file_changed",
+                        &[("path", path.display().to_string().into())],
                     );
                 }
             }

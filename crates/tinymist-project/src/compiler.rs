@@ -1,5 +1,6 @@
 //! Project compiler for tinymist.
 
+use tinymist_world::ShadowApi;
 use core::fmt;
 use std::collections::HashSet;
 use std::path::Path;
@@ -982,10 +983,26 @@ impl<F: CompilerFeat, Ext: 'static> ProjectInsState<F, Ext> {
         self.cached_snapshot = None; // invalidate; will be recomputed on demand
 
         // Notifies the new file dependencies.
+        //
+        // Not the ones held in memory over a path that has no file: watching
+        // one is a loop. The watcher reports it missing, missing is a reason to
+        // compile, and the compile reports the same dependency again — which is
+        // why a served HTML document, compiled through a generated wrapper,
+        // recompiled fifteen times a second forever after its first edit. A
+        // shadow over a file that does exist stays watched: that file can change
+        // under the copy of it, and whoever holds the copy wants to know.
+        let shadowed: std::collections::HashSet<_> = world
+            .shadow_paths()
+            .into_iter()
+            .filter(|path| !path.exists())
+            .collect();
         let mut deps = eco_vec![];
         world.iter_dependencies(&mut |dep| {
             if let Ok(x) = world.file_path(dep).and_then(|e| e.to_err()) {
-                deps.push(x.into())
+                let path: ImmutPath = x.into();
+                if !shadowed.contains(&path) {
+                    deps.push(path);
+                }
             }
         });
 

@@ -120,10 +120,15 @@ pub fn install_shims(verse: &mut tinymist_project::LspUniverse) -> Result<ShimEn
     verse
         .map_shadow(&path, Bytes::from_string(source))
         .map_err(|err| format!("cannot install the HTML shims: {err}"))?;
+    let wrapper_main = wrapper_entry
+        .main()
+        .ok_or("cannot resolve the shim wrapper")?;
     verse
         .mutate_entry(wrapper_entry)
         .map_err(|err| format!("cannot compile through the HTML shims: {err:?}"))?;
-    super::annotations::set_doc_file(main);
+    // Named per wrapper: one process can serve a directory, and every document
+    // in it is compiled through a wrapper of its own.
+    super::annotations::set_doc_file(wrapper_main, main);
 
     Ok(ShimEntry {
         path,
@@ -179,6 +184,9 @@ pub struct HtmlPin {
     pub discussion: Vec<super::annotations::AnnotationReply>,
     /// What the annotation refers to.
     pub scope: String,
+    /// The colour it was made in, as `#rrggbb`, or empty when it predates the
+    /// field: the client falls back to its palette then.
+    pub color: String,
     /// The byte offset of the anchor in the source.
     pub start: usize,
     /// The byte offset the annotation reaches to: the end anchor of a span, or
@@ -428,6 +436,7 @@ fn pin_for(rec: &AnnotationRecord, text: &str) -> Option<HtmlPin> {
         status: rec.status.clone(),
         discussion: rec.discussion.clone(),
         scope: scope.as_str().into(),
+        color: rec.color.clone(),
         start,
         end,
     })
@@ -437,6 +446,12 @@ fn pin_for(rec: &AnnotationRecord, text: &str) -> Option<HtmlPin> {
 pub trait HtmlAnnotationServer: Send + Sync {
     /// The document as HTML, labelled with source ranges.
     fn document(&self) -> Result<String, String>;
+    /// The rendered body and the version it was rendered at: read from the
+    /// site the server writes as it compiles, and made here only if the first
+    /// compile has not landed yet.
+    fn body(&self) -> (String, u64) {
+        (String::new(), 0)
+    }
     /// Every annotation, with the source offsets of its anchors.
     fn pins(&self) -> Vec<HtmlPin>;
 }
@@ -451,6 +466,31 @@ impl HtmlAnnotationServer for ArtifactHtmlServer {
     fn document(&self) -> Result<String, String> {
         let art = self.last_art.lock().clone().ok_or("nothing compiled yet")?;
         html_document(&art)
+    }
+
+    fn body(&self) -> (String, u64) {
+        let art = self.last_art.lock().clone();
+        let Some(art) = art else {
+            return (String::new(), 0);
+        };
+        // What was written when this document last compiled. Rendering here is
+        // the fallback for a page that asked before the writer did — the first
+        // request of the first compile.
+        let cached = crate::tool::serve::site_cache().and_then(|cache| {
+            let world = art.world();
+            let path = world
+                .path_for_id(doc_file(world))
+                .ok()
+                .and_then(|path| path.to_err().ok())?;
+            let body = cache.body(path.as_ref())?;
+            Some((std::fs::read_to_string(&body.path).ok()?, body.version))
+        });
+        cached.unwrap_or_else(|| {
+            let body = html_document(&art)
+                .map(|html| fragment(&html).body)
+                .unwrap_or_default();
+            (body, 0)
+        })
     }
 
     fn pins(&self) -> Vec<HtmlPin> {

@@ -14,13 +14,16 @@
 use std::io::Read;
 
 /// The role a server plays, which the glyph announces.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum IconRole {
     /// The editor-driven preview: `>τ`.
+    #[value(name = "preview", alias = "lsp")]
     Lsp,
     /// A plain document server: `τ`.
+    #[value(name = "serve")]
     Serve,
     /// A document server with annotation enabled: `τ` underlined.
+    #[value(name = "annotate")]
     Annotate,
 }
 

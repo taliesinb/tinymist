@@ -2,7 +2,8 @@
 
 pub use compile::{PreviewCompileView, ProjectPreviewHandler};
 pub use annotations::{
-    annotation_pins, sidecar_path, AnnotateRequest, AnnotationPin, AnnotationServer,
+    annotation_pins, dev_asset, dev_asset_in, doc_file, sidecar_path, AnnotateRequest,
+    AnnotationPin, AnnotationServer, ANCHOR_PREFIX,
 };
 
 pub use error_overlay::{
@@ -84,13 +85,18 @@ pub struct PreviewArgs {
     ///
     /// `tinymist preview` does not write an output file, so this selects the
     /// Typst compilation target used by the live preview.
-    #[clap(long = "format", default_value = "paged", value_name = "FORMAT")]
+    #[clap(long = "format", default_value = "html", value_name = "FORMAT")]
     pub format: ExportTarget,
 
-    /// Preview the document as HTML rather than as pages. Shorthand for
-    /// `--format=html`, and the same spelling `talimist-serve` uses.
+    /// Preview the document as HTML. The default, and named so a command can
+    /// say what it means; the same spelling `talimist-serve` uses.
     #[clap(long = "html")]
     pub html: bool,
+
+    /// Preview the document as pages rendered to SVG, the way an editor's own
+    /// preview does. Shorthand for `--format=paged`.
+    #[clap(long = "paged-svg", alias = "paged")]
+    pub paged_svg: bool,
 
     /// Configure the preview mode.
     #[clap(long = "preview-mode", default_value = "document", value_name = "MODE")]
@@ -164,7 +170,15 @@ impl PreviewArgs {
     /// The compilation target the preview runs on, with the `--html`
     /// shorthand folded in.
     pub fn export_target(&self) -> ExportTarget {
-        if self.html { ExportTarget::Html } else { self.format }
+        // Said outright wins over the default, and pages win over HTML: a
+        // command that names both meant the narrower one.
+        if self.paged_svg {
+            ExportTarget::Paged
+        } else if self.html {
+            ExportTarget::Html
+        } else {
+            self.format
+        }
     }
 
     /// Get the configuration for the preview.
@@ -230,6 +244,13 @@ pub struct PreviewCliArgs {
     /// ("Typst Server: Foo"). Without it the name falls back to the port.
     #[clap(long = "root-name", value_name = "NAME")]
     pub root_name: Option<String>,
+
+    /// Which face this server wears: `preview` for an editor's own live
+    /// preview, `serve` for a document served to be read, `annotate` for one
+    /// served to be annotated. It decides the name, the icon, and the URL
+    /// prefix everything is served under. `--annotate` implies `annotate`.
+    #[clap(long = "role", value_name = "ROLE", default_value = "preview")]
+    pub role: icons::IconRole,
 
     /// Give the document a window of its own: a web app installed from this
     /// URL if there is one, else the nearest thing the browser offers.
@@ -353,6 +374,12 @@ impl WebAppIdentity {
         Self { role, ..self.clone() }
     }
 
+    /// The identity of one document out of several: a directory's server is
+    /// named after the directory, and each page in it after its own document.
+    pub fn with_name(&self, name: String) -> Self {
+        Self { name: Some(name), ..self.clone() }
+    }
+
     /// What is being served, as a person would name it.
     fn subject(&self, port: u16) -> String {
         self.name.clone().unwrap_or_else(|| port.to_string())
@@ -404,16 +431,54 @@ pub fn build_stamp() -> String {
         .clone()
 }
 
+/// Where each mode lives, as the first segment of every URL it serves: `/p/`
+/// for the editor's preview, `/v/` for a document served to be read, `/a/` for
+/// one served to be annotated.
+///
+/// A prefix rather than a page, because an installed web app matches links
+/// against its manifest's scope: everything under `/a/` belongs to the
+/// annotator, whatever document it names, so a document opened from a listing
+/// lands in the same app as one opened directly. The document is the rest of
+/// the path, which is how one server comes to serve a whole directory.
+pub fn role_prefix(role: icons::IconRole) -> &'static str {
+    match role {
+        icons::IconRole::Lsp => "/p/",
+        icons::IconRole::Serve => "/v/",
+        icons::IconRole::Annotate => "/a/",
+    }
+}
+
+/// The mode a path asks for, and the document under it, if it names one at
+/// all. `/a` and `/a/` both mean the annotator's own front page.
+pub fn role_of_path(path: &str) -> Option<(icons::IconRole, &str)> {
+    for role in [
+        icons::IconRole::Lsp,
+        icons::IconRole::Serve,
+        icons::IconRole::Annotate,
+    ] {
+        let prefix = role_prefix(role);
+        if path == prefix.trim_end_matches('/') {
+            return Some((role, ""));
+        }
+        if let Some(rest) = path.strip_prefix(prefix) {
+            return Some((role, rest));
+        }
+    }
+    None
+}
+
 /// The web-app furniture: each mode is a page of its own, with its own name,
 /// icon and manifest, so both can live in the Dock side by side. Safari takes
 /// the name, start URL, icons and scope from the manifest when there is one,
-/// and treats in-scope links as belonging to that app — which is why the
-/// annotate scope is the narrower `/annotate`.
+/// and treats in-scope links as belonging to that app — which is what the
+/// per-mode prefix is for.
 pub fn mode_head(html: &str, identity: &WebAppIdentity, port: u16) -> String {
+    let prefix = role_prefix(identity.role);
+    let manifest = format!("{prefix}manifest.webmanifest");
     let (manifest, icon) = match identity.role {
-        icons::IconRole::Lsp => ("/manifest.webmanifest", "/icon/lsp-192.png"),
-        icons::IconRole::Serve => ("/manifest.webmanifest", "/icon/serve-192.png"),
-        icons::IconRole::Annotate => ("/annotate/manifest.webmanifest", "/icon/anno-192.png"),
+        icons::IconRole::Lsp => (manifest.as_str(), "/icon/lsp-192.png"),
+        icons::IconRole::Serve => (manifest.as_str(), "/icon/serve-192.png"),
+        icons::IconRole::Annotate => (manifest.as_str(), "/icon/anno-192.png"),
     };
     let title = identity.title(port);
     let head = format!(
@@ -506,13 +571,19 @@ pub fn icon_asset(path: &str, port: u16, identity: &WebAppIdentity) -> Option<Ve
 
 /// The web app manifest for a mode's path, if it names one.
 pub fn web_manifest(path: &str, port: u16, identity: &WebAppIdentity) -> Option<String> {
-    let (identity, start, scope) = match path {
-        "/manifest.webmanifest" => (identity.clone(), "/", "/"),
-        "/annotate/manifest.webmanifest" => (
-            identity.with_role(icons::IconRole::Annotate),
-            "/annotate",
-            "/annotate",
-        ),
+    // One manifest per mode, at that mode's own prefix, so an installed app's
+    // scope is the prefix and every document under it belongs to that app.
+    let (identity, start, scope) = match role_of_path(path) {
+        Some((role, "manifest.webmanifest")) => {
+            let prefix = role_prefix(role);
+            (identity.with_role(role), prefix, prefix)
+        }
+        // The bare one names whatever this server is, for a browser that asks
+        // before being redirected into a prefix.
+        _ if path == "/manifest.webmanifest" => {
+            let prefix = role_prefix(identity.role);
+            (identity.clone(), prefix, prefix)
+        }
         _ => return None,
     };
     let icon = match identity.role {
@@ -1056,8 +1127,16 @@ impl PreviewState {
                 frontend_html,
                 args.data_plane_host,
                 websocket_tx,
-                diag_rx,
-                annot,
+                // One document, the one the editor is looking at. The
+                // editor-driven preview is paged, so it has no HTML to serve.
+                Arc::new(crate::tool::serve::SingleSite {
+                    doc: Arc::new(crate::tool::serve::DocServices {
+                        title: String::new(),
+                        diag_rx,
+                        annot,
+                        html: None,
+                    }),
+                }),
                 // The editor owns this one's lifetime.
                 false,
                 WebAppIdentity {
@@ -1066,8 +1145,6 @@ impl PreviewState {
                     // The project, supplied by whoever started this server.
                     name: args.root_name.clone(),
                 },
-                // The editor-driven preview is paged; HTML mode is a CLI mode.
-                None,
                 args.allowed_origins.clone(),
             )
             .await;
@@ -1351,13 +1428,27 @@ impl DiskAnnotationServer {
         Ok(())
     }
 
-    fn emit(&self, event: serde_json::Value) {
+    /// One event, as one line of JSON on stdout — where a driving agent reads
+    /// them, unlike the server's own narration, which goes to stderr.
+    ///
+    /// Written field by field rather than serialised from a map, for the same
+    /// reason the narration is: `type` first, `ts` last, and the rest in the
+    /// order they were written, so the line reads the way it was designed to.
+    fn emit(&self, kind: &str, fields: &[(&str, serde_json::Value)]) {
         if !self.emit_events {
             return;
         }
+        let mut line = format!("{{\"type\":{}", serde_json::Value::from(kind));
+        for (key, value) in fields {
+            line.push_str(&format!(",{}:{value}", serde_json::Value::from(*key)));
+        }
+        line.push_str(&format!(
+            ",\"ts\":{}}}",
+            serde_json::Value::from(tinymist_project::iso_now())
+        ));
         use std::io::Write;
         let mut out = std::io::stdout().lock();
-        let _ = serde_json::to_writer(&mut out, &event);
+        let _ = out.write_all(line.as_bytes());
         let _ = out.write_all(b"\n");
         let _ = out.flush();
     }
@@ -1379,7 +1470,10 @@ impl AnnotationServer for DiskAnnotationServer {
             .into_iter()
             .find(|rec| rec.uuid == edit.uuid);
         if let Some(record) = record {
-            self.emit(serde_json::json!({ "type": "annotation_added", "value": record }));
+            self.emit(
+                "annotation_added",
+                &[("value", serde_json::to_value(&record).unwrap_or_default())],
+            );
         }
         Ok(edit.uuid)
     }
@@ -1395,7 +1489,7 @@ impl AnnotationServer for DiskAnnotationServer {
             Ok((edit.sidecar.clone(), edit.sidecar_content.clone(), edit))
         })?;
         self.apply_doc(&edit)?;
-        self.emit(serde_json::json!({ "type": "annotation_deleted", "uuid": uuid }));
+        self.emit("annotation_deleted", &[("uuid", uuid.into())]);
         Ok(())
     }
 
@@ -1406,12 +1500,14 @@ impl AnnotationServer for DiskAnnotationServer {
             Ok((path, content, ()))
         })?;
         self.push_pins();
-        self.emit(serde_json::json!({
-            "type": "discussion_extended",
-            "uuid": uuid,
-            "author": annotations::local_author(),
-            "text": text,
-        }));
+        self.emit(
+            "discussion_extended",
+            &[
+                ("uuid", uuid.into()),
+                ("author", annotations::local_author().into()),
+                ("text", text.into()),
+            ],
+        );
         Ok(())
     }
 
@@ -1422,11 +1518,10 @@ impl AnnotationServer for DiskAnnotationServer {
             Ok((path, content, ()))
         })?;
         self.push_pins();
-        self.emit(serde_json::json!({
-            "type": "annotation_status_changed",
-            "uuid": uuid,
-            "status": status,
-        }));
+        self.emit(
+            "annotation_status_changed",
+            &[("uuid", uuid.into()), ("status", status.into())],
+        );
         Ok(())
     }
 

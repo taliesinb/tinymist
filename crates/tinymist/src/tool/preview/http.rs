@@ -27,11 +27,9 @@ pub async fn make_http_server(
     frontend_html: String,
     static_file_addr: String,
     websocket_tx: mpsc::UnboundedSender<HyperWebsocket>,
-    diag_rx: Option<super::DiagRx>,
-    annot: Option<std::sync::Arc<dyn super::AnnotationServer>>,
+    site: std::sync::Arc<dyn crate::tool::serve::DocumentSite>,
     shutdown_on_last_client: bool,
     identity: super::WebAppIdentity,
-    html: Option<std::sync::Arc<dyn super::html_annotations::HtmlAnnotationServer>>,
     allowed_origins: Vec<String>,
 ) -> HttpServer {
     use futures::StreamExt;
@@ -79,7 +77,9 @@ pub async fn make_http_server(
     // Clients are numbered from zero as they arrive, so the line that says one
     // has gone can name which one it was.
     let next_client = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let site = site.clone();
     let make_service = {
+        let site = site.clone();
         let live = live.clone();
         let served_anyone = served_anyone.clone();
         let identity = identity.clone();
@@ -89,9 +89,7 @@ pub async fn make_http_server(
         let frontend_html = frontend_html.clone();
         let websocket_tx = websocket_tx.clone();
         let static_file_addr = static_file_addr.clone();
-        let diag_rx = diag_rx.clone();
-        let annot = annot.clone();
-        let html = html.clone();
+        let site = site.clone();
         let live = live.clone();
         let served_anyone = served_anyone.clone();
         let identity = identity.clone();
@@ -103,9 +101,7 @@ pub async fn make_http_server(
             let frontend_html = frontend_html.clone();
             let websocket_tx = websocket_tx.clone();
             let static_file_addr = static_file_addr.clone();
-            let diag_rx = diag_rx.clone();
-            let annot = annot.clone();
-            let html = html.clone();
+            let site = site.clone();
             let next_client = next_client.clone();
             let live = live.clone();
             let served_anyone = served_anyone.clone();
@@ -143,6 +139,42 @@ pub async fn make_http_server(
                         .and_then(|v| v.to_str().ok())
                         .unwrap_or("-"),
                 );
+                // Which document this request is about, and what it asks of
+                // it. A directory names the document in the first segment
+                // after the mode's prefix — `/a/paper/dev/html/doc` — and a
+                // single document leaves it out, so the same dispatch serves
+                // both and every endpoint sits under the page that uses it.
+                let raw_path = req.uri().path().to_owned();
+                let listing = site.is_listing();
+                let (page_role, slug, path) = match super::role_of_path(&raw_path) {
+                    // The site's own endpoints — the listing's data, chiefly —
+                    // are not a document called `dev`.
+                    Some((role, rest)) if listing && rest.starts_with("dev/") => {
+                        (Some(role), String::new(), format!("/{rest}"))
+                    }
+                    Some((role, rest)) if listing => match rest.split_once('/') {
+                        Some((slug, tail)) => (Some(role), slug.to_owned(), format!("/{tail}")),
+                        None => (Some(role), rest.to_owned(), String::new()),
+                    },
+                    Some((role, rest)) => (Some(role), String::new(), format!("/{rest}")),
+                    // Assets and the paged frontend's own endpoints are named
+                    // absolutely, from a page that is always the only one.
+                    None => (None, String::new(), raw_path.clone()),
+                };
+                let path = path.as_str();
+                // Building a document is compiling it, so it happens when one
+                // is asked for and not before: a directory of thirty papers is
+                // thirty compilers otherwise, to show a list of names.
+                let wants_doc = page_role.is_some() || path.starts_with("/dev/");
+                let doc = if wants_doc && !(listing && slug.is_empty()) {
+                    site.services(&slug).await
+                } else {
+                    None
+                };
+                let diag_rx = doc.as_ref().and_then(|d| d.diag_rx.clone());
+                let annot = doc.as_ref().and_then(|d| d.annot.clone());
+                let html = doc.as_ref().and_then(|d| d.html.clone());
+
                 // Check if the request is a websocket upgrade request.
                 if hyper_tungstenite::is_upgrade_request(&req) {
                     if origin_header.is_none() {
@@ -159,38 +191,102 @@ pub async fn make_http_server(
 
                     // Return the response so the spawned future can continue.
                     Ok(response.map(|b| Body::new(b)))
-                } else if req.uri().path() == "/" || req.uri().path() == "/annotate" {
-                    // Two paths, one document: the mode rides in the URL, so each
-                    // has its own manifest, icon and dock app.
-                    let identity = if req.uri().path() == "/annotate" {
-                        identity.with_role(super::icons::IconRole::Annotate)
-                    } else {
-                        (*identity).clone()
-                    };
-                    let html = super::mode_head(
-                        std::str::from_utf8(&frontend_html).unwrap_or_default(),
-                        &identity,
-                        port,
-                    );
-                    let res = hyper::Response::builder()
-                        .header(hyper::header::CONTENT_TYPE, "text/html")
-                        .body(Body::new(Full::<Bytes>::from(html)))
-                        .unwrap();
-                    Ok(res)
-                } else if let Some(icon) = super::icon_asset(req.uri().path(), port, &identity) {
+                } else if let Some(icon) = super::icon_asset(&raw_path, port, &identity) {
                     let res = hyper::Response::builder()
                         .header(hyper::header::CONTENT_TYPE, "image/png")
                         .header(hyper::header::CACHE_CONTROL, "max-age=3600")
                         .body(Body::new(Full::<Bytes>::from(icon)))
                         .unwrap();
                     Ok(res)
-                } else if let Some(manifest) = super::web_manifest(req.uri().path(), port, &identity) {
+                } else if let Some(manifest) = super::web_manifest(&raw_path, port, &identity) {
                     let res = hyper::Response::builder()
                         .header(hyper::header::CONTENT_TYPE, "application/manifest+json")
                         .body(Body::new(Full::<Bytes>::from(manifest)))
                         .unwrap();
                     Ok(res)
-                } else if req.uri().path() == "/dev/diagnostics" && diag_rx.is_some() {
+                } else if let (Some(role), true) = (page_role, path.is_empty() || path == "/") {
+                    if tinymist_project::announcing() {
+                        // The id a page will answer to: a page opens its event
+                        // stream as soon as it loads, and takes the next number
+                        // when it does, so a request and the client it becomes
+                        // read as one story.
+                        let id = next_client.load(std::sync::atomic::Ordering::SeqCst);
+                        tinymist_project::announce(
+                            "client_requested",
+                            &[("id", id.into()), ("url", raw_path.clone().into())],
+                        );
+                    }
+                    // The mode rides in the URL's first segment, so each has its
+                    // own manifest, icon and dock app — and the rest of the path
+                    // names the document, which is how one server comes to serve
+                    // a directory.
+                    let identity = identity.with_role(role);
+                    if listing && slug.is_empty() {
+                        // The directory's own front page. It holds no documents
+                        // — it asks for them — so it is the same page whatever
+                        // is in the directory, and can be an asset like the
+                        // annotator's own script and stylesheet.
+                        let body = super::mode_head(&crate::tool::serve::listing_html(), &identity, port);
+                        return Ok(hyper::Response::builder()
+                            .header(hyper::header::CONTENT_TYPE, "text/html")
+                            .body(Body::new(Full::<Bytes>::from(body)))
+                            .unwrap());
+                    }
+                    if doc.is_none() {
+                        return Ok(hyper::Response::builder()
+                            .status(hyper::StatusCode::NOT_FOUND)
+                            .header(hyper::header::CONTENT_TYPE, "text/plain")
+                            .body(Body::new(Full::<Bytes>::from(format!(
+                                "no document named {slug}\n"
+                            ))))
+                            .unwrap());
+                    }
+                    // Every endpoint a page uses sits under the page's own URL,
+                    // which is only a base to resolve them against if it ends
+                    // in a slash.
+                    if path.is_empty() {
+                        return Ok(hyper::Response::builder()
+                            .status(hyper::StatusCode::MOVED_PERMANENTLY)
+                            .header(hyper::header::LOCATION, format!("{raw_path}/"))
+                            .body(Body::new(Full::<Bytes>::default()))
+                            .unwrap());
+                    }
+                    let named = doc
+                        .as_ref()
+                        .map(|d| d.title.clone())
+                        .filter(|title| !title.is_empty())
+                        .map(|title| identity.with_name(title));
+                    let identity = named.unwrap_or(identity);
+                    let page = super::mode_head(
+                        std::str::from_utf8(&frontend_html).unwrap_or_default(),
+                        &identity,
+                        port,
+                    );
+                    let res = hyper::Response::builder()
+                        .header(hyper::header::CONTENT_TYPE, "text/html")
+                        .body(Body::new(Full::<Bytes>::from(page)))
+                        .unwrap();
+                    Ok(res)
+                } else if path == "/dev/docs" && listing {
+                    // What the listing page draws: the directory as it is now.
+                    let began = std::time::Instant::now();
+                    let entries = site.listing();
+                    tinymist_project::announce(
+                        "compiled_listing",
+                        &[
+                            ("path", site.root().display().to_string().into()),
+                            ("file_count", entries.len().into()),
+                            ("elapsed", began.elapsed().as_secs_f64().into()),
+                        ],
+                    );
+                    let body =
+                        crate::tool::serve::listing_json(&identity.title(port), site.root(), &entries);
+                    let res = hyper::Response::builder()
+                        .header(hyper::header::CONTENT_TYPE, "application/json")
+                        .body(Body::new(Full::<Bytes>::from(body)))
+                        .unwrap();
+                    Ok(res)
+                } else if path == "/dev/diagnostics" && diag_rx.is_some() {
                     // Stream diagnostics updates as server-sent events.
                     let rx = diag_rx.unwrap();
                     let init = rx.borrow().clone();
@@ -261,7 +357,7 @@ pub async fn make_http_server(
                         .body(Body::new(StreamBody::new(stream)))
                         .unwrap();
                     Ok(res)
-                } else if req.uri().path() == "/dev/overlay.js" && diag_rx.is_some() {
+                } else if path == "/dev/overlay.js" && diag_rx.is_some() {
                     // Read from the source tree per request so overlay
                     // script edits apply on browser reload, no rebuild.
                     let res = hyper::Response::builder()
@@ -270,7 +366,7 @@ pub async fn make_http_server(
                         .body(Body::new(Full::<Bytes>::from(super::overlay_js())))
                         .unwrap();
                     Ok(res)
-                } else if req.uri().path() == "/dev/build" {
+                } else if path == "/dev/build" {
                     // Which build is answering. A server whose binary has been
                     // replaced is on its way out but still holds its socket for
                     // a moment; whoever is starting up needs to know that the
@@ -281,7 +377,7 @@ pub async fn make_http_server(
                         .body(Body::new(Full::<Bytes>::from(super::build_stamp())))
                         .unwrap();
                     Ok(res)
-                } else if req.uri().path() == "/dev/clientlog" {
+                } else if path == "/dev/clientlog" {
                     // Frontend errors: logged to stderr and appended to a
                     // well-known file so they can be found after the fact.
                     use http_body_util::BodyExt;
@@ -304,13 +400,59 @@ pub async fn make_http_server(
                         .body(Body::new(Full::<Bytes>::default()))
                         .unwrap();
                     Ok(res)
-                } else if req.uri().path().starts_with("/dev/html/") && html.is_some() {
+                } else if path == "/body.html" && html.is_some() {
+                    // The rendered document, from disk: written once when it
+                    // compiled, and read by everyone who asks for it. The
+                    // version it was written at is its entity tag, so a browser
+                    // that already has this rendering is told so and keeps it.
+                    let html = html.unwrap();
+                    let (body, version) = html.body();
+                    let tag = format!("\"{version}\"");
+                    let known = req
+                        .headers()
+                        .get(hyper::header::IF_NONE_MATCH)
+                        .and_then(|value| value.to_str().ok())
+                        .is_some_and(|value| value == tag);
+                    let res = if known {
+                        hyper::Response::builder()
+                            .status(hyper::StatusCode::NOT_MODIFIED)
+                            .header(hyper::header::ETAG, tag)
+                            .body(Body::new(Full::<Bytes>::default()))
+                            .unwrap()
+                    } else {
+                        hyper::Response::builder()
+                            .header(hyper::header::CONTENT_TYPE, "text/html")
+                            .header(hyper::header::CACHE_CONTROL, "no-cache")
+                            .header(hyper::header::ETAG, tag)
+                            .body(Body::new(Full::<Bytes>::from(body)))
+                            .unwrap()
+                    };
+                    Ok(res)
+                } else if path == "/dev/html/annotate.js" || path == "/dev/html/annotate.css" {
+                    // The client itself, which is the same for every document
+                    // and for the listing: asked for without one, and read from
+                    // the source tree per request so an edit applies on reload.
+                    let (body, mime) = if path.ends_with(".js") {
+                        (
+                            super::html_annotations::client_js(),
+                            "application/javascript",
+                        )
+                    } else {
+                        (super::html_annotations::client_css(), "text/css")
+                    };
+                    let res = hyper::Response::builder()
+                        .header(hyper::header::CONTENT_TYPE, mime)
+                        .header(hyper::header::CACHE_CONTROL, "no-cache")
+                        .body(Body::new(Full::<Bytes>::from(body)))
+                        .unwrap();
+                    Ok(res)
+                } else if path.starts_with("/dev/html/") && html.is_some() {
                     // HTML mode's own endpoints. The document arrives as a
                     // fragment with every piece labelled with the source range
                     // it came from; the annotations arrive as source offsets.
                     // Geometry is the browser's business here, so none is sent.
                     let html = html.unwrap();
-                    let (body, mime) = match req.uri().path() {
+                    let (body, mime) = match path {
                         "/dev/html/annotate.js" => (
                             super::html_annotations::client_js(),
                             "application/javascript",
@@ -354,14 +496,14 @@ pub async fn make_http_server(
                         .body(Body::new(Full::<Bytes>::from(body)))
                         .unwrap();
                     Ok(res)
-                } else if req.uri().path() == "/dev/annotations.js" && annot.is_some() {
+                } else if path == "/dev/annotations.js" && annot.is_some() {
                     let res = hyper::Response::builder()
                         .header(hyper::header::CONTENT_TYPE, "application/javascript")
                         .header(hyper::header::CACHE_CONTROL, "no-cache")
                         .body(Body::new(Full::<Bytes>::from(super::annotations_js())))
                         .unwrap();
                     Ok(res)
-                } else if req.uri().path().starts_with("/dev/annotate") && annot.is_some() {
+                } else if path.starts_with("/dev/annotate") && annot.is_some() {
                     // Annotation endpoints: POST /dev/annotate creates an
                     // annotation at a clicked position; POST
                     // /dev/annotate/delete removes one by id.
@@ -374,7 +516,7 @@ pub async fn make_http_server(
                         #[serde(default)]
                         status: String,
                     }
-                    let path = req.uri().path().to_owned();
+                    let path = path.to_owned();
                     let annot = annot.unwrap();
                     // Resolved before the body is consumed, and imposed on the
                     // request afterwards: whatever the client claimed about
@@ -526,10 +668,16 @@ pub async fn make_http_server(
                         .unwrap();
                     Ok(res)
                 } else {
-                    // jump to /
+                    // Anything else is a page asked for without a mode: send it
+                    // into this server's own, keeping whatever it named.
+                    let target = format!(
+                        "{}{}",
+                        super::role_prefix(identity.role),
+                        raw_path.trim_start_matches('/')
+                    );
                     let res = hyper::Response::builder()
                         .status(hyper::StatusCode::FOUND)
-                        .header(hyper::header::LOCATION, "/")
+                        .header(hyper::header::LOCATION, target)
                         .body(Body::new(Full::<Bytes>::default()))
                         .unwrap();
                     Ok(res)

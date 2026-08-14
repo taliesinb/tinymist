@@ -33,9 +33,16 @@ use typst::World;
 /// edited without rebuilding — falling back to the copy embedded at build
 /// time. The source tree path is baked in at build time, which is exactly
 /// right for a locally-built binary.
-pub(crate) fn dev_asset(rel: &str, embedded: &'static str) -> String {
+pub fn dev_asset(rel: &str, embedded: &'static str) -> String {
+    dev_asset_in("preview", rel, embedded)
+}
+
+/// The same, for an asset that belongs to another tool: `dir` is the directory
+/// under `src/tool` it lives in.
+pub fn dev_asset_in(dir: &str, rel: &str, embedded: &'static str) -> String {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("src/tool/preview")
+        .join("src/tool")
+        .join(dir)
         .join(rel);
     std::fs::read_to_string(path).unwrap_or_else(|_| embedded.to_owned())
 }
@@ -74,8 +81,17 @@ pub struct AnnotationRecord {
     /// The annotation kind: "comment" | "question" | "request".
     #[serde(rename = "type")]
     pub rtype: String,
-    /// The unique id, e.g. "7C42"; the document anchor is `<-7C42->`.
+    /// The unique id, e.g. "7C42"; the document anchor is `<anno.7C42.word>`.
     pub uuid: String,
+    /// What the annotation refers to: the same word as the anchor's suffix,
+    /// written out so the sidecar reads on its own, without the document.
+    #[serde(default)]
+    pub scope: String,
+    /// The colour the client chose for it, as `#rrggbb`. Stored, not decided:
+    /// the palette lives in the client, and an annotation keeps the colour it
+    /// was given however the palette changes around it.
+    #[serde(default)]
+    pub color: String,
     /// The display letter shown on the pin: "a".."z", then "aa", ...
     pub letter: String,
     /// The author of the annotation.
@@ -99,6 +115,9 @@ pub struct AnnotationPin {
     pub rtype: String,
     /// The unique id.
     pub uuid: String,
+    /// The colour it was made in, as `#rrggbb`, or empty when it predates the
+    /// field: the client falls back to its palette then.
+    pub color: String,
     /// The display letter shown on the pin.
     pub letter: String,
     /// The author.
@@ -160,6 +179,11 @@ pub struct AnnotateRequest {
     /// between words makes a point, not a word).
     #[serde(default)]
     pub scope: Option<String>,
+    /// The colour the client drew it in, as `#rrggbb`, stored as given: the
+    /// palette is the client's business, and the annotation keeps the colour
+    /// it was made with.
+    #[serde(default)]
+    pub color: Option<String>,
     /// A source range, when the client already knows the span it wants.
     #[serde(default)]
     pub s: Option<usize>,
@@ -316,56 +340,78 @@ impl Scope {
     }
 }
 
-/// The document anchor text for a uuid, e.g. `<7C42.word>`.
+/// What every anchor and every sidecar entry is named after, so that one
+/// plain search — no regular expression — finds every annotation in a
+/// document: `<anno.`. A leading `.` would have been shorter, but Typst does
+/// not accept it in a label: `<.7C42.word>` is not an anchor, it is text, and
+/// it renders as text.
+pub const ANCHOR_PREFIX: &str = "anno.";
+
+/// The document anchor text for a uuid, e.g. `<anno.7C42.word>`.
 fn anchor_text(uuid: &str, scope: Scope) -> String {
     match scope {
-        Scope::Span => format!("<{uuid}.span.begin>"),
-        scope => format!("<{uuid}.{}>", scope.as_str()),
+        Scope::Span => format!("<{ANCHOR_PREFIX}{uuid}.span.begin>"),
+        scope => format!("<{ANCHOR_PREFIX}{uuid}.{}>", scope.as_str()),
     }
 }
 
 /// Finds every anchor of an annotation in a source: their byte offsets and
 /// scopes, in document order.
 pub fn find_anchors(text: &str, uuid: &str) -> Vec<(usize, Scope, String)> {
-    let prefix = format!("<{uuid}.");
+    // Both spellings are read; only the prefixed one is written. Documents
+    // annotated before the prefix existed keep working, and keep their marks.
+    let prefixes = [format!("<{ANCHOR_PREFIX}{uuid}."), format!("<{uuid}.")];
     let mut out = vec![];
-    let mut from = 0;
-    while let Some(rel) = text[from..].find(&prefix) {
-        let start = from + rel;
-        let Some(close) = text[start..].find('>') else {
-            break;
-        };
-        let suffix = &text[start + prefix.len()..start + close];
-        if let Some(scope) = Scope::from_suffix(suffix) {
-            out.push((start, scope, text[start..start + close + 1].to_owned()));
+    for prefix in prefixes {
+        let mut from = 0;
+        while let Some(rel) = text[from..].find(&prefix) {
+            let start = from + rel;
+            let Some(close) = text[start..].find('>') else {
+                break;
+            };
+            let suffix = &text[start + prefix.len()..start + close];
+            if let Some(scope) = Scope::from_suffix(suffix) {
+                out.push((start, scope, text[start..start + close + 1].to_owned()));
+            }
+            from = start + close + 1;
         }
-        from = start + close + 1;
+        if !out.is_empty() {
+            break;
+        }
     }
+    out.sort_by_key(|(at, _, _)| *at);
     out
 }
 
 /// The file being served, which is not always the file being compiled: HTML
 /// mode compiles a generated wrapper that installs export shims and includes
 /// the real document, and every annotation belongs to the document, not to the
-/// wrapper. Set once at startup by whoever arranges that.
-static DOC_FILE: std::sync::RwLock<Option<typst::syntax::FileId>> =
-    std::sync::RwLock::new(None);
+/// wrapper.
+///
+/// A map rather than one file, because one process can serve a directory: each
+/// wrapper names the document it was made for, and an annotation written
+/// through one server must not land in another server's document.
+static DOC_FILES: std::sync::RwLock<
+    Option<std::collections::HashMap<typst::syntax::FileId, typst::syntax::FileId>>,
+> = std::sync::RwLock::new(None);
 
-/// Declares which file annotations belong to, when it is not the compile's
-/// main file.
-pub fn set_doc_file(id: typst::syntax::FileId) {
-    if let Ok(mut slot) = DOC_FILE.write() {
-        *slot = Some(id);
+/// Declares which file annotations belong to when `wrapper` is what is being
+/// compiled.
+pub fn set_doc_file(wrapper: typst::syntax::FileId, doc: typst::syntax::FileId) {
+    if let Ok(mut slot) = DOC_FILES.write() {
+        slot.get_or_insert_with(Default::default).insert(wrapper, doc);
     }
 }
 
-/// The file annotations belong to: the served document.
+/// The file annotations belong to: the served document behind whatever is
+/// being compiled, or that file itself when it is served directly.
 pub fn doc_file<W: World + ?Sized>(world: &W) -> typst::syntax::FileId {
-    DOC_FILE
+    let main = world.main();
+    DOC_FILES
         .read()
         .ok()
-        .and_then(|slot| *slot)
-        .unwrap_or_else(|| world.main())
+        .and_then(|slot| slot.as_ref()?.get(&main).copied())
+        .unwrap_or(main)
 }
 
 /// The sidecar path for the current main file, e.g. `typing.annos.typ`
@@ -454,6 +500,8 @@ fn record_from_value(value: &typst::foundations::Value) -> Option<AnnotationReco
     Some(AnnotationRecord {
         rtype: string_of(&dict, "type").unwrap_or_else(|| "comment".into()),
         uuid: string_of(&dict, "uuid")?,
+        scope: string_of(&dict, "scope").unwrap_or_default(),
+        color: string_of(&dict, "color").unwrap_or_default(),
         letter: string_of(&dict, "letter").unwrap_or_default(),
         author: string_of(&dict, "author").unwrap_or_else(|| "unknown".into()),
         content: string_of(&dict, "content")?,
@@ -494,8 +542,18 @@ pub fn parse_records(content: &str) -> Vec<AnnotationRecord> {
 /// `<note-LABEL>` uuid, for surgical replacement. Format changes only need
 /// to keep that uuid after the entry's closing `))`.
 fn entry_span(content: &str, uuid: &str) -> Option<std::ops::Range<usize>> {
-    let note = format!("<note-{uuid}>");
-    let note_at = find_in_code(content, &note, 0)?;
+    // The entry carries the same name as the anchors it belongs to, so one
+    // search for `<anno.7C42` finds the annotation and everything it is
+    // attached to. Sidecars written before that keep their `<note-7C42>`.
+    let note = format!("<{ANCHOR_PREFIX}{uuid}>");
+    let (note, note_at) = match find_in_code(content, &note, 0) {
+        Some(at) => (note, at),
+        None => {
+            let legacy = format!("<note-{uuid}>");
+            let at = find_in_code(content, &legacy, 0)?;
+            (legacy, at)
+        }
+    };
     let start = rfind_in_code(content, "#metadata((", note_at)?;
     let mut end = note_at + note.len();
     if content[end..].starts_with('\n') {
@@ -565,6 +623,8 @@ pub fn format_record(rec: &AnnotationRecord) -> String {
     entry_template()
         .replace("${type}", &escape(&rec.rtype))
         .replace("${uuid}", &escape(&rec.uuid))
+        .replace("${scope}", &escape(&rec.scope))
+        .replace("${color}", &escape(&rec.color))
         .replace("${letter}", &escape(&rec.letter))
         .replace("${author}", &escape(&rec.author))
         .replace("${content}", &escape(&rec.content))
@@ -749,6 +809,7 @@ pub fn annotation_pins(art: &LspCompiledArtifact) -> Vec<AnnotationPin> {
             Some(AnnotationPin {
                 rtype: rec.rtype.clone(),
                 uuid: rec.uuid.clone(),
+                color: rec.color.clone(),
                 letter: rec.letter.clone(),
                 author: rec.author.clone(),
                 content: rec.content.clone(),
@@ -2205,6 +2266,8 @@ fn prepare_at(
     let rec = AnnotationRecord {
         rtype: "comment".into(),
         uuid: fresh_label(&records, req.uuid.as_deref()),
+        scope: scope.as_str().into(),
+        color: req.color.clone().unwrap_or_default(),
         letter: next_letter(&records),
         author: author_or_local(req.author.as_deref()),
         content: req.text.clone(),
@@ -2265,6 +2328,8 @@ fn prepare_span_range(
     let rec = AnnotationRecord {
         rtype: "comment".into(),
         uuid: fresh_label(&records, req.uuid.as_deref()),
+        scope: Scope::Span.as_str().into(),
+        color: req.color.clone().unwrap_or_default(),
         letter: next_letter(&records),
         author: author_or_local(req.author.as_deref()),
         content: req.text.clone(),
@@ -2276,8 +2341,8 @@ fn prepare_span_range(
 
     // Insert the end anchor first: inserting the begin anchor would shift
     // every later offset.
-    let begin = format!("<{}.span.begin>", rec.uuid);
-    let end = format!("<{}.span.end>", rec.uuid);
+    let begin = format!("<{ANCHOR_PREFIX}{}.span.begin>", rec.uuid);
+    let end = format!("<{ANCHOR_PREFIX}{}.span.end>", rec.uuid);
     let mut new_source = source.text().to_owned();
     new_source.insert_str(range.end, &end);
     new_source.insert_str(range.start, &begin);

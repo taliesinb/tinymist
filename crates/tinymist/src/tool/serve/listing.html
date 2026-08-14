@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="dev/html/annotate.css">
+<style>
+  /* The listing is its own page, so its layout lives here rather than in the
+     annotator's stylesheet, which is about a document and the marks on it. */
+  .tm-listing {
+    box-sizing: border-box;
+    width: 100%;
+    max-width: 46rem;
+    margin: 0 auto;
+    padding: 3rem 1.5rem 6rem;
+  }
+
+  .tm-listing h1 {
+    font: 600 1.5rem/1.3 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    margin: 0 0 0.25rem;
+  }
+
+  .tm-listing .tm-where {
+    color: color-mix(in oklab, var(--tm-fg) 55%, transparent);
+    font-size: 0.85rem;
+    margin: 0 0 2rem;
+  }
+
+  .tm-listing ul {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+  }
+
+  .tm-listing li + li {
+    border-top: 1px solid var(--tm-rule);
+  }
+
+  .tm-listing a {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 0.15rem 1rem;
+    padding: 0.85rem 0.6rem;
+    margin: 0 -0.6rem;
+    border-radius: 6px;
+    text-decoration: none;
+    color: inherit;
+  }
+
+  .tm-listing a:hover {
+    background: color-mix(in oklab, var(--tm-fg) 7%, transparent);
+  }
+
+  .tm-name {
+    font-weight: 600;
+    font-size: 1.02rem;
+  }
+
+  .tm-file,
+  .tm-when,
+  .tm-notes {
+    color: color-mix(in oklab, var(--tm-fg) 55%, transparent);
+    font-size: 0.85rem;
+  }
+
+  .tm-file {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+
+  /* The right-hand column: how much has been said about the document, and how
+     long ago it changed. */
+  .tm-meta {
+    grid-column: 2;
+    grid-row: 1 / span 2;
+    align-self: center;
+    text-align: right;
+    display: grid;
+    gap: 0.15rem;
+  }
+
+  .tm-notes[data-count="0"] {
+    visibility: hidden;
+  }
+
+  .tm-empty {
+    color: color-mix(in oklab, var(--tm-fg) 55%, transparent);
+  }
+</style>
+</head>
+<body>
+<main class="tm-listing">
+  <h1 id="tm-title">Documents</h1>
+  <p class="tm-where" id="tm-where"></p>
+  <ul id="tm-docs"></ul>
+  <p class="tm-empty" id="tm-empty" hidden>No documents here yet.</p>
+</main>
+<script>
+  // The listing is data plus this page: the server answers `dev/docs` with the
+  // directory as it is now, so a document added while the server runs is one
+  // reload away rather than one restart.
+  (() => {
+    const docs = document.getElementById("tm-docs");
+    const empty = document.getElementById("tm-empty");
+    const text = (tag, cls, value) => {
+      const el = document.createElement(tag);
+      el.className = cls;
+      el.textContent = value;
+      return el;
+    };
+    // "just now", "14 min", "3 h", "2 d": past the day, the exact figure is
+    // not what the reader is asking.
+    const ago = (seconds) => {
+      if (seconds < 60) return "just now";
+      if (seconds < 3600) return `${Math.floor(seconds / 60)} min`;
+      if (seconds < 86400) return `${Math.floor(seconds / 3600)} h`;
+      return `${Math.floor(seconds / 86400)} d`;
+    };
+    const render = (data) => {
+      document.title = data.title || "Documents";
+      document.getElementById("tm-title").textContent = data.title || "Documents";
+      document.getElementById("tm-where").textContent = data.dir || "";
+      docs.textContent = "";
+      empty.hidden = data.docs.length > 0;
+      for (const doc of data.docs) {
+        const li = document.createElement("li");
+        const a = document.createElement("a");
+        a.href = doc.slug + "/";
+        a.append(text("span", "tm-name", doc.title));
+        a.append(text("span", "tm-file", doc.file));
+        const meta = document.createElement("span");
+        meta.className = "tm-meta";
+        const notes = text(
+          "span",
+          "tm-notes",
+          doc.annotations === 1 ? "1 annotation" : `${doc.annotations} annotations`,
+        );
+        notes.dataset.count = doc.annotations;
+        meta.append(notes);
+        meta.append(text("span", "tm-when", ago(doc.age)));
+        a.append(meta);
+        li.append(a);
+        docs.append(li);
+      }
+    };
+    const load = () =>
+      fetch("dev/docs")
+        .then((r) => r.json())
+        .then(render)
+        .catch(() => {});
+    load();
+    // Cheap enough to repeat: it is a directory read and a few file stats.
+    setInterval(load, 5000);
+    addEventListener("focus", load);
+  })();
+</script>
+</body>
+</html>

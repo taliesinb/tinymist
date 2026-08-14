@@ -6,7 +6,9 @@
   if (!api) return;
   const { findPages, docDark, lastData } = api;
   const SVG_NS = "http://www.w3.org/2000/svg";
-  const ANNOTATE = location.pathname.replace(/\/+$/, "") === "/annotate";
+  // Which face this page wears rides in the URL's first segment: `/a/` is the
+  // annotator, `/v/` a document served to be read, `/p/` an editor's preview.
+  const ANNOTATE = /^\/a(\/|$)/.test(location.pathname);
 
   const ALT_STYLE_ID = "tinymist-alt-mode";
   const setAltMode = (on) => {

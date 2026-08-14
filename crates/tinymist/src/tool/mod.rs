@@ -7,3 +7,5 @@ pub mod word_count;
 
 #[cfg(feature = "preview")]
 pub mod preview;
+#[cfg(feature = "preview")]
+pub mod serve;

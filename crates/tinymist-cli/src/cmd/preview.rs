@@ -66,7 +66,7 @@ pub async fn preview_main(mut args: PreviewCliArgs) -> Result<()> {
     let cli_role = if args.annotate {
         tinymist::tool::preview::icons::IconRole::Annotate
     } else {
-        tinymist::tool::preview::icons::IconRole::Serve
+        args.role
     };
     let identity = tinymist::tool::preview::WebAppIdentity {
         role: cli_role,
@@ -273,14 +273,21 @@ pub async fn preview_main(mut args: PreviewCliArgs) -> Result<()> {
                 String::default(),
                 args.control_plane_host,
                 control_sock_tx,
-                None,
-                None,
+                // The control plane carries no document: it is the editor's
+                // channel, and it serves no pages.
+                Arc::new(tinymist::tool::serve::SingleSite {
+                    doc: Arc::new(tinymist::tool::serve::DocServices {
+                        title: String::new(),
+                        diag_rx: None,
+                        annot: None,
+                        html: None,
+                    }),
+                }),
                 // The control plane serves the editor, not a browser.
                 false,
                 tinymist::tool::preview::WebAppIdentity::new(
                     tinymist::tool::preview::icons::IconRole::Serve,
                 ),
-                None,
                 // The control plane serves the editor over loopback, so the
                 // origins a browser might reach the data plane by are none of
                 // its business.
@@ -418,6 +425,19 @@ pub async fn preview_main(mut args: PreviewCliArgs) -> Result<()> {
     // of them accept the same origins.
     let allowed_origins = args.allowed_origins.clone();
 
+    // One document, which is a site with one nameless entry: the HTTP layer
+    // asks a site what a request is about, and this is the answer to every
+    // question it can be asked here.
+    let site: Arc<dyn tinymist::tool::serve::DocumentSite> =
+        Arc::new(tinymist::tool::serve::SingleSite {
+            doc: Arc::new(tinymist::tool::serve::DocServices {
+                title: String::new(),
+                diag_rx: Some(diag_rx),
+                annot: Some(annot),
+                html: html_server,
+            }),
+        });
+
     let static_server = if let Some(static_file_host) = static_file_host {
         log::warn!(
             "--static-file-host is deprecated, which will be removed in the future. Use --data-plane-host instead."
@@ -428,11 +448,9 @@ pub async fn preview_main(mut args: PreviewCliArgs) -> Result<()> {
                 html,
                 static_file_host,
                 websocket_tx.clone(),
-                Some(diag_rx.clone()),
-                Some(annot.clone()),
+                site.clone(),
                 shutdown_on_last_client,
                 identity.clone(),
-                html_server.clone(),
                 allowed_origins.clone(),
             )
             .await,
@@ -446,11 +464,9 @@ pub async fn preview_main(mut args: PreviewCliArgs) -> Result<()> {
             frontend_html,
             args.data_plane_host,
             websocket_tx,
-            Some(diag_rx),
-            Some(annot),
+            site,
             shutdown_on_last_client,
             identity.clone(),
-            html_server,
             allowed_origins,
         )
         .await;
@@ -470,7 +486,7 @@ pub async fn preview_main(mut args: PreviewCliArgs) -> Result<()> {
 
     #[cfg(feature = "open")]
     if open_in_browser {
-        let path = if args.annotate { "/annotate" } else { "/" };
+        let path = tinymist::tool::preview::role_prefix(identity.role);
         // The app to look for is the one this server would be added to the
         // Dock as — its manifest's short name — so opening lands in the window
         // that already belongs to this document rather than a stray browser
@@ -499,7 +515,7 @@ pub async fn preview_main(mut args: PreviewCliArgs) -> Result<()> {
     // ports and only one of them is meant for a person. A log line for each is
     // how the wrong one gets copied.
     {
-        let path = if args.annotate { "/annotate" } else { "/" };
+        let path = tinymist::tool::preview::role_prefix(identity.role);
         let port = static_server_addr.port();
         println!();
         println!("{}", identity.title(port));

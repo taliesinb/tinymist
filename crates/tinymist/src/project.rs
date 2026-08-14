@@ -873,6 +873,52 @@ impl CompileHandler<LspCompilerFeat, ProjectInsStateExt> for CompileHandlerImpl 
         #[cfg(feature = "preview")]
         if let Some(inner) = self.preview.get(art.id()) {
             *self.last_art.lock() = Some(art.clone());
+            // What was compiled, and where it is: both the narration and the
+            // rendered site are about the document, not about the wrapper the
+            // shims put in front of it.
+            let doc_path: Option<std::path::PathBuf> = {
+                use tinymist_project::WorldProvider as _;
+                let world = art.world();
+                let doc = crate::tool::preview::doc_file(world);
+                world
+                    .path_for_id(doc)
+                    .ok()
+                    .and_then(|path| path.to_err().ok())
+                    .map(|path: std::path::PathBuf| path)
+            };
+            if tinymist_project::announcing() {
+                // How long the wait was, measured from the change that caused
+                // this compile: the figure between saving a file and being able
+                // to read it.
+                let waited = tinymist_project::since_change()
+                    .map(|since| since.as_secs_f64())
+                    .unwrap_or(0.0);
+                tinymist_project::announce(
+                    "compiled_document",
+                    &[
+                        (
+                            "path",
+                            doc_path
+                                .as_ref()
+                                .map(|path| path.display().to_string())
+                                .unwrap_or_default()
+                                .into(),
+                        ),
+                        ("elapsed", waited.into()),
+                    ],
+                );
+            }
+            // The rendering goes to disk, once, for everyone who asks for it —
+            // rather than being made again in the answer to each request.
+            let rendered = match (crate::tool::serve::site_cache(), &doc_path) {
+                (Some(cache), Some(path)) => {
+                    crate::tool::preview::html_annotations::html_document(art)
+                        .ok()
+                        .map(|html| crate::tool::preview::html_annotations::fragment(&html))
+                        .and_then(|frag| cache.write_body(path, &frag.body))
+                }
+                _ => None,
+            };
             if let Some(diag_tx) = self.preview.diag_tx(art.id()) {
                 let last_edit = self.last_edit.lock().clone();
                 let payload = crate::tool::preview::diagnostics_payload(
@@ -881,7 +927,11 @@ impl CompileHandler<LspCompilerFeat, ProjectInsStateExt> for CompileHandlerImpl 
                 );
                 let doc_dark = crate::tool::preview::doc_is_dark(art);
                 let annotations = crate::tool::preview::annotation_pins(art);
+                let doc_version = rendered.as_ref().map(|body| body.version);
                 diag_tx.send_modify(|state| {
+                    if let Some(version) = doc_version {
+                        state.doc_version = version;
+                    }
                     state.ok = payload.ok;
                     state.messages = payload.messages;
                     state.locations = payload.locations;
