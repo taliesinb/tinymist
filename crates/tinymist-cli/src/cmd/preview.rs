@@ -19,7 +19,6 @@ use tinymist_std::error::prelude::*;
 use tinymist_task::ExportTarget;
 use tokio::sync::mpsc;
 
-use crate::utils::exit_on_ctrl_c;
 
 /// Entry point of the preview tool.
 pub async fn preview_main(mut args: PreviewCliArgs) -> Result<()> {
@@ -59,7 +58,10 @@ pub async fn preview_main(mut args: PreviewCliArgs) -> Result<()> {
         };
 
     tinymist::tool::preview::note_build_stamp();
-    exit_on_ctrl_c();
+    // Ctrl-C and `kill` are how a server is usually stopped, and neither runs a
+    // destructor: caught so that what this one leaves behind — its note in the
+    // register, the site it rendered — goes with it.
+    crate::utils::tidy_up_on_signals();
 
     let shutdown_on_last_client = args.shutdown_on_last_client;
     let mcp = args.mcp;
@@ -283,6 +285,7 @@ pub async fn preview_main(mut args: PreviewCliArgs) -> Result<()> {
                         annot: None,
                         html: None,
                     }),
+                    path: None,
                 }),
                 // The control plane serves the editor, not a browser.
                 false,
@@ -438,6 +441,7 @@ pub async fn preview_main(mut args: PreviewCliArgs) -> Result<()> {
                 annot: Some(annot),
                 html: html_server,
             }),
+            path: args.compile.input.as_deref().map(std::path::PathBuf::from),
         });
 
     let static_server = if let Some(static_file_host) = static_file_host {

@@ -10,6 +10,38 @@ pub fn exit_on_ctrl_c() {
     });
 }
 
+/// Leaves properly when asked to stop, however it is asked.
+///
+/// A server has things to put away — the note that says it is running, the
+/// site it rendered — and the ordinary ways of stopping one are Ctrl-C and
+/// `kill`. Neither runs a destructor, so both are caught and answered with the
+/// same shutdown the server does when a client asks it to stop.
+#[cfg(feature = "preview")]
+pub fn tidy_up_on_signals() {
+    use tokio::signal::unix::{signal, SignalKind};
+    tokio::spawn(async move {
+        let mut terminate = match signal(SignalKind::terminate()) {
+            Ok(signal) => signal,
+            Err(err) => {
+                log::warn!("cannot listen for SIGTERM: {err}");
+                return;
+            }
+        };
+        let mut interrupt = match signal(SignalKind::interrupt()) {
+            Ok(signal) => signal,
+            Err(err) => {
+                log::warn!("cannot listen for SIGINT: {err}");
+                return;
+            }
+        };
+        tokio::select! {
+            _ = terminate.recv() => log::info!("asked to stop"),
+            _ = interrupt.recv() => log::info!("interrupted"),
+        }
+        tinymist::tool::serve::shutdown();
+    });
+}
+
 /// Exits when the binary this process was started from is replaced.
 ///
 /// A long-running server keeps its own inode after `cargo install` writes a new

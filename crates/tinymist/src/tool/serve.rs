@@ -82,6 +82,13 @@ pub trait DocumentSite: Send + Sync + 'static {
         vec![]
     }
 
+    /// The annotation sidecars of everything this site serves, for asking
+    /// whether anyone is in the middle of something. A read of a few files,
+    /// never a compile: it is asked while deciding whether to shut down.
+    fn sidecars(&self) -> Vec<PathBuf> {
+        vec![]
+    }
+
     /// The services for one document, built if this is the first time it has
     /// been asked for. The empty name is the single-document case.
     fn services<'a>(
@@ -229,15 +236,42 @@ pub fn title_in(text: &str) -> Option<String> {
 pub struct SingleSite {
     /// The one document's services.
     pub doc: Arc<DocServices>,
+    /// Where that document is, when this site is a served file rather than an
+    /// editor's preview of one.
+    pub path: Option<PathBuf>,
 }
 
 impl DocumentSite for SingleSite {
+    fn sidecars(&self) -> Vec<PathBuf> {
+        self.path
+            .as_ref()
+            .map(|path| vec![path.with_extension("annos.typ")])
+            .unwrap_or_default()
+    }
+
     fn services<'a>(
         &'a self,
         _slug: &'a str,
     ) -> futures::future::BoxFuture<'a, Option<Arc<DocServices>>> {
         Box::pin(async move { Some(self.doc.clone()) })
     }
+}
+
+/// Whether any annotation in these sidecars is being worked on.
+///
+/// Claiming one is how an agent — or a person — says "I am in the middle of
+/// this", and it is the one thing a server should outlive a closed window for.
+/// Read rather than evaluated: this is asked on a timer, and the answer is a
+/// word in a file.
+pub fn anyone_working(sidecars: &[PathBuf]) -> bool {
+    sidecars.iter().any(|path| {
+        std::fs::read_to_string(path).is_ok_and(|text| {
+            text.lines().any(|line| {
+                // The prelude explains the field; it is not an entry.
+                !line.trim_start().starts_with("//") && line.contains(r#"status: "ongoing""#)
+            })
+        })
+    })
 }
 
 /// The listing page, read from the source tree when it is there, so it can be

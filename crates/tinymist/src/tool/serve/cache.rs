@@ -127,12 +127,16 @@ pub fn site_cache() -> Option<Arc<SiteCache>> {
     SITE.read().ok().and_then(|slot| slot.clone())
 }
 
-/// Stops rendering to disk, and takes the site with it once the last holder of
-/// it lets go. A global is never dropped on the way out, so the server says
-/// when it is done rather than leaving that to the end of the process.
+/// Stops rendering to disk and removes what was rendered.
+///
+/// The directory goes here rather than when the last holder of the cache lets
+/// go: a global is never dropped on the way out, and a server on its way out is
+/// exactly when this is called. The destructor stays as a backstop for anything
+/// that drops a cache without saying so.
 pub fn drop_site_cache() {
-    if let Ok(mut slot) = SITE.write() {
-        *slot = None;
+    let taken = SITE.write().ok().and_then(|mut slot| slot.take());
+    if let Some(cache) = taken {
+        let _ = std::fs::remove_dir_all(cache.dir());
     }
 }
 

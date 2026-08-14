@@ -78,6 +78,13 @@ impl DocumentSite for DirSite {
         tinymist::tool::serve::entries_in(&self.dir)
     }
 
+    fn sidecars(&self) -> Vec<PathBuf> {
+        tinymist::tool::serve::entries_in(&self.dir)
+            .into_iter()
+            .map(|entry| self.dir.join(entry.file).with_extension("annos.typ"))
+            .collect()
+    }
+
     fn services<'a>(
         &'a self,
         slug: &'a str,
@@ -289,6 +296,7 @@ pub async fn serve_directory(
              websocket with no room in it to say which document. Name a file to serve it as pages."
         );
     }
+    crate::utils::tidy_up_on_signals();
     let identity = identity_for(&dir, role, args.icon_color.as_deref().and_then(icons::parse_hex));
     let allowed_origins = args.allowed_origins.clone();
     let addr = args.data_plane_host.clone();

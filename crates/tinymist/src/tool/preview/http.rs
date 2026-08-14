@@ -829,49 +829,50 @@ pub async fn make_http_server(
     // to outlive it. A short grace period covers a page reload, which drops
     // every connection for a moment before opening new ones.
     const IDLE_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
-    // What an agent's silence is worth. Closing a window is a decision, and it
-    // is what ends a server — but a server an agent opened a window on is being
-    // read *and* worked on, and the reader finishing does not mean the work is.
-    // An agent between two questions has not gone anywhere; one that has said
-    // nothing for half an hour has.
-    //
-    // Only the pause needs saying: a server nobody has ever connected to does
-    // not shut down at all, since shutting down is what happens when the last
-    // client leaves and there has to have been one.
-    const AGENT_GRACE: u64 = 30 * 60;
+    // How long an empty server waits before going, which depends on what is
+    // going on in it. A closed window usually means the reader is done, and ten
+    // seconds is enough to tell that from a reload. But a document an agent has
+    // been asked about is one it may come back to, and a document with an
+    // annotation somebody has claimed is one being worked on right now — the
+    // claim is the difference between a pause and an ending, and it is dropped
+    // as soon as the annotation is resolved or released.
+    const CLOSED: u64 = 10;
+    const AGENT_HERE: u64 = 60;
+    const AGENT_WORKING: u64 = 30 * 60;
     if shutdown_on_last_client {
         let live = live.clone();
         let served_anyone = served_anyone.clone();
         let last_call = last_call.clone();
+        let site = site.clone();
         tokio::spawn(async move {
             use std::sync::atomic::Ordering::SeqCst;
+            let mut empty_since: Option<std::time::Instant> = None;
             loop {
                 tokio::time::sleep(IDLE_GRACE).await;
-                if mcp {
-                    let called = last_call.load(SeqCst);
-                    let running = started.elapsed().as_secs();
-                    if called > 0 && running.saturating_sub(called) < AGENT_GRACE {
-                        continue;
-                    }
-                }
-                log::debug!(
-                    target: crate::PREVIEW_COMPAT_LOG_TARGET,
-                    "idle check: pages={} served={}",
-                    live.load(SeqCst),
-                    served_anyone.load(SeqCst)
-                );
-                if !served_anyone.load(SeqCst) || live.load(SeqCst) > 0 {
+                if !served_anyone.load(SeqCst) {
                     continue;
                 }
-                // Still nobody a whole grace period later: this was not a reload.
-                tokio::time::sleep(IDLE_GRACE).await;
-                if live.load(SeqCst) == 0 {
-                    log::info!(
-                        target: crate::PREVIEW_COMPAT_LOG_TARGET,
-                        "last client disconnected, shutting down"
-                    );
-                    std::process::exit(0);
+                if live.load(SeqCst) > 0 {
+                    empty_since = None;
+                    continue;
                 }
+                let empty = *empty_since.get_or_insert_with(std::time::Instant::now);
+                let called = last_call.load(SeqCst) > 0;
+                let grace = if called && crate::tool::serve::anyone_working(&site.sidecars()) {
+                    AGENT_WORKING
+                } else if called {
+                    AGENT_HERE
+                } else {
+                    CLOSED
+                };
+                if empty.elapsed().as_secs() < grace {
+                    continue;
+                }
+                log::info!(
+                    target: crate::PREVIEW_COMPAT_LOG_TARGET,
+                    "nobody here for {grace}s, shutting down"
+                );
+                crate::tool::serve::shutdown();
             }
         });
     }

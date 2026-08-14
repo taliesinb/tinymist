@@ -1143,6 +1143,8 @@ impl PreviewState {
                         annot,
                         html: None,
                     }),
+                    // An editor's preview is not asked to outlive its window.
+                    path: None,
                 }),
                 // The editor owns this one's lifetime.
                 false,
