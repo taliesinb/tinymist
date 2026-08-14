@@ -1,0 +1,88 @@
+<!-- The sidecar, as a page: one card per annotation, for looking at what the
+     server thinks it has. Plain and templated on purpose — this is a debugging
+     view, not part of the annotator. -->
+<meta charset="utf-8">
+<title>${title}</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    margin: 0 auto; padding: 24px 20px 64px; max-width: 62em;
+    font: 14px/1.5 ui-sans-serif, system-ui, sans-serif;
+    background: light-dark(#fbfbfc, #101014);
+    color: light-dark(#16161a, #e8e8ec);
+  }
+  h1 { font-size: 17px; margin: 0 0 2px; }
+  .doc { font: 12px ui-monospace, monospace; opacity: 0.6; margin-bottom: 20px; }
+  .anno {
+    border: 1px solid light-dark(#dcdce4, #2a2a33); border-left-width: 4px;
+    border-radius: 6px; margin-bottom: 16px; overflow: hidden;
+    background: light-dark(#ffffff, #16161c);
+  }
+  .anno.resolved { opacity: 0.62; }
+  .head {
+    display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+    padding: 8px 12px; border-bottom: 1px solid light-dark(#ececf2, #23232b);
+  }
+  .letter {
+    font: bold 12px ui-monospace, monospace; text-transform: uppercase;
+    padding: 1px 6px; border-radius: 4px; color: #101014;
+  }
+  .uuid { font: 12px ui-monospace, monospace; }
+  .flags { margin-left: auto; display: flex; gap: 6px; }
+  .flag {
+    font-size: 11px; padding: 1px 7px; border-radius: 999px;
+    border: 1px solid light-dark(#d4d4de, #33333d);
+  }
+  .flag.on { background: light-dark(#e8f0ff, #1d2740); border-color: #4a7fd4; }
+  .meta { font-size: 11.5px; opacity: 0.66; }
+  .body { padding: 10px 12px; }
+  .said { white-space: pre-wrap; }
+  .stack { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 10px; }
+  .stack img {
+    max-width: 100%; background: #fff; border: 1px solid light-dark(#dcdce4, #2a2a33);
+    border-radius: 4px;
+  }
+  .cap { font-size: 11px; opacity: 0.6; margin-top: 3px; }
+  .replies { margin-top: 12px; border-top: 1px dashed light-dark(#e2e2ea, #2a2a33); }
+  .reply { padding-top: 8px; }
+  .who { font-weight: 650; font-size: 12.5px; }
+  /* The block an agent would be handed: the fields of a JSON object, one to a
+     line, read down rather than across. */
+  .block {
+    margin-top: 10px; padding-top: 8px;
+    border-top: 1px solid light-dark(#e6e6ee, #26262f);
+    font: 11.5px/1.5 ui-monospace, monospace;
+    color: light-dark(#3a3a46, #b6b6c4);
+  }
+  .block .row { display: flex; gap: 1ch; }
+  /* `ch` is the width of a digit in the monospace face, so the column is as
+     wide as the longest key rather than as wide as a guess. */
+  .block .key { flex: 0 0 12ch; opacity: 0.55; }
+  .block .key::after { content: ":"; }
+  .block .row > :not(.key) { min-width: 0; overflow-wrap: anywhere; }
+  /* The block's source, shown by default. A long one is folded to its head and
+     tail; the dots toggle the checkbox that unfolds it. */
+  .src { position: relative; }
+  .src pre { margin: 8px 0 0; }
+  .src .ln { display: block; }
+  .src.folded .fold:not(:checked) ~ pre .ln:nth-child(n+6):nth-last-child(n+6) {
+    display: none;
+  }
+  .src .more {
+    display: block; margin-top: 3px; cursor: pointer; user-select: none;
+    color: light-dark(#6a6a7a, #8a8a9a);
+  }
+  .src .more:hover { color: light-dark(#3a3a46, #c8c8d6); }
+  .src .fold:checked ~ .more .when-folded,
+  .src .fold:not(:checked) ~ .more .when-open { display: none; }
+  pre {
+    margin: 8px 0 0; padding: 10px; overflow-x: auto; border-radius: 5px;
+    font: 11.5px/1.45 ui-monospace, monospace;
+    background: light-dark(#f3f3f7, #0c0c10);
+    border: 1px solid light-dark(#e4e4ec, #23232b);
+  }
+  .none { opacity: 0.6; font-style: italic; }
+</style>
+<h1>${title}</h1>
+<div class="doc">${path}</div>
+${entries}

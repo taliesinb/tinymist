@@ -57,7 +57,7 @@ pub async fn preview_main(mut args: PreviewCliArgs) -> Result<()> {
             None
         };
 
-    tinymist::tool::preview::note_build_stamp();
+    tinymist::tool::webapp::note_build_stamp();
     // Ctrl-C and `kill` are how a server is usually stopped, and neither runs a
     // destructor: caught so that what this one leaves behind — its note in the
     // register, the site it rendered — goes with it.
@@ -67,16 +67,16 @@ pub async fn preview_main(mut args: PreviewCliArgs) -> Result<()> {
     let mcp = args.mcp;
     // `annotate` and `preview` are the same server wearing different faces.
     let cli_role = if args.annotate {
-        tinymist::tool::preview::icons::IconRole::Annotate
+        tinymist::tool::webapp::icons::IconRole::Annotate
     } else {
         args.role
     };
-    let identity = tinymist::tool::preview::WebAppIdentity {
+    let identity = tinymist::tool::webapp::WebAppIdentity {
         role: cli_role,
         color: args
             .icon_color
             .as_deref()
-            .and_then(tinymist::tool::preview::icons::parse_hex),
+            .and_then(tinymist::tool::webapp::icons::parse_hex),
         // Falling back to the document's own name: a port tells nobody which
         // project a window belongs to.
         name: args.root_name.clone().or_else(|| {
@@ -93,31 +93,32 @@ pub async fn preview_main(mut args: PreviewCliArgs) -> Result<()> {
     if !args.daemon {
         tinymist::tool::preview::exit_when_orphaned();
     }
+    // Which rendering, independent of who is driving: an editor following a
+    // maths paper wants the pages a PDF would have, and one following technical
+    // documentation wants the HTML, which is faster to compile and to draw.
     let preview_target = args.preview.export_target();
     let html_mode = matches!(preview_target, ExportTarget::Html);
-    if matches!(preview_target, ExportTarget::Bundle) {
-        bail!("bundle export target is not supported by preview");
-    }
     let mut verse = args.compile.resolve()?;
-    // HTML export drops whole elements (`align`, `grid`, `place`, ...) and the
-    // appearance of others; the shims put that back by compiling the document
-    // through a generated wrapper that installs show rules in front of it.
-    let shims = if html_mode {
-        match tinymist::tool::preview::html_annotations::install_shims(&mut verse) {
-            Ok(entry) => Some(entry),
-            Err(err) => {
-                log::warn!("serving without the HTML export shims: {err}");
-                None
-            }
+    if html_mode {
+        // The same shims a served document gets: what HTML export drops, put
+        // back in front of the document rather than in it.
+        if let Err(err) = tinymist::tool::render::html::install_shims(&mut verse) {
+            log::warn!("previewing without the HTML export shims: {err}");
         }
-    } else {
-        None
-    };
+    }
     let previewer = PreviewBuilder::new(config);
 
-    let (service, handle, diag_rx, annot, html_server) = {
+    let (service, handle, diag_rx, body) = {
         let preview_state = ProjectPreviewState::default();
         let last_art = Arc::new(parking_lot::Mutex::default());
+        // In HTML mode the page fetches the document rather than being drawn
+        // into over the websocket, and this is what answers it.
+        let body: Option<Arc<dyn tinymist::tool::render::html::HtmlBody>> =
+            html_mode.then(|| {
+                Arc::new(tinymist::tool::render::html::ArtifactHtmlServer {
+                    last_art: last_art.clone(),
+                }) as Arc<_>
+            });
         let mut opts = ProjectOpts {
             handle: Some(handle),
             preview: preview_state.clone(),
@@ -157,45 +158,22 @@ pub async fn preview_main(mut args: PreviewCliArgs) -> Result<()> {
         );
         preview_state.register_diag(&id, diag_tx);
 
-        // Annotations: the CLI has no editor, so all annotation edits are
-        // written to disk directly.
-        let annot: Arc<dyn tinymist::tool::preview::AnnotationServer> =
-            Arc::new(tinymist::tool::preview::DiskAnnotationServer {
-                last_art: last_art.clone(),
-                watchers: preview_state.clone(),
-                project_id: id.clone(),
-                // In annotate mode, stream annotation events as JSON lines
-                // on stdout so a driving agent can react to them.
-                emit_events: args.annotate,
-            });
-
-        // The sidecar is not a compile dependency; poll its mtime so
-        // external edits (e.g. an agent updating a status) refresh the pins.
+        // The overlay script is read from the source tree on every request, so
+        // a page reloads when it changes on disk.
         {
             let watchers = preview_state.clone();
             let poll_id = id.clone();
-            let poll_art = last_art.clone();
             tokio::spawn(async move {
-                let mut last_mtime = None;
-                let mut js_mtime = Vec::new();
+                let mut js_mtime = None;
                 let mut first = true;
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                     let Some(diag_tx) = watchers.diag_tx(&poll_id) else {
                         break;
                     };
-                    let mut stamps = vec![
-                        std::fs::metadata(tinymist::tool::preview::overlay_js_path())
-                            .and_then(|m| m.modified())
-                            .ok(),
-                        std::fs::metadata(tinymist::tool::preview::annotations_js_path())
-                            .and_then(|m| m.modified())
-                            .ok(),
-                    ];
-                    for path in tinymist::tool::preview::html_annotations::asset_paths() {
-                        stamps.push(std::fs::metadata(path).and_then(|m| m.modified()).ok());
-                    }
-                    let mtime = stamps;
+                    let mtime = std::fs::metadata(tinymist::tool::preview::overlay_js_path())
+                        .and_then(|m| m.modified())
+                        .ok();
                     if mtime != js_mtime {
                         js_mtime = mtime;
                         if !first {
@@ -203,19 +181,6 @@ pub async fn preview_main(mut args: PreviewCliArgs) -> Result<()> {
                         }
                     }
                     first = false;
-                    let Some(art) = poll_art.lock().clone() else {
-                        continue;
-                    };
-                    let Some(path) = tinymist::tool::preview::sidecar_path(&art) else {
-                        continue;
-                    };
-                    let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
-                    if mtime == last_mtime {
-                        continue;
-                    }
-                    last_mtime = mtime;
-                    let pins = tinymist::tool::preview::annotation_pins(&art);
-                    diag_tx.send_modify(|state| state.annotations = pins);
                 }
             });
         }
@@ -225,46 +190,8 @@ pub async fn preview_main(mut args: PreviewCliArgs) -> Result<()> {
             client: Box::new(intr_tx),
         });
 
-        // HTML mode answers from the same artifact, through its own endpoints.
-        let html_server: Option<
-            Arc<dyn tinymist::tool::preview::html_annotations::HtmlAnnotationServer>,
-        > = html_mode.then(|| {
-            Arc::new(tinymist::tool::preview::html_annotations::ArtifactHtmlServer {
-                last_art: last_art.clone(),
-            }) as Arc<_>
-        });
-
-        (service, handle, diag_rx, annot, html_server)
+        (service, handle, diag_rx, body)
     };
-
-    // A shim edit is not a compile dependency — the wrapper holds a copy of the
-    // text — so the wrapper is rewritten when the file changes, which is what
-    // the compiler notices.
-    if let Some(shims) = shims.clone() {
-        let handle = handle.clone();
-        tokio::spawn(async move {
-            use tinymist::tool::preview::html_annotations;
-            use tinymist_preview::EditorServer;
-            let mut last = None;
-            loop {
-                let stamp = std::fs::metadata(html_annotations::shims_path())
-                    .and_then(|meta| meta.modified())
-                    .ok();
-                if last.is_some() && stamp != last {
-                    log::info!("reloading the HTML export shims");
-                    let files = tinymist_preview::MemoryFiles {
-                        files: std::collections::HashMap::from([(
-                            shims.path.clone(),
-                            html_annotations::wrapper_source(&shims.main_name),
-                        )]),
-                    };
-                    let _ = handle.update_memory_files(files, false).await;
-                }
-                last = stamp;
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            }
-        });
-    }
 
     let (lsp_tx, mut lsp_rx) = ControlPlaneTx::new(true);
 
@@ -276,26 +203,12 @@ pub async fn preview_main(mut args: PreviewCliArgs) -> Result<()> {
                 String::default(),
                 args.control_plane_host,
                 control_sock_tx,
+                None,
                 // The control plane carries no document: it is the editor's
                 // channel, and it serves no pages.
-                Arc::new(tinymist::tool::serve::SingleSite {
-                    doc: Arc::new(tinymist::tool::serve::DocServices {
-                        title: String::new(),
-                        diag_rx: None,
-                        annot: None,
-                        html: None,
-                    }),
-                    path: None,
-                }),
-                // The control plane serves the editor, not a browser.
-                false,
-                false,
-                tinymist::tool::preview::WebAppIdentity::new(
-                    tinymist::tool::preview::icons::IconRole::Serve,
-                ),
-                // The control plane serves the editor over loopback, so the
-                // origins a browser might reach the data plane by are none of
-                // its business.
+                None,
+                // It serves the editor over loopback, so the origins a browser
+                // might reach the data plane by are none of its business.
                 Vec::new(),
             )
             .await;
@@ -384,10 +297,11 @@ pub async fn preview_main(mut args: PreviewCliArgs) -> Result<()> {
         args.preview.page_title.as_deref(),
         args.compile.input.as_deref(),
     );
-    // HTML mode brings its own page: the paged frontend is a renderer for a
-    // document this mode does not produce, and nothing in it applies here.
+    // Two renderings, two pages. Pages are drawn into by the renderer at the
+    // other end of the websocket; HTML is a document the page fetches, and its
+    // page is the reading client.
     let mut frontend_html = if html_mode {
-        tinymist::tool::preview::html_annotations::shell_html()
+        tinymist::tool::render::html::shell_html()
     } else {
         frontend_html(
             TYPST_PREVIEW_HTML,
@@ -396,53 +310,32 @@ pub async fn preview_main(mut args: PreviewCliArgs) -> Result<()> {
             &page_title,
         )
     };
-    // The early trap watches for a paged render that never arrives, and would
-    // call an HTML-mode page broken for want of pages it never has.
-    let early = if html_mode {
-        String::new()
-    } else {
-        format!(
+    if !html_mode {
+        // A trap for a render that never arrives: without it a page that fails
+        // early is a blank one, with nothing to say why.
+        let early = format!(
             "<script>{}</script>",
             tinymist::tool::preview::EARLY_ERROR_JS
-        )
-    };
-    frontend_html = match frontend_html.find("<head>").filter(|_| !early.is_empty()) {
-        Some(at) => {
-            let mut html = frontend_html.clone();
-            html.insert_str(at + "<head>".len(), &early);
-            html
+        );
+        frontend_html = match frontend_html.find("<head>") {
+            Some(at) => {
+                let mut html = frontend_html.clone();
+                html.insert_str(at + "<head>".len(), &early);
+                html
+            }
+            None => format!("{early}{frontend_html}"),
+        };
+        let script = "<script src=\"/dev/overlay.js\"></script>";
+        if frontend_html.contains("</body>") {
+            frontend_html = frontend_html.replace("</body>", &format!("{script}</body>"));
+        } else {
+            frontend_html.push_str(script);
         }
-        None => format!("{early}{frontend_html}"),
-    };
-    let script = if html_mode {
-        ""
-    } else {
-        "<script src=\"/dev/overlay.js\"></script>"
-    };
-    if script.is_empty() {
-    } else if frontend_html.contains("</body>") {
-        frontend_html = frontend_html.replace("</body>", &format!("{script}</body>"));
-    } else {
-        frontend_html.push_str(script);
     }
 
     // Bound once: `args` is partially moved into the servers below, and both
     // of them accept the same origins.
     let allowed_origins = args.allowed_origins.clone();
-
-    // One document, which is a site with one nameless entry: the HTTP layer
-    // asks a site what a request is about, and this is the answer to every
-    // question it can be asked here.
-    let site: Arc<dyn tinymist::tool::serve::DocumentSite> =
-        Arc::new(tinymist::tool::serve::SingleSite {
-            doc: Arc::new(tinymist::tool::serve::DocServices {
-                title: String::new(),
-                diag_rx: Some(diag_rx),
-                annot: Some(annot),
-                html: html_server,
-            }),
-            path: args.compile.input.as_deref().map(std::path::PathBuf::from),
-        });
 
     let static_server = if let Some(static_file_host) = static_file_host {
         log::warn!(
@@ -454,10 +347,8 @@ pub async fn preview_main(mut args: PreviewCliArgs) -> Result<()> {
                 html,
                 static_file_host,
                 websocket_tx.clone(),
-                site.clone(),
-                shutdown_on_last_client,
-                args.mcp,
-                identity.clone(),
+                Some(diag_rx.clone()),
+                body.clone(),
                 allowed_origins.clone(),
             )
             .await,
@@ -466,18 +357,15 @@ pub async fn preview_main(mut args: PreviewCliArgs) -> Result<()> {
         None
     };
 
-    let srv =
-        make_http_server(
-            frontend_html,
-            args.data_plane_host,
-            websocket_tx,
-            site,
-            shutdown_on_last_client,
-            mcp,
-            identity.clone(),
-            allowed_origins,
-        )
-        .await;
+    let srv = make_http_server(
+        frontend_html,
+        args.data_plane_host,
+        websocket_tx,
+        Some(diag_rx),
+        body,
+        allowed_origins,
+    )
+    .await;
     log::info!(
         target: PREVIEW_COMPAT_LOG_TARGET,
         "Data plane server listening on: {}",
@@ -494,7 +382,7 @@ pub async fn preview_main(mut args: PreviewCliArgs) -> Result<()> {
 
     #[cfg(feature = "open")]
     if open_in_browser {
-        let path = tinymist::tool::preview::role_prefix(identity.role);
+        let path = tinymist::tool::webapp::role_prefix(identity.role);
         // The app to look for is the one this server would be added to the
         // Dock as — its manifest's short name — so opening lands in the window
         // that already belongs to this document rather than a stray browser
@@ -523,7 +411,7 @@ pub async fn preview_main(mut args: PreviewCliArgs) -> Result<()> {
     // ports and only one of them is meant for a person. A log line for each is
     // how the wrong one gets copied.
     {
-        let path = tinymist::tool::preview::role_prefix(identity.role);
+        let path = tinymist::tool::webapp::role_prefix(identity.role);
         let port = static_server_addr.port();
         println!();
         println!("{}", identity.title(port));

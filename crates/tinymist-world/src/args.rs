@@ -126,6 +126,83 @@ pub struct CompileOnceArgs {
     /// for downloading typst packages.
     #[clap(long = "cert", env = "TYPST_CERT", value_name = "CERT_PATH")]
     pub cert: Option<PathBuf>,
+
+    /// Which appearance the document is compiled for.
+    ///
+    /// A document that styles itself reads `sys.inputs.theme` — this is the
+    /// short way to set it, so that every caller spells the same convention
+    /// rather than each one inventing its own `--input` pair.
+    ///
+    /// `auto` follows the desktop's own setting, so that a preview matches the
+    /// window it is read in. Anything written to a file stays where it was put:
+    /// a PDF outlives the appearance setting of the machine that made it, so
+    /// this is `light` unless asked.
+    #[clap(long = "theme", value_name = "THEME", default_value = "light")]
+    pub theme: ThemeArg,
+}
+
+/// Which appearance a document is compiled for.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ThemeArg {
+    /// Whatever the desktop is set to.
+    Auto,
+    /// Dark on light.
+    #[default]
+    Light,
+    /// Light on dark.
+    Dark,
+}
+
+impl ThemeArg {
+    /// The `sys.inputs` pairs this theme stands for.
+    ///
+    /// One place says what a theme means, so that a document reads the same
+    /// keys whichever command compiled it.
+    ///
+    /// Light is the absence of them rather than a pair of its own: a document
+    /// that has never heard of a theme reads light, and adding a key that says
+    /// so would only be a second way of spelling the default.
+    pub fn input_pairs(self) -> impl Iterator<Item = (String, String)> {
+        let dark = matches!(self.resolve(), Self::Dark);
+        dark.then(|| {
+            [
+                ("theme".to_owned(), "dark".to_owned()),
+                ("dark-mode".to_owned(), "true".to_owned()),
+            ]
+        })
+        .into_iter()
+        .flatten()
+    }
+
+    /// The theme this resolves to: `auto` asks the desktop, and falls back to
+    /// light where there is nothing to ask.
+    pub fn resolve(self) -> Self {
+        match self {
+            Self::Auto if desktop_is_dark() => Self::Dark,
+            Self::Auto => Self::Light,
+            other => other,
+        }
+    }
+}
+
+/// Whether the desktop is in dark mode.
+///
+/// macOS answers by leaving `AppleInterfaceStyle` unset in light mode, so the
+/// read failing is the answer rather than an error.
+fn desktop_is_dark() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("defaults")
+            .args(["read", "-g", "AppleInterfaceStyle"])
+            .output()
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim() == "Dark")
+            .unwrap_or(false)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
 }
 
 impl CompileOnceArgs {
@@ -135,14 +212,22 @@ impl CompileOnceArgs {
     }
 
     /// Resolves the inputs.
+    ///
+    /// The theme goes in as a pair like any other, and is written first so that
+    /// an explicit `--input theme=…` still wins: the flag is the short way to
+    /// say a common thing, not a lock on it.
     pub fn resolve_inputs(&self) -> Option<ImmutDict> {
-        if self.inputs.is_empty() {
+        let theme = self.theme.resolve();
+        if self.inputs.is_empty() && matches!(theme, ThemeArg::Light) {
             return None;
         }
 
+        let theme = theme
+            .input_pairs()
+            .map(|(k, v)| (k.as_str().into(), v.as_str().into_value()));
         let pairs = self.inputs.iter();
         let pairs = pairs.map(|(k, v)| (k.as_str().into(), v.as_str().into_value()));
-        Some(Arc::new(LazyHash::new(pairs.collect())))
+        Some(Arc::new(LazyHash::new(theme.chain(pairs).collect())))
     }
 
     /// Resolves the entry options.

@@ -1,4 +1,14 @@
-//! Document preview tool for Typst
+//! The preview server: the page the editor's previewer talks to.
+//!
+//! One document, opened by an editor, rendered as pages over a websocket. It
+//! answers for exactly that: the frontend, its diagnostics stream, and the
+//! overlay script that draws them.
+//!
+//! The document *server* — a file or a directory served to a browser, with
+//! annotations, captures and an agent endpoint — is `tool/serve`, which has an
+//! HTTP server of its own. The two were one for a while, and everything the
+//! document server needs was steadily added here; keeping this one to what a
+//! previewer needs is what keeps it recognisable.
 
 use std::net::SocketAddr;
 use std::sync::LazyLock;
@@ -27,11 +37,11 @@ pub async fn make_http_server(
     frontend_html: String,
     static_file_addr: String,
     websocket_tx: mpsc::UnboundedSender<HyperWebsocket>,
-    site: std::sync::Arc<dyn crate::tool::serve::DocumentSite>,
-    shutdown_on_last_client: bool,
-    // Whether the machine face is served at `/m/`.
-    mcp: bool,
-    identity: super::WebAppIdentity,
+    diag_rx: Option<super::DiagRx>,
+    // The document as HTML, when that is what is being previewed. Pages are
+    // drawn by the renderer at the other end of the websocket; HTML is fetched
+    // from here.
+    body: Option<std::sync::Arc<dyn crate::tool::render::html::HtmlBody>>,
     allowed_origins: Vec<String>,
 ) -> HttpServer {
     use futures::StreamExt;
@@ -39,24 +49,6 @@ pub async fn make_http_server(
     use hyper::body::{Bytes, Frame, Incoming};
     type Server = hyper_util::server::conn::auto::Builder<hyper_util::rt::TokioExecutor>;
     type Body = http_body_util::combinators::UnsyncBoxBody<Bytes, std::convert::Infallible>;
-
-    /// One open page, counted for as long as its event stream lives. Page
-    /// count is the honest measure of "is anyone there": a browser keeps idle
-    /// TCP connections pooled long after the tab that opened them is gone, but
-    /// it tears down the event stream immediately.
-    struct ClientGuard(std::sync::Arc<std::sync::atomic::AtomicUsize>, usize);
-    impl Drop for ClientGuard {
-        fn drop(&mut self) {
-            let left = self
-                .0
-                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst)
-                .saturating_sub(1);
-            tinymist_project::announce(
-                "client_disconnected",
-                &[("id", self.1.into()), ("connected", left.into())],
-            );
-        }
-    }
 
     fn sse_frame(payload: &super::OverlayPayload) -> Result<Frame<Bytes>, std::convert::Infallible> {
         let payload = serde_json::to_string(payload).unwrap_or_default();
@@ -70,52 +62,23 @@ pub async fn make_http_server(
     log::info!("preview server listening on http://{addr}");
 
     let frontend_html = hyper::body::Bytes::from(frontend_html);
-    // Icons and manifests are keyed to the port this server answers on.
-    let port = addr.port();
-    let live = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let served_anyone = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let identity = std::sync::Arc::new(identity);
     let allowed_origins = std::sync::Arc::new(allowed_origins);
-    // Clients are numbered from zero as they arrive, so the line that says one
-    // has gone can name which one it was.
-    let next_client = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    // When an agent last called. A page says it is there by holding its event
-    // stream open, which is what "is anyone there" counts; an agent asks a
-    // question and goes away to think about the answer, so it says it is there
-    // by having asked recently.
-    let started = std::time::Instant::now();
-    let last_call = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let site = site.clone();
     let make_service = {
-        let last_call = last_call.clone();
-        let site = site.clone();
-        let live = live.clone();
-        let served_anyone = served_anyone.clone();
-        let identity = identity.clone();
         let allowed_origins = allowed_origins.clone();
-        let next_client = next_client.clone();
-        move |peer: std::net::SocketAddr| {
-        let last_call = last_call.clone();
+        move |_peer: std::net::SocketAddr| {
         let frontend_html = frontend_html.clone();
         let websocket_tx = websocket_tx.clone();
         let static_file_addr = static_file_addr.clone();
-        let site = site.clone();
-        let live = live.clone();
-        let served_anyone = served_anyone.clone();
-        let identity = identity.clone();
+        let diag_rx = diag_rx.clone();
+        let body = body.clone();
         let allowed_origins = allowed_origins.clone();
-        let next_client = next_client.clone();
         service_fn(move |mut req: hyper::Request<Incoming>| {
-            let identity = identity.clone();
-            let allowed_origins = allowed_origins.clone();
-            let last_call = last_call.clone();
             let frontend_html = frontend_html.clone();
             let websocket_tx = websocket_tx.clone();
             let static_file_addr = static_file_addr.clone();
-            let site = site.clone();
-            let next_client = next_client.clone();
-            let live = live.clone();
-            let served_anyone = served_anyone.clone();
+            let diag_rx = diag_rx.clone();
+            let body = body.clone();
+            let allowed_origins = allowed_origins.clone();
             async move {
                 // When a user visits a website in a browser, that website can try to connect to
                 // our http / websocket server on `127.0.0.1` which may leak sensitive
@@ -123,14 +86,6 @@ pub async fn make_http_server(
                 // this. However, for Websockets, this does not work. Thus, we
                 // manually check the `Origin` header. Browsers always send this
                 // header for cross-origin requests.
-                //
-                // Important: This does _not_ protect against malicious users that share the
-                // same computer as us (i.e. multi- user systems where the users
-                // don't trust each other). In this case, malicious attackers can _still_
-                // connect to our http / websocket servers (using a browser and
-                // otherwise). And additionally they can impersonate a tinymist
-                // http / websocket server towards a legitimate frontend/html client.
-                // This requires additional protection that may be added in the future.
                 let origin_header = req.headers().get("Origin");
                 if origin_header.is_some_and(|h| {
                     !is_valid_origin(h, &static_file_addr, addr.port(), &allowed_origins)
@@ -140,51 +95,15 @@ pub async fn make_http_server(
                     );
                 }
 
-                log::info!(
-                    target: crate::PREVIEW_COMPAT_LOG_TARGET,
-                    "{} {} ua={:?}",
-                    req.method(),
-                    req.uri().path(),
-                    req.headers()
-                        .get(hyper::header::USER_AGENT)
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("-"),
-                );
-                // Which document this request is about, and what it asks of
-                // it. A directory names the document in the first segment
-                // after the mode's prefix — `/a/paper/dev/html/doc` — and a
-                // single document leaves it out, so the same dispatch serves
-                // both and every endpoint sits under the page that uses it.
-                let raw_path = req.uri().path().to_owned();
-                let listing = site.is_listing();
-                let (page_role, slug, path) = match super::role_of_path(&raw_path) {
-                    // The site's own endpoints — the listing's data, chiefly —
-                    // are not a document called `dev`.
-                    Some((role, rest)) if listing && rest.starts_with("dev/") => {
-                        (Some(role), String::new(), format!("/{rest}"))
-                    }
-                    Some((role, rest)) if listing => match rest.split_once('/') {
-                        Some((slug, tail)) => (Some(role), slug.to_owned(), format!("/{tail}")),
-                        None => (Some(role), rest.to_owned(), String::new()),
-                    },
-                    Some((role, rest)) => (Some(role), String::new(), format!("/{rest}")),
-                    // Assets and the paged frontend's own endpoints are named
-                    // absolutely, from a page that is always the only one.
-                    None => (None, String::new(), raw_path.clone()),
-                };
-                let path = path.as_str();
-                // Building a document is compiling it, so it happens when one
-                // is asked for and not before: a directory of thirty papers is
-                // thirty compilers otherwise, to show a list of names.
-                let wants_doc = page_role.is_some() || path.starts_with("/dev/");
-                let doc = if wants_doc && !(listing && slug.is_empty()) {
-                    site.services(&slug).await
-                } else {
-                    None
-                };
-                let diag_rx = doc.as_ref().and_then(|d| d.diag_rx.clone());
-                let annot = doc.as_ref().and_then(|d| d.annot.clone());
-                let html = doc.as_ref().and_then(|d| d.html.clone());
+                let path = req.uri().path().to_owned();
+                // A preview lives at `/p/`, and a page there asks for
+                // everything beside it — so the prefix is stripped before
+                // anything is matched. One server, one document; the segment
+                // only says what kind of window this is.
+                let path = path
+                    .strip_prefix("/p")
+                    .filter(|rest| rest.starts_with('/'))
+                    .unwrap_or(&path);
 
                 // Check if the request is a websocket upgrade request.
                 if hyper_tungstenite::is_upgrade_request(&req) {
@@ -202,282 +121,69 @@ pub async fn make_http_server(
 
                     // Return the response so the spawned future can continue.
                     Ok(response.map(|b| Body::new(b)))
-                } else if let Some(icon) = super::icon_asset(&raw_path, port, &identity) {
+                } else if path == "/body.html" && body.is_some() {
+                    // The document itself, fetched by the page rather than
+                    // pushed down the websocket: HTML is a document, not a
+                    // stream of drawing commands.
+                    let (html, version) = body.unwrap().body();
                     let res = hyper::Response::builder()
-                        .header(hyper::header::CONTENT_TYPE, "image/png")
-                        .header(hyper::header::CACHE_CONTROL, "max-age=3600")
-                        .body(Body::new(Full::<Bytes>::from(icon)))
+                        .header(hyper::header::CONTENT_TYPE, "text/html; charset=utf-8")
+                        .header(hyper::header::CACHE_CONTROL, "no-cache")
+                        .header(hyper::header::ETAG, format!("\"{version}\""))
+                        .body(Body::new(Full::<Bytes>::from(html)))
                         .unwrap();
                     Ok(res)
-                } else if let Some(manifest) = super::web_manifest(&raw_path, port, &identity) {
-                    let res = hyper::Response::builder()
-                        .header(hyper::header::CONTENT_TYPE, "application/manifest+json")
-                        .body(Body::new(Full::<Bytes>::from(manifest)))
-                        .unwrap();
-                    Ok(res)
-                } else if let (Some(role), true) = (page_role, path.is_empty() || path == "/") {
-                    if tinymist_project::announcing() {
-                        // The id a page will answer to: a page opens its event
-                        // stream as soon as it loads, and takes the next number
-                        // when it does, so a request and the client it becomes
-                        // read as one story.
-                        let id = next_client.load(std::sync::atomic::Ordering::SeqCst);
-                        tinymist_project::announce(
-                            "client_requested",
-                            &[("id", id.into()), ("url", raw_path.clone().into())],
-                        );
-                    }
-                    // The mode rides in the URL's first segment, so each has its
-                    // own manifest, icon and dock app — and the rest of the path
-                    // names the document, which is how one server comes to serve
-                    // a directory.
-                    let identity = identity.with_role(role);
-                    if listing && slug.is_empty() {
-                        // The directory's own front page. It holds no documents
-                        // — it asks for them — so it is the same page whatever
-                        // is in the directory, and can be an asset like the
-                        // annotator's own script and stylesheet.
-                        let body = super::mode_head(&crate::tool::serve::listing_html(), &identity, port);
-                        return Ok(hyper::Response::builder()
-                            .header(hyper::header::CONTENT_TYPE, "text/html")
-                            .body(Body::new(Full::<Bytes>::from(body)))
-                            .unwrap());
-                    }
-                    if doc.is_none() {
-                        return Ok(hyper::Response::builder()
-                            .status(hyper::StatusCode::NOT_FOUND)
-                            .header(hyper::header::CONTENT_TYPE, "text/plain")
-                            .body(Body::new(Full::<Bytes>::from(format!(
-                                "no document named {slug}\n"
-                            ))))
-                            .unwrap());
-                    }
-                    // Every endpoint a page uses sits under the page's own URL,
-                    // which is only a base to resolve them against if it ends
-                    // in a slash.
-                    if path.is_empty() {
-                        return Ok(hyper::Response::builder()
-                            .status(hyper::StatusCode::MOVED_PERMANENTLY)
-                            .header(hyper::header::LOCATION, format!("{raw_path}/"))
-                            .body(Body::new(Full::<Bytes>::default()))
-                            .unwrap());
-                    }
-                    let named = doc
-                        .as_ref()
-                        .map(|d| d.title.clone())
-                        .filter(|title| !title.is_empty())
-                        .map(|title| identity.with_name(title));
-                    let identity = named.unwrap_or(identity);
-                    let page = super::mode_head(
-                        std::str::from_utf8(&frontend_html).unwrap_or_default(),
-                        &identity,
-                        port,
-                    );
-                    let res = hyper::Response::builder()
-                        .header(hyper::header::CONTENT_TYPE, "text/html")
-                        .body(Body::new(Full::<Bytes>::from(page)))
-                        .unwrap();
-                    Ok(res)
-                } else if raw_path == "/m" || raw_path.starts_with("/m/") {
-                    // The machine face, beside the pages rather than instead of
-                    // them: a person reads `/a/`, an agent calls `/m/`.
-                    if !mcp {
-                        let res = hyper::Response::builder()
-                            .status(hyper::StatusCode::NOT_FOUND)
-                            .header(hyper::header::CONTENT_TYPE, "text/plain")
-                            .body(Body::new(Full::<Bytes>::from(
-                                "this server was not started with --mcp\n",
-                            )))
-                            .unwrap();
-                        return Ok(res);
-                    }
-                    if req.method() != hyper::Method::POST {
-                        // The stream a client may open to be spoken to first is
-                        // not offered: everything here is asked for, including
-                        // waiting for something to happen.
-                        let res = hyper::Response::builder()
-                            .status(hyper::StatusCode::METHOD_NOT_ALLOWED)
-                            .header(hyper::header::ALLOW, "POST")
-                            .body(Body::new(Full::<Bytes>::default()))
-                            .unwrap();
-                        return Ok(res);
-                    }
-                    use http_body_util::BodyExt;
-                    last_call.store(
-                        started.elapsed().as_secs().max(1),
-                        std::sync::atomic::Ordering::SeqCst,
-                    );
-                    let body = req.into_body().collect().await?.to_bytes();
-                    let request: serde_json::Value =
-                        serde_json::from_slice(&body).unwrap_or_default();
-                    let answer = match request {
-                        // A batch, which the protocol allows.
-                        serde_json::Value::Array(calls) => {
-                            let mut answers = vec![];
-                            for call in calls {
-                                if let Some(answer) =
-                                    crate::tool::serve::mcp::handle(&site, call).await
-                                {
-                                    answers.push(answer);
-                                }
-                            }
-                            (!answers.is_empty())
-                                .then(|| serde_json::Value::Array(answers))
-                        }
-                        one => crate::tool::serve::mcp::handle(&site, one).await,
-                    };
-                    let res = match answer {
-                        Some(answer) => hyper::Response::builder()
-                            .header(hyper::header::CONTENT_TYPE, "application/json")
-                            .body(Body::new(Full::<Bytes>::from(answer.to_string())))
-                            .unwrap(),
-                        // A notification is answered with silence, which over
-                        // HTTP is an empty acceptance.
-                        None => hyper::Response::builder()
-                            .status(hyper::StatusCode::ACCEPTED)
-                            .body(Body::new(Full::<Bytes>::default()))
-                            .unwrap(),
-                    };
-                    Ok(res)
-                } else if raw_path == "/dev/stop" {
-                    // Asked to stop, which is not the same as being killed: the
-                    // rendered site is cleared up and the register is told.
-                    // Loopback only, like everything else that writes here.
-                    log::info!(
-                        target: crate::PREVIEW_COMPAT_LOG_TARGET,
-                        "asked to stop by {peer}"
-                    );
-                    let res = hyper::Response::builder()
-                        .header(hyper::header::CONTENT_TYPE, "text/plain")
-                        .body(Body::new(Full::<Bytes>::from("stopping\n")))
-                        .unwrap();
-                    tokio::spawn(async {
-                        // After the answer has gone out.
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                        crate::tool::serve::shutdown();
-                    });
-                    Ok(res)
-                } else if path == "/dev/events" {
-                    // What the server has said, with numbers on it. A client
-                    // asks with the last id it saw and waits for the next: a
-                    // loop is then the length of what happened, not of how
-                    // often it asked.
-                    let query = req.uri().query().unwrap_or("");
-                    let param = |name: &str| -> Option<String> {
-                        query.split('&').find_map(|pair| {
-                            let (key, value) = pair.split_once('=')?;
-                            (key == name).then(|| value.to_owned())
-                        })
-                    };
-                    let since = param("since").and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
-                    let wait = param("wait")
-                        .and_then(|v| v.parse::<u64>().ok())
-                        .unwrap_or(0)
-                        .min(300);
-                    let (mut events, mut cursor) = tinymist_project::events_since(since);
-                    if events.is_empty() && wait > 0 {
-                        let mut signal = tinymist_project::event_signal();
-                        let waited = tokio::time::timeout(
-                            std::time::Duration::from_secs(wait),
-                            signal.changed(),
+                } else if path == "/dev/html/annotate.js" || path == "/dev/html/annotate.css" {
+                    // The reading client, which is the annotator with nothing
+                    // to annotate: an editor's preview has no sidecar, and it
+                    // asks for none.
+                    let (asset, mime) = if path.ends_with(".js") {
+                        (
+                            crate::tool::render::html::client_js(),
+                            "application/javascript",
                         )
-                        .await;
-                        if waited.is_ok() {
-                            let fresh = tinymist_project::events_since(since);
-                            events = fresh.0;
-                            cursor = fresh.1;
-                        }
-                    }
-                    let payload = serde_json::json!({
-                        "ok": true,
-                        "events": events,
-                        "cursor": cursor,
-                    });
+                    } else {
+                        (crate::tool::render::html::client_css(), "text/css")
+                    };
                     let res = hyper::Response::builder()
-                        .header(hyper::header::CONTENT_TYPE, "application/json")
-                        .header(hyper::header::CACHE_CONTROL, "no-store")
-                        .body(Body::new(Full::<Bytes>::from(payload.to_string())))
+                        .header(hyper::header::CONTENT_TYPE, mime)
+                        .header(hyper::header::CACHE_CONTROL, "no-cache")
+                        .body(Body::new(Full::<Bytes>::from(asset)))
                         .unwrap();
                     Ok(res)
-                } else if path == "/dev/docs" && listing {
-                    // What the listing page draws: the directory as it is now.
-                    let began = std::time::Instant::now();
-                    let entries = site.listing();
-                    tinymist_project::announce(
-                        "compiled_listing",
-                        &[
-                            ("path", site.root().display().to_string().into()),
-                            ("file_count", entries.len().into()),
-                            ("elapsed", began.elapsed().as_secs_f64().into()),
-                        ],
-                    );
-                    let body =
-                        crate::tool::serve::listing_json(&identity.title(port), site.root(), &entries);
+                } else if path == "/dev/html/pins" {
+                    // Asked for by the same client; a preview has none.
                     let res = hyper::Response::builder()
                         .header(hyper::header::CONTENT_TYPE, "application/json")
-                        .body(Body::new(Full::<Bytes>::from(body)))
+                        .body(Body::new(Full::<Bytes>::from(
+                            "{\"ok\":true,\"pins\":[]}",
+                        )))
                         .unwrap();
                     Ok(res)
                 } else if path == "/dev/diagnostics" && diag_rx.is_some() {
                     // Stream diagnostics updates as server-sent events.
                     let rx = diag_rx.unwrap();
                     let init = rx.borrow().clone();
-                    use std::sync::atomic::Ordering::SeqCst;
-                    let now = live.fetch_add(1, SeqCst) + 1;
-                    served_anyone.store(true, SeqCst);
-                    let id = next_client.fetch_add(1, SeqCst);
-                    let guard = ClientGuard(live.clone(), id);
-                    if tinymist_project::announcing() {
-                        // Who, from the same header the annotations take their
-                        // author from: behind `tailscale serve` that is the
-                        // tailnet login, and on loopback it is whoever is
-                        // running the server.
-                        let headers = req.headers();
-                        let name =
-                            super::annotations::author_or_local(request_author(headers).as_deref());
-                        let agent = headers
-                            .get(hyper::header::USER_AGENT)
-                            .and_then(|value| value.to_str().ok())
-                            .unwrap_or("")
-                            .to_owned();
-                        // The address the request came from: a proxy's own, if
-                        // one forwarded it, else the connection's far end.
-                        let ip = headers
-                            .get("X-Forwarded-For")
-                            .and_then(|value| value.to_str().ok())
-                            .and_then(|value| value.split(',').next())
-                            .map(|value| value.trim().to_owned())
-                            .unwrap_or_else(|| peer.ip().to_string());
-                        tinymist_project::announce(
-                            "client_connected",
-                            &[
-                                ("id", id.into()),
-                                ("name", name.into()),
-                                ("useragent", agent.into()),
-                                ("ip", ip.into()),
-                                ("connected", now.into()),
-                            ],
-                        );
-                    }
                     // A comment line every few seconds. Nothing reads it: it
                     // exists so writing to a browser that has gone away fails,
                     // which is the only way this connection learns it is dead
                     // during a quiet stretch with no recompiles.
                     let stream = futures::stream::once(async move { sse_frame(&init) }).chain(
-                        futures::stream::unfold((rx, guard), |(mut rx, guard)| async move {
+                        futures::stream::unfold(rx, |mut rx| async move {
                             loop {
                                 let tick = tokio::time::sleep(std::time::Duration::from_secs(3));
                                 tokio::select! {
                                     changed = rx.changed() => {
-                                        changed.ok()?;
-                                        let payload = rx.borrow_and_update().clone();
-                                        return Some((sse_frame(&payload), (rx, guard)));
+                                        if changed.is_err() {
+                                            return None;
+                                        }
+                                        let payload = rx.borrow().clone();
+                                        return Some((sse_frame(&payload), rx));
                                     }
                                     _ = tick => {
-                                        return Some((
-                                            Ok(Frame::data(Bytes::from_static(b": ping\n\n"))),
-                                            (rx, guard),
-                                        ));
+                                        let ping: Result<Frame<Bytes>, std::convert::Infallible> =
+                                            Ok(Frame::data(Bytes::from(":\n\n")));
+                                        return Some((ping, rx));
                                     }
                                 }
                             }
@@ -498,319 +204,11 @@ pub async fn make_http_server(
                         .body(Body::new(Full::<Bytes>::from(super::overlay_js())))
                         .unwrap();
                     Ok(res)
-                } else if path == "/dev/build" {
-                    // Which build is answering. A server whose binary has been
-                    // replaced is on its way out but still holds its socket for
-                    // a moment; whoever is starting up needs to know that the
-                    // address it just probed is not the one it would reuse.
-                    let res = hyper::Response::builder()
-                        .header(hyper::header::CONTENT_TYPE, "text/plain")
-                        .header(hyper::header::CACHE_CONTROL, "no-store")
-                        .body(Body::new(Full::<Bytes>::from(super::build_stamp())))
-                        .unwrap();
-                    Ok(res)
-                } else if path == "/dev/clientlog" {
-                    // Frontend errors: logged to stderr and appended to a
-                    // well-known file so they can be found after the fact.
-                    use http_body_util::BodyExt;
-                    let body = req.into_body().collect().await?.to_bytes();
-                    let text = String::from_utf8_lossy(&body).to_string();
-                    log::error!(target: "tinymist::preview::client", "{text}");
-                    // A fixed, findable path (not the sandboxed per-user
-                    // temp dir): /tmp/tinymist-preview-client.log.
-                    let path = std::path::Path::new("/tmp/tinymist-preview-client.log");
-                    if let Ok(mut file) = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(path)
-                    {
-                        use std::io::Write;
-                        let _ = writeln!(file, "{text}");
-                    }
-                    let res = hyper::Response::builder()
-                        .status(hyper::StatusCode::OK)
-                        .body(Body::new(Full::<Bytes>::default()))
-                        .unwrap();
-                    Ok(res)
-                } else if path == "/body.html" && html.is_some() {
-                    // The rendered document, from disk: written once when it
-                    // compiled, and read by everyone who asks for it. The
-                    // version it was written at is its entity tag, so a browser
-                    // that already has this rendering is told so and keeps it.
-                    let html = html.unwrap();
-                    let (body, version) = html.body();
-                    let tag = format!("\"{version}\"");
-                    let known = req
-                        .headers()
-                        .get(hyper::header::IF_NONE_MATCH)
-                        .and_then(|value| value.to_str().ok())
-                        .is_some_and(|value| value == tag);
-                    let res = if known {
-                        hyper::Response::builder()
-                            .status(hyper::StatusCode::NOT_MODIFIED)
-                            .header(hyper::header::ETAG, tag)
-                            .body(Body::new(Full::<Bytes>::default()))
-                            .unwrap()
-                    } else {
-                        hyper::Response::builder()
-                            .header(hyper::header::CONTENT_TYPE, "text/html")
-                            .header(hyper::header::CACHE_CONTROL, "no-cache")
-                            .header(hyper::header::ETAG, tag)
-                            .body(Body::new(Full::<Bytes>::from(body)))
-                            .unwrap()
-                    };
-                    Ok(res)
-                } else if path == "/dev/html/annotate.js" || path == "/dev/html/annotate.css" {
-                    // The client itself, which is the same for every document
-                    // and for the listing: asked for without one, and read from
-                    // the source tree per request so an edit applies on reload.
-                    let (body, mime) = if path.ends_with(".js") {
-                        (
-                            super::html_annotations::client_js(),
-                            "application/javascript",
-                        )
-                    } else {
-                        (super::html_annotations::client_css(), "text/css")
-                    };
-                    let res = hyper::Response::builder()
-                        .header(hyper::header::CONTENT_TYPE, mime)
-                        .header(hyper::header::CACHE_CONTROL, "no-cache")
-                        .body(Body::new(Full::<Bytes>::from(body)))
-                        .unwrap();
-                    Ok(res)
-                } else if path.starts_with("/dev/html/") && html.is_some() {
-                    // HTML mode's own endpoints. The document arrives as a
-                    // fragment with every piece labelled with the source range
-                    // it came from; the annotations arrive as source offsets.
-                    // Geometry is the browser's business here, so none is sent.
-                    let html = html.unwrap();
-                    let (body, mime) = match path {
-                        "/dev/html/annotate.js" => (
-                            super::html_annotations::client_js(),
-                            "application/javascript",
-                        ),
-                        "/dev/html/annotate.css" => {
-                            (super::html_annotations::client_css(), "text/css")
-                        }
-                        "/dev/html/doc" => {
-                            let payload = match html.document() {
-                                Ok(doc) => {
-                                    let frag = super::html_annotations::fragment(&doc);
-                                    serde_json::json!({
-                                        "ok": true,
-                                        "title": frag.title,
-                                        "body": frag.body,
-                                    })
-                                }
-                                Err(err) => serde_json::json!({"ok": false, "error": err}),
-                            };
-                            (payload.to_string(), "application/json")
-                        }
-                        "/dev/html/pins" => {
-                            let payload = serde_json::json!({
-                                "ok": true,
-                                "pins": html.pins(),
-                            });
-                            (payload.to_string(), "application/json")
-                        }
-                        other => (
-                            serde_json::json!({
-                                "ok": false,
-                                "error": format!("unknown endpoint: {other}"),
-                            })
-                            .to_string(),
-                            "application/json",
-                        ),
-                    };
-                    let res = hyper::Response::builder()
-                        .header(hyper::header::CONTENT_TYPE, mime)
-                        .header(hyper::header::CACHE_CONTROL, "no-cache")
-                        .body(Body::new(Full::<Bytes>::from(body)))
-                        .unwrap();
-                    Ok(res)
-                } else if path == "/dev/annotations.js" && annot.is_some() {
-                    let res = hyper::Response::builder()
-                        .header(hyper::header::CONTENT_TYPE, "application/javascript")
-                        .header(hyper::header::CACHE_CONTROL, "no-cache")
-                        .body(Body::new(Full::<Bytes>::from(super::annotations_js())))
-                        .unwrap();
-                    Ok(res)
-                } else if path.starts_with("/dev/annotate") && annot.is_some() {
-                    // Annotation endpoints: POST /dev/annotate creates an
-                    // annotation at a clicked position; POST
-                    // /dev/annotate/delete removes one by id.
-                    use http_body_util::BodyExt;
-                    #[derive(serde::Deserialize)]
-                    struct UuidReq {
-                        uuid: String,
-                        #[serde(default)]
-                        text: String,
-                        #[serde(default)]
-                        status: String,
-                    }
-                    let path = path.to_owned();
-                    let annot = annot.unwrap();
-                    // Resolved before the body is consumed, and imposed on the
-                    // request afterwards: whatever the client claimed about
-                    // authorship is not consulted.
-                    let author = request_author(req.headers());
-                    let body = req.into_body().collect().await?.to_bytes();
-                    let parse_uuid = || {
-                        serde_json::from_slice::<UuidReq>(&body).map_err(|e| e.to_string())
-                    };
-                    let outcome = match path.as_str() {
-                        "/dev/annotate" => serde_json::from_slice::<super::AnnotateRequest>(&body)
-                            .map_err(|e| e.to_string())
-                            .and_then(|mut req| {
-                                req.author = author.clone();
-                                annot.annotate(req)
-                            }),
-                        "/dev/annotate/delete" => parse_uuid()
-                            .and_then(|req| annot.remove(&req.uuid).map(|()| String::new())),
-                        "/dev/annotate/reply" => parse_uuid().and_then(|req| {
-                            annot
-                                .reply(&req.uuid, &req.text, author.as_deref())
-                                .map(|()| String::new())
-                        }),
-                        "/dev/annotate/status" => parse_uuid().and_then(|req| {
-                            annot
-                                .set_status(&req.uuid, &req.status)
-                                .map(|()| String::new())
-                        }),
-                        "/dev/annotate/layout" => {
-                            let (status, body) = match annot.layout() {
-                                Ok(map) => (
-                                    hyper::StatusCode::OK,
-                                    serde_json::to_string(&serde_json::json!({
-                                        "ok": true,
-                                        "blocks": map.blocks,
-                                    }))
-                                    .unwrap_or_default(),
-                                ),
-                                Err(err) => (
-                                    hyper::StatusCode::BAD_REQUEST,
-                                    serde_json::json!({ "ok": false, "error": err })
-                                        .to_string(),
-                                ),
-                            };
-                            let res = hyper::Response::builder()
-                                .status(status)
-                                .header(hyper::header::CONTENT_TYPE, "application/json")
-                                .header(hyper::header::CACHE_CONTROL, "no-cache")
-                                .body(Body::new(Full::<Bytes>::from(body)))
-                                .unwrap();
-                            return Ok(res);
-                        }
-                        "/dev/annotate/words" => {
-                            #[derive(serde::Deserialize)]
-                            struct WordsReq {
-                                s: usize,
-                                e: usize,
-                            }
-                            let outcome = serde_json::from_slice::<WordsReq>(&body)
-                                .map_err(|e| e.to_string())
-                                .and_then(|req| annot.words(req.s, req.e));
-                            let (status, body) = match outcome {
-                                Ok(words) => (
-                                    hyper::StatusCode::OK,
-                                    serde_json::to_string(&serde_json::json!({
-                                        "ok": true, "words": words,
-                                    }))
-                                    .unwrap_or_default(),
-                                ),
-                                Err(err) => (
-                                    hyper::StatusCode::BAD_REQUEST,
-                                    serde_json::json!({ "ok": false, "error": err })
-                                        .to_string(),
-                                ),
-                            };
-                            let res = hyper::Response::builder()
-                                .status(status)
-                                .header(hyper::header::CONTENT_TYPE, "application/json")
-                                .body(Body::new(Full::<Bytes>::from(body)))
-                                .unwrap();
-                            return Ok(res);
-                        }
-                        "/dev/annotate/probe" => {
-                            #[derive(serde::Deserialize)]
-                            struct ProbeReq {
-                                page: usize,
-                                x: f64,
-                                y: f64,
-                                // A second point makes it a drag: the probe
-                                // reports the span it would create.
-                                #[serde(default)]
-                                page2: Option<usize>,
-                                #[serde(default)]
-                                x2: Option<f64>,
-                                #[serde(default)]
-                                y2: Option<f64>,
-                            }
-                            let outcome = serde_json::from_slice::<ProbeReq>(&body)
-                                .map_err(|e| e.to_string())
-                                .and_then(|req| {
-                                    match (req.page2, req.x2, req.y2) {
-                                        (Some(p2), Some(x2), Some(y2)) => annot.probe_span(
-                                            (req.page, req.x, req.y),
-                                            (p2, x2, y2),
-                                        ),
-                                        _ => annot.probe(req.page, req.x, req.y),
-                                    }
-                                });
-                            let (status, body) = match outcome {
-                                Ok(pos) => (
-                                    hyper::StatusCode::OK,
-                                    serde_json::json!({
-                                        "ok": true,
-                                        "scope": pos.scope,
-                                        "page": pos.page, "x": pos.x, "y": pos.y,
-                                        "rects": pos.rects,
-                                    })
-                                    .to_string(),
-                                ),
-                                Err(err) => (
-                                    hyper::StatusCode::BAD_REQUEST,
-                                    serde_json::json!({ "ok": false, "error": err })
-                                        .to_string(),
-                                ),
-                            };
-                            let res = hyper::Response::builder()
-                                .status(status)
-                                .header(hyper::header::CONTENT_TYPE, "application/json")
-                                .body(Body::new(Full::<Bytes>::from(body)))
-                                .unwrap();
-                            return Ok(res);
-                        }
-                        _ => Err(format!("unknown annotation endpoint: {path}")),
-                    };
-                    let (status, body) = match outcome {
-                        Ok(uuid) => (
-                            hyper::StatusCode::OK,
-                            serde_json::json!({ "ok": true, "uuid": uuid }).to_string(),
-                        ),
-                        Err(err) => (
-                            hyper::StatusCode::BAD_REQUEST,
-                            serde_json::json!({ "ok": false, "error": err }).to_string(),
-                        ),
-                    };
-                    let res = hyper::Response::builder()
-                        .status(status)
-                        .header(hyper::header::CONTENT_TYPE, "application/json")
-                        .body(Body::new(Full::<Bytes>::from(body)))
-                        .unwrap();
-                    Ok(res)
                 } else {
-                    // Anything else is a page asked for without a mode: send it
-                    // into this server's own, keeping whatever it named.
-                    let target = format!(
-                        "{}{}",
-                        super::role_prefix(identity.role),
-                        raw_path.trim_start_matches('/')
-                    );
+                    // Anything else is the previewer's own page.
                     let res = hyper::Response::builder()
-                        .status(hyper::StatusCode::FOUND)
-                        .header(hyper::header::LOCATION, target)
-                        .body(Body::new(Full::<Bytes>::default()))
+                        .header(hyper::header::CONTENT_TYPE, "text/html; charset=utf-8")
+                        .body(Body::new(Full::<Bytes>::from(frontend_html.clone())))
                         .unwrap();
                     Ok(res)
                 }
@@ -824,58 +222,6 @@ pub async fn make_http_server(
 
     // the graceful watcher
     let graceful = hyper_util::server::graceful::GracefulShutdown::new();
-
-    // Serving nobody: when the last browser goes away the server has no reason
-    // to outlive it. A short grace period covers a page reload, which drops
-    // every connection for a moment before opening new ones.
-    const IDLE_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
-    // How long an empty server waits before going, which depends on what is
-    // going on in it. A closed window usually means the reader is done, and ten
-    // seconds is enough to tell that from a reload. But a document an agent has
-    // been asked about is one it may come back to, and a document with an
-    // annotation somebody has claimed is one being worked on right now — the
-    // claim is the difference between a pause and an ending, and it is dropped
-    // as soon as the annotation is resolved or released.
-    const CLOSED: u64 = 10;
-    const AGENT_HERE: u64 = 60;
-    const AGENT_WORKING: u64 = 30 * 60;
-    if shutdown_on_last_client {
-        let live = live.clone();
-        let served_anyone = served_anyone.clone();
-        let last_call = last_call.clone();
-        let site = site.clone();
-        tokio::spawn(async move {
-            use std::sync::atomic::Ordering::SeqCst;
-            let mut empty_since: Option<std::time::Instant> = None;
-            loop {
-                tokio::time::sleep(IDLE_GRACE).await;
-                if !served_anyone.load(SeqCst) {
-                    continue;
-                }
-                if live.load(SeqCst) > 0 {
-                    empty_since = None;
-                    continue;
-                }
-                let empty = *empty_since.get_or_insert_with(std::time::Instant::now);
-                let called = last_call.load(SeqCst) > 0;
-                let grace = if called && crate::tool::serve::anyone_working(&site.sidecars()) {
-                    AGENT_WORKING
-                } else if called {
-                    AGENT_HERE
-                } else {
-                    CLOSED
-                };
-                if empty.elapsed().as_secs() < grace {
-                    continue;
-                }
-                log::info!(
-                    target: crate::PREVIEW_COMPAT_LOG_TARGET,
-                    "nobody here for {grace}s, shutting down"
-                );
-                crate::tool::serve::shutdown();
-            }
-        });
-    }
 
     let serve_conn = move |server: &Server, graceful: &GracefulShutdown, conn| {
         let (stream, peer_addr) = match conn {
@@ -966,24 +312,6 @@ fn log_connection_error(err: &(dyn std::error::Error + 'static)) {
     log::error!("cannot serve http: {err}");
 }
 
-/// The identity a request carries, when it has one.
-///
-/// `tailscale serve` authenticates the caller against the tailnet and injects
-/// the result, so a document served that way knows who is writing without
-/// asking anyone to log in. A direct loopback request has no such header, and
-/// the caller is whoever is running the server — see `author_or_local`.
-///
-/// Read from the headers and never from the body: the point of the header is
-/// that a proxy the client cannot forge sets it.
-fn request_author(headers: &hyper::HeaderMap) -> Option<String> {
-    headers
-        .get("Tailscale-User-Login")
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|login| !login.is_empty())
-        .map(str::to_owned)
-}
-
 /// Whether a configured origin is the one the browser sent.
 ///
 /// Configured values are normalised through `Url::origin`, so `http://typst`,
@@ -1002,7 +330,11 @@ fn origin_allows(configured: &str, origin_header: &HeaderValue) -> bool {
     }
 }
 
-fn is_valid_origin(
+/// Whether a browser at this origin may talk to this server.
+///
+/// Shared with the document server, which is a fork of this one: the rule is
+/// upstream's and there should be exactly one of it.
+pub(crate) fn is_valid_origin(
     h: &HeaderValue,
     static_file_addr: &str,
     expected_port: u16,

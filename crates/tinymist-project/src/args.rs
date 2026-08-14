@@ -38,6 +38,10 @@ pub struct DocNewArgs {
         value_parser = ValueParser::new(parse_input_pair),
     )]
     pub inputs: Vec<(String, String)>,
+    /// Which appearance the document is compiled for: sets `sys.inputs.theme`,
+    /// the same as `--input theme=…` but spelled once for everybody.
+    #[clap(long = "theme", value_name = "THEME", default_value = "light")]
+    pub theme: tinymist_world::args::ThemeArg,
     /// Specify the font related arguments.
     #[clap(flatten)]
     pub font: CompileFontArgs,
@@ -81,7 +85,8 @@ impl DocNewArgs {
             lock_dir: Some(ctx.1.to_path_buf()),
             root,
             main,
-            inputs: self.inputs.clone(),
+            // The theme first, so an explicit `--input theme=…` still wins.
+            inputs: self.theme.input_pairs().chain(self.inputs.iter().cloned()).collect(),
             font_paths,
             system_fonts: !self.font.ignore_system_fonts,
             package_path,

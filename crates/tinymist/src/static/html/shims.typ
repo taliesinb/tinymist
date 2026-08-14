@@ -192,15 +192,47 @@
 // linguistic content", which is what a drawing is.
 #let _drawing-lang = "zxx"
 
-/// Lays a drawing out the paged way, in a region wide enough to hold it, and
-/// centred there: a picture in flowing text sits in the middle of its column,
-/// which is what the paged rendering does with one.
-#let _frame-drawing(it) = html.frame(
-  block(width: _column, {
+/// Lays a drawing out the paged way and frames it at its own size.
+///
+/// The frame becomes an `<svg>` element as wide as the region it was laid out
+/// in, and that element is what a reader sees a box drawn around when the
+/// drawing is annotated — so a frame the width of the column puts a box the
+/// width of the column around a picture half that wide. Measured first, then
+/// laid out again at the width it needs, the element is the picture.
+///
+/// Content that asks for a fraction of the page has no size of its own to
+/// measure: it gets the column to be a fraction of, and is centred in it as
+/// the paged rendering would centre it.
+#let _frame-drawing(it) = html.frame(context {
+  let body = {
     set text(lang: _drawing-lang)
-    align(center, it)
-  }),
-)
+    it
+  }
+  // How wide the drawing is when the column is what its fractions are of. The
+  // layout below has to happen in the column all the same — a box asking for
+  // 70% of the page, laid out again in its own width, would ask for 70% of
+  // that and shrink — so the drawing is laid out wide and shown narrow.
+  // In points, both of them: an em is only a length once something has
+  // resolved it against the text size, and the two cannot be compared before
+  // that.
+  let column = measure(block(width: _column)).width
+  let ink = measure(body, width: column)
+  if ink.width > 0pt and ink.width < column {
+    // Laid out in the column, so a drawing asking for a fraction of the page
+    // still gets one, and placed rather than flowed, so the box around it is
+    // the size of the drawing rather than of the column it was measured in.
+    // Placing is what keeps the two apart: a placed thing has a position and
+    // no size, so the box keeps the size given here and the drawing sits in
+    // the middle of it, whichever way the document had centred it.
+    box(
+      width: ink.width,
+      height: ink.height,
+      place(center + horizon, block(width: column, body)),
+    )
+  } else {
+    block(width: column, align(center, body))
+  }
+})
 
 /// Whether an `html.elem` can be made here at all.
 #let _html-here() = target() == "html" and text.lang != _drawing-lang

@@ -475,6 +475,22 @@ impl<F: CompilerFeat + Send + Sync + 'static, Ext: Default + 'static> ProjectCom
 
     /// Restart a dedicate project.
     pub fn restart_dedicate(&mut self, group: &str, entry: EntryState) -> Result<ProjectInsId> {
+        self.restart_dedicate_as(group, entry, self.export_target)
+    }
+
+    /// The same, for a project rendered to something other than what the rest
+    /// of this compiler renders to.
+    ///
+    /// An editor previewing a document as HTML while its language features go
+    /// on being answered from a paged compile is one project each, and the two
+    /// targets differ: the preview is what the reader sees, and the primary is
+    /// what the editor asks questions of.
+    pub fn restart_dedicate_as(
+        &mut self,
+        group: &str,
+        entry: EntryState,
+        export_target: ExportTarget,
+    ) -> Result<ProjectInsId> {
         let id = ProjectInsId(group.into());
 
         let verse = CompilerUniverse::<F>::new_raw(
@@ -490,7 +506,7 @@ impl<F: CompilerFeat + Send + Sync + 'static, Ext: Default + 'static> ProjectCom
         let mut proj = Self::create_project(
             id.clone(),
             verse,
-            self.export_target,
+            export_target,
             self.syntax_only,
             self.handler.clone(),
         );

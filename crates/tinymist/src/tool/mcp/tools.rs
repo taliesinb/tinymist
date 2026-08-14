@@ -18,9 +18,9 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 
-use crate::tool::preview::{AnchorPolicy, AnnotationServer};
+use crate::tool::serve::annotations::{AnchorPolicy, AnnotationServer};
 
-use super::{DocServices, DocumentSite};
+use crate::tool::serve::{DocServices, DocumentSite};
 
 /// What this server calls itself to an agent.
 const SERVER_NAME: &str = "talimist";
@@ -164,6 +164,29 @@ fn tools() -> Vec<Tool> {
             },
         },
         Tool {
+            name: "get_capture",
+            title: "See what an annotation points at",
+            description: "Returns a picture of the thing a graphical annotation is about — a \
+                          plot, a diagram, a framed drawing — as an image you can look at, \
+                          together with anything the reader drew on top of it. The document is \
+                          source, so this is the only way to see what they saw. Defaults to the \
+                          most recent capture; earlier ones are the same drawing before it \
+                          changed.",
+            schema: || {
+                schema(
+                    json!({
+                        "uuid": string("The annotation's id, e.g. G001 — the same id as everywhere else. Its captures are listed on the annotation."),
+                        "index": {"type": "integer", "description": "Which capture: 0 is the most recent, 1 the one before it. Default 0."},
+                        "hash": optional_string("A capture's hash, when you want that exact one."),
+                        "markup": {"type": "boolean", "description": "Include what the reader drew on top. Default true; pass false to see the drawing bare."},
+                        "scale": {"type": "number", "description": "Size, as a multiple of the drawing's own. Default is half size, or less when that would still be over 1000px on the long edge."},
+                        "document": optional_string("Which document, when the server holds several."),
+                    }),
+                    &["uuid"],
+                )
+            },
+        },
+        Tool {
             name: "reply",
             title: "Reply to an annotation",
             description: "Adds a message to an annotation's discussion, which is where the \
@@ -256,10 +279,7 @@ async fn document_of(
 /// is somebody: it waits here rather than being told to come back, which is
 /// what a first call would otherwise mean.
 async fn annot_of(doc: &Arc<DocServices>) -> Result<Arc<dyn AnnotationServer>, String> {
-    let annot = doc
-        .annot
-        .clone()
-        .ok_or_else(|| "this document is served without annotations".to_owned())?;
+    let annot = doc.annot.clone();
     let began = std::time::Instant::now();
     while annot.compile_revision() == 0 {
         if began.elapsed() > std::time::Duration::from_secs(30) {
@@ -289,7 +309,7 @@ async fn compile_report(annot: &Arc<dyn AnnotationServer>, was: u64) -> Value {
 }
 
 /// One annotation, as the tools describe it.
-fn record_json(rec: &crate::tool::preview::AnnotationRecord, excerpt: Option<String>) -> Value {
+fn record_json(rec: &crate::tool::serve::annotations::AnnotationRecord, excerpt: Option<String>) -> Value {
     let mut value = serde_json::to_value(rec).unwrap_or_default();
     if let (Some(map), Some(excerpt)) = (value.as_object_mut(), excerpt) {
         map.insert("excerpt".into(), excerpt.into());
@@ -345,7 +365,7 @@ async fn call_tool(site: &Arc<dyn DocumentSite>, name: &str, args: &Value) -> Re
             let records = annot.records()?;
             let annotations: Vec<Value> = records
                 .iter()
-                .filter(|rec| status.as_ref().is_none_or(|want| &rec.status == want))
+                .filter(|rec| status.as_ref().is_none_or(|want| rec.status() == want))
                 .filter(|rec| author.as_ref().is_none_or(|want| &rec.author == want))
                 .map(|rec| record_json(rec, excerpt_of(&annot, &rec.uuid)))
                 .collect();
@@ -399,9 +419,9 @@ async fn call_tool(site: &Arc<dyn DocumentSite>, name: &str, args: &Value) -> Re
             let uuid = uuid()?;
             let (_, doc) = document_of(site, args).await?;
             let annot = annot_of(&doc).await?;
-            let status = if name == "claim" { "ongoing" } else { "created" };
-            annot.set_status(&uuid, status)?;
-            Ok(json!({ "uuid": uuid, "status": status }))
+            let claimed = name == "claim";
+            annot.set_flags(&uuid, Some(claimed), None)?;
+            Ok(json!({ "uuid": uuid, "claimed": claimed }))
         }
         "get_block" => {
             let uuid = uuid()?;
@@ -434,6 +454,75 @@ async fn call_tool(site: &Arc<dyn DocumentSite>, name: &str, args: &Value) -> Re
                 "block": block,
             }))
         }
+        "get_capture" => {
+            use crate::tool::serve::capture;
+            let uuid = uuid()?;
+            let (_, doc) = document_of(site, args).await?;
+            let annot = annot_of(&doc).await?;
+            let record = annot
+                .records()?
+                .into_iter()
+                .find(|rec| rec.uuid == uuid)
+                .ok_or_else(|| format!("no annotation {uuid}"))?;
+            if record.captures.is_empty() {
+                return Err(format!(
+                    "{uuid} has no captures: it does not point at a drawing, or the document has \
+                     not compiled since it was made"
+                ));
+            }
+            // Newest first, which is what "the picture" means unless an older
+            // one is asked for by name.
+            let newest = record.captures.len() - 1;
+            let wanted = match text("hash") {
+                Some(hash) => record
+                    .captures
+                    .iter()
+                    .position(|capture| capture.hash == hash)
+                    .ok_or_else(|| format!("{uuid} has no capture {hash}"))?,
+                None => {
+                    let back = args.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                    newest
+                        .checked_sub(back)
+                        .ok_or_else(|| format!("{uuid} has only {} captures", record.captures.len()))?
+                }
+            };
+            let chosen = &record.captures[wanted];
+            let source = capture::read(&chosen.hash, &chosen.fmt).ok_or_else(|| {
+                format!(
+                    "the capture {} is no longer stored; it is remade the next time the drawing \
+                     changes",
+                    chosen.hash
+                )
+            })?;
+            if chosen.fmt != "svg" {
+                return Err(format!(
+                    "captures stored as {} cannot be rendered yet",
+                    chosen.fmt
+                ));
+            }
+            let svg = String::from_utf8(source).map_err(|_| "the capture is not text".to_owned())?;
+            let with_markup = args.get("markup").and_then(Value::as_bool).unwrap_or(true);
+            let markup = chosen.markup.as_deref().filter(|_| with_markup);
+            let drawn = match markup {
+                Some(markup) => capture::with_markup(&svg, markup),
+                None => svg,
+            };
+            let scale = args.get("scale").and_then(Value::as_f64).map(|s| s as f32);
+            let png = capture::png(&drawn, scale)?;
+            use base64::Engine as _;
+            let data = base64::engine::general_purpose::STANDARD.encode(&png);
+            Ok(json!({
+                "image": { "data": data, "mimeType": "image/png" },
+                "uuid": uuid,
+                "hash": chosen.hash,
+                "time": chosen.time,
+                "index": newest - wanted,
+                "captures": record.captures.len(),
+                "markup": markup.is_some(),
+                "width": chosen.width,
+                "height": chosen.height,
+            }))
+        }
         "reply" => {
             let uuid = uuid()?;
             let said = text("text").ok_or("what should it say? pass text")?;
@@ -449,8 +538,10 @@ async fn call_tool(site: &Arc<dyn DocumentSite>, name: &str, args: &Value) -> Re
             if let Some(said) = text("text") {
                 annot.reply(&uuid, &said, text("author").as_deref())?;
             }
-            annot.set_status(&uuid, "resolved")?;
-            Ok(json!({ "uuid": uuid, "status": "resolved" }))
+            // Resolved and let go in one move: an annotation nobody needs to
+            // look at again is not one anybody is still holding.
+            annot.set_flags(&uuid, Some(false), Some(true))?;
+            Ok(json!({ "uuid": uuid, "claimed": false, "resolved": true }))
         }
         other => Err(format!("no such tool: {other}")),
     }
@@ -468,9 +559,30 @@ fn rpc_error(id: Value, code: i64, message: &str) -> Value {
 /// A tool result: text content, because that is what every client renders, and
 /// the structured value beside it for those that read it.
 fn tool_result(value: Value, failed: bool) -> Value {
+    // A tool that answers with a picture says so by putting it under `image`,
+    // which is lifted out here into a content block of its own: an image block
+    // is what a client renders and what a model can actually look at, and the
+    // base64 has no business being in the text beside it.
+    let mut value = value;
+    let image = value
+        .as_object_mut()
+        .and_then(|map| map.remove("image"))
+        .filter(|image| image.get("data").is_some());
     let text = serde_json::to_string_pretty(&value).unwrap_or_default();
+    let mut content = vec![];
+    if let Some(image) = image {
+        content.push(json!({
+            "type": "image",
+            "data": image.get("data").and_then(Value::as_str).unwrap_or_default(),
+            "mimeType": image
+                .get("mimeType")
+                .and_then(Value::as_str)
+                .unwrap_or("image/png"),
+        }));
+    }
+    content.push(json!({ "type": "text", "text": text }));
     json!({
-        "content": [{ "type": "text", "text": text }],
+        "content": content,
         "structuredContent": value,
         "isError": failed,
     })

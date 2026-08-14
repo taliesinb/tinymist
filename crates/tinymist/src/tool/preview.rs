@@ -1,25 +1,17 @@
 //! Document preview tool for Typst
 
 pub use compile::{PreviewCompileView, ProjectPreviewHandler};
-pub use annotations::{
-    annotation_pins, dev_asset, dev_asset_in, doc_file, sidecar_path, AnchorPolicy,
-    AnnotateRequest, AnnotationPin, AnnotationRecord, AnnotationServer, SourceBlock,
-    ANCHOR_PREFIX,
-};
-
 pub use error_overlay::{
-    annotations_js, annotations_js_path, cursor_overlay, EARLY_ERROR_JS, diagnostics_payload, doc_is_dark,
-    overlay_js, overlay_js_path, BlockExtent, DiagRx, DiagTx, OverlayPayload,
+    cursor_overlay, diagnostics_payload, doc_is_dark, overlay_js, overlay_js_path, BlockExtent,
+    DiagRx, DiagTx, OverlayPayload, EARLY_ERROR_JS,
 };
 pub use http::{make_http_server, HttpServer};
 
-pub mod html_annotations;
-pub mod icons;
 pub mod open;
-mod annotations;
+
 mod compile;
 mod error_overlay;
-mod http;
+pub(crate) mod http;
 
 use std::{collections::HashMap, path::Path, sync::Arc};
 
@@ -44,6 +36,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::actor::preview::{PreviewActor, PreviewRequest, PreviewTab};
 use crate::project::{ProjectInsId, ProjectPreviewState};
+use crate::world::vfs::ImmutPath;
 use crate::*;
 
 /// The kind of the preview.
@@ -84,13 +77,17 @@ impl From<RefreshStyle> for TaskWhen {
 pub struct PreviewArgs {
     /// Configure the preview output format.
     ///
-    /// `tinymist preview` does not write an output file, so this selects the
-    /// Typst compilation target used by the live preview.
-    #[clap(long = "format", default_value = "html", value_name = "FORMAT")]
-    pub format: ExportTarget,
+    /// A preview writes no output file, so this selects the Typst compilation
+    /// target the live preview renders from: `paged` draws the document as
+    /// pages, which is what a printed copy looks like; `html` reflows and is
+    /// much faster to update, which is what technical writing wants.
+    /// Unset means the caller did not say: the CLI draws pages, and the editor
+    /// draws whatever `preview.mode` asks for.
+    #[clap(long = "format", value_name = "FORMAT")]
+    pub format: Option<ExportTarget>,
 
     /// Preview the document as HTML. The default, and named so a command can
-    /// say what it means; the same spelling `talimist-serve` uses.
+    /// say what it means; the same spelling `talimist serve` uses.
     #[clap(long = "html")]
     pub html: bool,
 
@@ -178,8 +175,13 @@ impl PreviewArgs {
         } else if self.html {
             ExportTarget::Html
         } else {
-            self.format
+            self.format.unwrap_or(ExportTarget::Paged)
         }
+    }
+
+    /// Whether the caller said which rendering they wanted at all.
+    pub fn names_a_target(&self) -> bool {
+        self.paged_svg || self.html || self.format.is_some()
     }
 
     /// Get the configuration for the preview.
@@ -251,7 +253,7 @@ pub struct PreviewCliArgs {
     /// served to be annotated. It decides the name, the icon, and the URL
     /// prefix everything is served under. `--annotate` implies `annotate`.
     #[clap(long = "role", value_name = "ROLE", default_value = "preview")]
-    pub role: icons::IconRole,
+    pub role: crate::tool::webapp::icons::IconRole,
 
     /// Also answer agents, at `/m/`: an MCP endpoint over the same port, with
     /// tools for hearing about annotations, reading the source they point at,
@@ -355,268 +357,6 @@ impl PreviewCliArgs {
         !self.no_open && (self.open || default)
     }
 
-}
-
-/// What a server calls itself in the Dock: its role, and the two things an
-/// operator can override — the colour and the name.
-#[derive(Debug, Clone)]
-pub struct WebAppIdentity {
-    /// Which glyph the icon wears.
-    pub role: icons::IconRole,
-    /// The tile colour, if one was chosen; otherwise derived from the port.
-    pub color: Option<[u8; 3]>,
-    /// What the server serves, as a person would name it.
-    pub name: Option<String>,
-}
-
-impl WebAppIdentity {
-    /// An identity for a role, with nothing overridden.
-    pub fn new(role: icons::IconRole) -> Self {
-        Self { role, color: None, name: None }
-    }
-
-    /// The identity of a page, which may be the annotating face of a server
-    /// that is otherwise a plain one.
-    pub fn with_role(&self, role: icons::IconRole) -> Self {
-        Self { role, ..self.clone() }
-    }
-
-    /// The identity of one document out of several: a directory's server is
-    /// named after the directory, and each page in it after its own document.
-    pub fn with_name(&self, name: String) -> Self {
-        Self { name: Some(name), ..self.clone() }
-    }
-
-    /// What is being served, as a person would name it.
-    fn subject(&self, port: u16) -> String {
-        self.name.clone().unwrap_or_else(|| port.to_string())
-    }
-
-    /// The long name, for the browser's tab and the manifest's `name`.
-    pub fn title(&self, port: u16) -> String {
-        format!("{}: {}", self.role.title(), self.subject(port))
-    }
-
-    /// The name a Dock app takes, which is the manifest's `short_name`.
-    ///
-    /// Subject first, because that is what distinguishes one app from the next
-    /// once there are several — and a plain document server needs no suffix at
-    /// all, being the ordinary way to look at a document.
-    pub fn short_title(&self, port: u16) -> String {
-        let subject = self.subject(port);
-        match self.role {
-            icons::IconRole::Serve => subject,
-            icons::IconRole::Lsp => format!("{subject} (LSP)"),
-            icons::IconRole::Annotate => format!("{subject} (Annotator)"),
-        }
-    }
-}
-
-/// A stamp for the running binary: when it was last written. Two servers with
-/// the same stamp are the same build; a different one means the binary has
-/// been replaced since, and the older server is on its way out.
-/// Reads it now, while the binary on disk is still the one running: asked for
-/// the first time after a rebuild, the answer would be the *new* binary's
-/// stamp, and a server on its way out would claim to be the one taking over.
-pub fn note_build_stamp() {
-    let _ = build_stamp();
-}
-
-pub fn build_stamp() -> String {
-    use std::time::UNIX_EPOCH;
-    static STAMP: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    STAMP
-        .get_or_init(|| {
-            std::env::current_exe()
-                .and_then(std::fs::metadata)
-                .and_then(|meta| meta.modified())
-                .ok()
-                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-                .map(|since| since.as_nanos().to_string())
-                .unwrap_or_else(|| "unknown".into())
-        })
-        .clone()
-}
-
-/// Where each mode lives, as the first segment of every URL it serves: `/p/`
-/// for the editor's preview, `/v/` for a document served to be read, `/a/` for
-/// one served to be annotated.
-///
-/// A prefix rather than a page, because an installed web app matches links
-/// against its manifest's scope: everything under `/a/` belongs to the
-/// annotator, whatever document it names, so a document opened from a listing
-/// lands in the same app as one opened directly. The document is the rest of
-/// the path, which is how one server comes to serve a whole directory.
-pub fn role_prefix(role: icons::IconRole) -> &'static str {
-    match role {
-        icons::IconRole::Lsp => "/p/",
-        icons::IconRole::Serve => "/v/",
-        icons::IconRole::Annotate => "/a/",
-    }
-}
-
-/// The mode a path asks for, and the document under it, if it names one at
-/// all. `/a` and `/a/` both mean the annotator's own front page.
-pub fn role_of_path(path: &str) -> Option<(icons::IconRole, &str)> {
-    for role in [
-        icons::IconRole::Lsp,
-        icons::IconRole::Serve,
-        icons::IconRole::Annotate,
-    ] {
-        let prefix = role_prefix(role);
-        if path == prefix.trim_end_matches('/') {
-            return Some((role, ""));
-        }
-        if let Some(rest) = path.strip_prefix(prefix) {
-            return Some((role, rest));
-        }
-    }
-    None
-}
-
-/// The web-app furniture: each mode is a page of its own, with its own name,
-/// icon and manifest, so both can live in the Dock side by side. Safari takes
-/// the name, start URL, icons and scope from the manifest when there is one,
-/// and treats in-scope links as belonging to that app — which is what the
-/// per-mode prefix is for.
-pub fn mode_head(html: &str, identity: &WebAppIdentity, port: u16) -> String {
-    let prefix = role_prefix(identity.role);
-    let manifest = format!("{prefix}manifest.webmanifest");
-    let (manifest, icon) = match identity.role {
-        icons::IconRole::Lsp => (manifest.as_str(), "/icon/lsp-192.png"),
-        icons::IconRole::Serve => (manifest.as_str(), "/icon/serve-192.png"),
-        icons::IconRole::Annotate => (manifest.as_str(), "/icon/anno-192.png"),
-    };
-    let title = identity.title(port);
-    let head = format!(
-        "<title>{title}</title>\
-         <link rel=\"manifest\" href=\"{manifest}\">\
-         <link rel=\"apple-touch-icon\" href=\"{icon}\">\
-         <link rel=\"icon\" type=\"image/png\" href=\"{icon}\">"
-    );
-
-    // The bundled frontend ships its own title and icon; a browser takes the
-    // last icon it is offered, so ours has to both replace theirs and come
-    // last. Strip, then append at the end of the head.
-    let html = strip_tags(html, &["<title>"], &["</title>"]);
-    let html = strip_icon_links(&html);
-    match html.find("</head>") {
-        Some(at) => {
-            let mut out = String::with_capacity(html.len() + head.len());
-            out.push_str(&html[..at]);
-            out.push_str(&head);
-            out.push_str(&html[at..]);
-            out
-        }
-        None => format!("{head}{html}"),
-    }
-}
-
-/// Removes every `open..close` span from `html`.
-fn strip_tags(html: &str, open: &[&str], close: &[&str]) -> String {
-    let mut out = html.to_string();
-    for (open, close) in open.iter().zip(close) {
-        while let Some(start) = out.find(open) {
-            let Some(end) = out[start..].find(close) else {
-                break;
-            };
-            out.replace_range(start..start + end + close.len(), "");
-        }
-    }
-    out
-}
-
-/// Removes the `<link rel="icon">` and friends a page declares for itself.
-fn strip_icon_links(html: &str) -> String {
-    let mut out = String::with_capacity(html.len());
-    let mut rest = html;
-    while let Some(at) = rest.find("<link") {
-        let Some(len) = rest[at..].find('>') else {
-            break;
-        };
-        let tag = &rest[at..at + len + 1];
-        let is_icon = tag.contains("rel=\"icon\"")
-            || tag.contains("rel=\"shortcut icon\"")
-            || tag.contains("rel=\"apple-touch-icon\"");
-        out.push_str(&rest[..at]);
-        if !is_icon {
-            out.push_str(tag);
-        }
-        rest = &rest[at + len + 1..];
-    }
-    out.push_str(rest);
-    out
-}
-
-/// The PNG behind an `/icon/...` path, if it names one of ours.
-///
-/// Icons are synthesised rather than stored: the glyph comes from the role in
-/// the path and the colour from the port this server is bound to, so two
-/// servers never wear the same icon in the Dock.
-pub fn icon_asset(path: &str, port: u16, identity: &WebAppIdentity) -> Option<Vec<u8>> {
-    // Browsers ask for /favicon.ico whatever the page says, and Safari caches
-    // what it gets per origin — so leaving this to fall through to the page
-    // meant a stale icon stuck to the port.
-    if path == "/favicon.ico" || path == "/favicon.png" {
-        return icons::icon_png(identity.role, port, 192, identity.color).ok();
-    }
-    let name = path.strip_prefix("/icon/")?.strip_suffix(".png")?;
-    let (role, size) = name.rsplit_once('-')?;
-    let role = match role {
-        "lsp" => icons::IconRole::Lsp,
-        "serve" => icons::IconRole::Serve,
-        "anno" => icons::IconRole::Annotate,
-        _ => return None,
-    };
-    let size = match size {
-        "192" => 192,
-        "512" => 512,
-        _ => return None,
-    };
-    icons::icon_png(role, port, size, identity.color).ok()
-}
-
-/// The web app manifest for a mode's path, if it names one.
-pub fn web_manifest(path: &str, port: u16, identity: &WebAppIdentity) -> Option<String> {
-    // One manifest per mode, at that mode's own prefix, so an installed app's
-    // scope is the prefix and every document under it belongs to that app.
-    let (identity, start, scope) = match role_of_path(path) {
-        Some((role, "manifest.webmanifest")) => {
-            let prefix = role_prefix(role);
-            (identity.with_role(role), prefix, prefix)
-        }
-        // The bare one names whatever this server is, for a browser that asks
-        // before being redirected into a prefix.
-        _ if path == "/manifest.webmanifest" => {
-            let prefix = role_prefix(identity.role);
-            (identity.clone(), prefix, prefix)
-        }
-        _ => return None,
-    };
-    let icon = match identity.role {
-        icons::IconRole::Lsp => "lsp",
-        icons::IconRole::Serve => "serve",
-        icons::IconRole::Annotate => "anno",
-    };
-    let (bg, _) = icons::colors_for(port, identity.color);
-    let background = format!("#{:02x}{:02x}{:02x}", bg[0], bg[1], bg[2]);
-    let name = identity.title(port);
-    let short = identity.short_title(port);
-    Some(format!(
-        r##"{{
-  "name": "{name}",
-  "short_name": "{short}",
-  "start_url": "{start}",
-  "scope": "{scope}",
-  "display": "standalone",
-  "background_color": "{background}",
-  "icons": [
-    {{ "src": "/icon/{icon}-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable" }},
-    {{ "src": "/icon/{icon}-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }}
-  ]
-}}
-"##
-    ))
 }
 
 /// Exits when this process is orphaned — when whatever launched it is gone,
@@ -733,7 +473,7 @@ impl ServerState {
                 }
                 Some(Ok(resp)) => {
                     if let (Some(root), Some(addr)) = (root, resp.static_server_addr.as_deref()) {
-                        write_preview_addr_file(&root, addr);
+                        announce_preview(&root, addr);
                     }
                 }
                 None => {}
@@ -751,8 +491,13 @@ impl ServerState {
         let cli_args = ["preview"]
             .into_iter()
             .chain(cli_args.iter().map(|e| e.as_str()));
-        let cli_args =
+        let mut cli_args =
             PreviewCliArgs::try_parse_from(cli_args).map_err(|e| invalid_params(e.to_string()))?;
+        // Unsaid means the editor's own setting: a preview started from a
+        // command that names no rendering is the preview this editor asked for.
+        if !cli_args.preview.names_a_target() {
+            cli_args.preview.format = Some(self.config.preview.mode.into());
+        }
         // default configs
         let config = cli_args.preview.config(&self.config.preview());
 
@@ -789,13 +534,22 @@ impl ServerState {
         let is_browsing = matches!(kind, PreviewKind::Browsing | PreviewKind::Background);
         let is_background = matches!(kind, PreviewKind::Background);
 
-        let registered_as_primary = !cli_args.not_as_primary
+        // An HTML preview cannot ride on the primary instance: the primary is
+        // what language features are answered from, and it is paged. HTML gets
+        // an instance of its own, compiled through the shim wrapper — and
+        // follows the editor by being re-pointed, rather than by riding along.
+        let html_mode = matches!(cli_args.preview.export_target(), ExportTarget::Html);
+        let registered_as_primary = !html_mode
+            && !cli_args.not_as_primary
             && (is_browsing || entry.is_some())
             && self.preview.watchers.register(&primary.id, watcher);
-        if matches!(kind, PreviewKind::Background) && !registered_as_primary {
+        if matches!(kind, PreviewKind::Background) && !registered_as_primary && !html_mode {
             return Err(invalid_params(
                 "failed to register background preview to the primary instance",
             ));
+        }
+        if html_mode && !is_browsing && entry.is_none() {
+            return Err(invalid_params("a preview needs the file to preview"));
         }
 
         if registered_as_primary {
@@ -811,6 +565,39 @@ impl ServerState {
                 previewer,
                 id,
                 true,
+                is_background,
+                self.project.last_art.clone(),
+            )
+        } else if html_mode {
+            // A browsing HTML preview starts on whatever has focus — which may
+            // be nothing yet, in an editor that has only just opened — and is
+            // re-pointed from `follow_html_previews` as focus moves.
+            let entry = if is_browsing {
+                entry.or_else(|| self.focusing.clone())
+            } else {
+                entry
+            };
+            let id = self
+                .restart_dedicate_html(&task_id, entry.clone())
+                .map_err(internal_error)?;
+
+            if !self.project.preview.register(&id, watcher) {
+                return Err(invalid_params(
+                    "cannot register preview to the compiler instance",
+                ));
+            }
+            if is_browsing {
+                self.preview
+                    .html_followers
+                    .lock()
+                    .insert(task_id.clone(), entry);
+            }
+
+            self.preview.start(
+                cli_args,
+                previewer,
+                id,
+                false,
                 is_background,
                 self.project.last_art.clone(),
             )
@@ -855,20 +642,38 @@ fn derive_preview_port(root: &Path) -> u16 {
     23700 + (hash % 300) as u16
 }
 
-/// Records the bound preview address under the cache dir, keyed by workspace
-/// root (slashes replaced by `_`, matching `${ROOT//\//_}` in shell), so
-/// editor tasks can find the right window's preview server.
-fn write_preview_addr_file(root: &Path, addr: &str) {
-    let Some(cache_dir) = dirs::cache_dir() else {
+/// Leaves a note saying where this project's preview answers, so that anything
+/// else — `talimist open-preview`, an editor task, an agent — can find it
+/// without knowing how the port was arrived at.
+///
+/// The same register the document servers write to: one place to look for
+/// "what is running", whatever kind of thing it is.
+fn announce_preview(root: &Path, addr: &str) {
+    let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let Some(port) = addr.rsplit(':').next().and_then(|port| port.parse().ok()) else {
+        log::warn!("cannot read a port out of the preview address {addr}");
         return;
     };
-    let dir = cache_dir.join("tinymist").join("preview");
-    let name = format!("{}.addr", root.to_string_lossy().replace('/', "_"));
-    let result = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(dir.join(&name), addr));
-    if let Err(err) = result {
-        log::warn!("failed to write preview addr file {name}: {err}");
-    } else {
-        log::info!("preview addr for {} recorded as {addr}", root.display());
+    let note = crate::tool::registry::ServerNote {
+        server: crate::tool::registry::slug_for(&canonical),
+        path: canonical.display().to_string(),
+        url: format!("http://{addr}/"),
+        port,
+        role: "preview".into(),
+        mcp: false,
+        // A project, not a document: the editor's preview follows whatever file
+        // has focus.
+        directory: true,
+        pid: std::process::id(),
+        ppid: crate::tool::registry::parent_pid(),
+        // The language server's own process, which is answering the editor as
+        // well as drawing this: not a process to be reaped.
+        hosted: true,
+        started: tinymist_project::iso_now(),
+    };
+    match crate::tool::registry::announce_server(&note) {
+        Ok(_) => log::info!("preview for {} answers at {}", canonical.display(), note.url),
+        Err(err) => log::warn!("cannot announce the preview: {err}"),
     }
 }
 
@@ -887,6 +692,15 @@ pub struct PreviewState {
     pub overlay_enabled: bool,
     /// The editor's position encoding, used when preparing annotation edits.
     pub position_encoding: tinymist_query::PositionEncoding,
+    /// Previews that draw HTML and follow the focused file: the task each one
+    /// is, and the file it is showing.
+    ///
+    /// A paged preview follows the editor by riding the primary compile, which
+    /// is paged because that is what language features are answered from. An
+    /// HTML preview cannot ride it, so it is a project of its own — and
+    /// following has to be done by hand: when the editor moves, the project is
+    /// re-pointed at the file it moved to.
+    pub(crate) html_followers: Arc<parking_lot::Mutex<HashMap<String, Option<ImmutPath>>>>,
 }
 
 impl PreviewState {
@@ -917,6 +731,7 @@ impl PreviewState {
                 || config.preview.cursor_indicator
                 || config.preview().invert_colors.contains("smart"),
             position_encoding: config.const_config.position_encoding,
+            html_followers: Arc::default(),
         }
     }
 
@@ -947,43 +762,32 @@ impl PreviewState {
         project_id: ProjectInsId,
         is_primary: bool,
         is_background: bool,
+        // Held by the caller for the compile pipeline; the previewer itself has
+        // no use for it now that annotations are the document server's.
         last_art: Arc<parking_lot::Mutex<Option<tinymist_project::LspCompiledArtifact>>>,
     ) -> SchedulableResponse<StartPreviewResponse> {
-        let annot: Option<Arc<dyn AnnotationServer>> = self.overlay_enabled.then(|| {
-            Arc::new(LspAnnotationServer {
-                last_art: last_art.clone(),
-                client: self.client.clone(),
-                watchers: self.watchers.clone(),
-                project_id: project_id.clone(),
-                position_encoding: self.position_encoding,
-            }) as Arc<dyn AnnotationServer>
-        });
-        // The sidecar is not a compile dependency, so edits made to it by
-        // external tools (e.g. an agent flipping `completed`) trigger no
-        // compile; poll its mtime and push refreshed pins over SSE.
-        if annot.is_some() {
+        // Two renderings, two pages. Pages are drawn by the previewer at the
+        // other end of the websocket; HTML is a document the page fetches, and
+        // its page is the reading client — the annotator with nothing to
+        // annotate.
+        let html_mode = matches!(args.preview.export_target(), ExportTarget::Html);
+
+        // Dev asset watching: reload connected pages when the overlay script
+        // changes on disk.
+        if self.overlay_enabled {
             let watchers = self.watchers.clone();
             let poll_id = project_id.clone();
-            let poll_art = last_art.clone();
             self.client.handle.spawn(async move {
-                let mut last_mtime = None;
-                let mut js_mtime = (None, None);
+                let mut js_mtime = None;
                 let mut first = true;
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                     let Some(diag_tx) = watchers.diag_tx(&poll_id) else {
                         break;
                     };
-                    // Dev asset watching: reload connected pages when the
-                    // overlay script changes on disk.
-                    let mtime = (
-                        std::fs::metadata(error_overlay::overlay_js_path())
-                            .and_then(|m| m.modified())
-                            .ok(),
-                        std::fs::metadata(error_overlay::annotations_js_path())
-                            .and_then(|m| m.modified())
-                            .ok(),
-                    );
+                    let mtime = std::fs::metadata(error_overlay::overlay_js_path())
+                        .and_then(|m| m.modified())
+                        .ok();
                     if mtime != js_mtime {
                         js_mtime = mtime;
                         if !first {
@@ -991,23 +795,13 @@ impl PreviewState {
                         }
                     }
                     first = false;
-                    let Some(art) = poll_art.lock().clone() else {
-                        continue;
-                    };
-                    let Some(path) = annotations::sidecar_path(&art) else {
-                        continue;
-                    };
-                    let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
-                    if mtime == last_mtime {
-                        continue;
-                    }
-                    last_mtime = mtime;
-                    let pins = annotations::annotation_pins(&art);
-                    diag_tx.send_modify(|state| state.annotations = pins);
                 }
             });
         }
-        let diag_rx = self.overlay_enabled.then(|| {
+
+        // The HTML page has no websocket: the compile reaches it as an event on
+        // this stream, so it is not optional there.
+        let diag_rx = (self.overlay_enabled || html_mode).then(|| {
             let (diag_tx, diag_rx) = tokio::sync::watch::channel(OverlayPayload::default());
             self.watchers.register_diag(&project_id, diag_tx);
             diag_rx
@@ -1104,13 +898,20 @@ impl PreviewState {
                 args.preview.page_title.as_deref(),
                 args.compile.input.as_deref(),
             );
-            let mut frontend_html = frontend_html(
-                TYPST_PREVIEW_HTML,
-                args.preview.preview_mode,
-                "/",
-                &page_title,
-            );
-            if diag_rx.is_some() {
+            let body: Option<Arc<dyn crate::tool::render::html::HtmlBody>> = html_mode.then(|| {
+                Arc::new(crate::tool::render::html::ArtifactHtmlServer { last_art }) as Arc<_>
+            });
+            let mut frontend_html = if html_mode {
+                crate::tool::render::html::shell_html()
+            } else {
+                frontend_html(
+                    TYPST_PREVIEW_HTML,
+                    args.preview.preview_mode,
+                    "/",
+                    &page_title,
+                )
+            };
+            if diag_rx.is_some() && !html_mode {
                 let early = format!("<script>{EARLY_ERROR_JS}</script>");
                 frontend_html = match frontend_html.find("<head>") {
                     Some(at) => {
@@ -1134,28 +935,8 @@ impl PreviewState {
                 frontend_html,
                 args.data_plane_host,
                 websocket_tx,
-                // One document, the one the editor is looking at. The
-                // editor-driven preview is paged, so it has no HTML to serve.
-                Arc::new(crate::tool::serve::SingleSite {
-                    doc: Arc::new(crate::tool::serve::DocServices {
-                        title: String::new(),
-                        diag_rx,
-                        annot,
-                        html: None,
-                    }),
-                    // An editor's preview is not asked to outlive its window.
-                    path: None,
-                }),
-                // The editor owns this one's lifetime.
-                false,
-                // An editor's preview has no agents talking to it.
-                false,
-                WebAppIdentity {
-                    role: icons::IconRole::Lsp,
-                    color: args.icon_color.as_deref().and_then(icons::parse_hex),
-                    // The project, supplied by whoever started this server.
-                    name: args.root_name.clone(),
-                },
+                diag_rx,
+                body,
                 args.allowed_origins.clone(),
             )
             .await;
@@ -1174,8 +955,8 @@ impl PreviewState {
 
             #[cfg(feature = "open")]
             if open_in_browser {
-                let identity = WebAppIdentity {
-                    role: icons::IconRole::Lsp,
+                let identity = crate::tool::webapp::WebAppIdentity {
+                    role: crate::tool::webapp::icons::IconRole::Lsp,
                     color: None,
                     name: args.root_name.clone(),
                 };
@@ -1247,370 +1028,6 @@ impl PreviewState {
         sent.map_err(|_| internal_error("failed to send scroll request"))?;
 
         just_ok(JsonValue::Null)
-    }
-}
-
-/// Serves preview annotation requests for the LSP-hosted previews: source
-/// edits go to the editor as workspace edits (so they land in the editor
-/// buffer, undoable), the sidecar is written on disk, and the updated pins
-/// are pushed over the SSE overlay channel after the next compile.
-struct LspAnnotationServer {
-    last_art: Arc<parking_lot::Mutex<Option<tinymist_project::LspCompiledArtifact>>>,
-    client: TypedLspClient<PreviewState>,
-    watchers: ProjectPreviewState,
-    project_id: ProjectInsId,
-    position_encoding: tinymist_query::PositionEncoding,
-}
-
-impl LspAnnotationServer {
-    /// Applies the document half of an annotation edit (the sidecar half
-    /// goes through [`annotations::commit_sidecar`]).
-    fn apply_doc(&self, edit: &annotations::AnnotationEdit) -> Result<(), String> {
-        if let Some(content) = &edit.disk_content {
-            // Write the label straight to disk so external watchers (e.g.
-            // agents) see it immediately. For a clean editor buffer this is
-            // the whole edit (the editor reloads silently); for a dirty one
-            // it is a best-effort patch that the buffer's next save
-            // overwrites.
-            std::fs::write(&edit.path, content)
-                .map_err(|e| format!("failed to write {}: {e}", edit.path.display()))?;
-            log::info!("annotation {} written to disk: {}", edit.uuid, edit.path.display());
-        }
-        if edit.buffer_edit {
-            // Unsaved editor changes exist: the authoritative edit goes
-            // through the editor buffer, where it lands undoably and
-            // reaches disk on the next save.
-            let text_edit = lsp_types::TextEdit {
-                range: edit.range,
-                new_text: edit.new_text.clone(),
-            };
-            let mut changes = std::collections::HashMap::new();
-            changes.insert(edit.uri.clone(), vec![text_edit]);
-            let params = lsp_types::ApplyWorkspaceEditParams {
-                label: Some(format!("typst annotation {}", edit.uuid)),
-                edit: lsp_types::WorkspaceEdit {
-                    changes: Some(changes),
-                    ..Default::default()
-                },
-            };
-            self.client
-                .send_lsp_request::<lsp_types::request::ApplyWorkspaceEdit>(params, |_, resp| {
-                    if let Some(err) = resp.error {
-                        log::error!("annotation workspace edit failed: {err:?}");
-                    }
-                });
-        }
-
-        // The sidecar usually isn't a compile dependency, so its change alone
-        // wouldn't refresh the pins; the label edit comes back from the
-        // editor as a memory event and triggers a compile, whose notify pass
-        // recomputes the pins. Push an eager update for the delete case
-        // (where the entry is already gone from the sidecar).
-        let art = self.last_art.lock().clone();
-        if let (Some(art), Some(diag_tx)) = (art, self.watchers.diag_tx(&self.project_id)) {
-            let pins = annotations::annotation_pins(&art);
-            diag_tx.send_modify(|state| state.annotations = pins);
-        }
-        Ok(())
-    }
-}
-
-impl LspAnnotationServer {
-    fn art(&self) -> Result<tinymist_project::LspCompiledArtifact, String> {
-        self.last_art
-            .lock()
-            .clone()
-            .ok_or_else(|| "no compiled artifact yet".to_owned())
-    }
-
-    /// Pushes refreshed pins over SSE.
-    fn push_pins(&self) {
-        if let (Ok(art), Some(diag_tx)) = (self.art(), self.watchers.diag_tx(&self.project_id)) {
-            let pins = annotations::annotation_pins(&art);
-            diag_tx.send_modify(|state| state.annotations = pins);
-        }
-    }
-}
-
-impl AnnotationServer for LspAnnotationServer {
-    fn annotate(&self, req: annotations::AnnotateRequest) -> Result<String, String> {
-        let art = self.art()?;
-        let edit = annotations::commit_sidecar(&art, || {
-            let edit = annotations::prepare_annotate(&art, &req, self.position_encoding)?;
-            Ok((edit.sidecar.clone(), edit.sidecar_content.clone(), edit))
-        })?;
-        self.apply_doc(&edit)?;
-        Ok(edit.uuid)
-    }
-
-    fn remove(&self, uuid: &str) -> Result<(), String> {
-        let art = self.art()?;
-        let edit = annotations::commit_sidecar(&art, || {
-            let edit = annotations::prepare_delete(&art, uuid, self.position_encoding)?;
-            Ok((edit.sidecar.clone(), edit.sidecar_content.clone(), edit))
-        })?;
-        self.apply_doc(&edit)
-    }
-
-    fn reply(&self, uuid: &str, text: &str, author: Option<&str>) -> Result<(), String> {
-        let art = self.art()?;
-        annotations::commit_sidecar(&art, || {
-            let (path, content) = annotations::prepare_reply(&art, uuid, text, author)?;
-            Ok((path, content, ()))
-        })?;
-        self.push_pins();
-        Ok(())
-    }
-
-    fn set_status(&self, uuid: &str, status: &str) -> Result<(), String> {
-        let art = self.art()?;
-        annotations::commit_sidecar(&art, || {
-            let (path, content) = annotations::prepare_status(&art, uuid, status)?;
-            Ok((path, content, ()))
-        })?;
-        self.push_pins();
-        Ok(())
-    }
-
-    fn probe(&self, page: usize, x: f64, y: f64) -> Result<annotations::ProbeResult, String> {
-        annotations::probe_annotate(&self.art()?, page, x, y)
-    }
-
-
-    fn probe_span(
-        &self,
-        a: (usize, f64, f64),
-        b: (usize, f64, f64),
-    ) -> Result<annotations::ProbeResult, String> {
-        annotations::probe_span(&self.art()?, a, b)
-    }
-
-    fn layout(&self) -> Result<annotations::LayoutMap, String> {
-        Ok(annotations::layout_map(&self.art()?))
-    }
-
-    fn words(&self, s: usize, e: usize) -> Result<Vec<annotations::LayoutWord>, String> {
-        Ok(annotations::words_in_range(&self.art()?, s..e))
-    }
-}
-
-/// Serves preview annotation requests for the standalone CLI preview,
-/// which has no editor: all edits are written to disk directly (the CLI's
-/// world compiles from disk, so its sources cannot diverge except for a
-/// brief window after an external change, which the best-effort patch
-/// covers).
-pub struct DiskAnnotationServer {
-    /// The most recent compiled artifact.
-    pub last_art: Arc<parking_lot::Mutex<Option<tinymist_project::LspCompiledArtifact>>>,
-    /// The preview watchers holding the SSE diagnostics channel.
-    pub watchers: ProjectPreviewState,
-    /// The project instance id.
-    pub project_id: ProjectInsId,
-    /// Whether to emit annotation events as JSON lines on stdout, for
-    /// driving agents: annotation_added, discussion_extended,
-    /// annotation_deleted, annotation_status_changed.
-    pub emit_events: bool,
-}
-
-impl DiskAnnotationServer {
-    fn art(&self) -> Result<tinymist_project::LspCompiledArtifact, String> {
-        self.last_art
-            .lock()
-            .clone()
-            .ok_or_else(|| "no compiled artifact yet".to_owned())
-    }
-
-    fn push_pins(&self) {
-        if let (Ok(art), Some(diag_tx)) = (self.art(), self.watchers.diag_tx(&self.project_id)) {
-            let pins = annotations::annotation_pins(&art);
-            diag_tx.send_modify(|state| state.annotations = pins);
-        }
-    }
-
-    /// Applies the document half of an annotation edit (the sidecar half
-    /// goes through [`annotations::commit_sidecar`]).
-    fn apply_doc(&self, edit: &annotations::AnnotationEdit) -> Result<(), String> {
-        let content = edit
-            .disk_content
-            .as_ref()
-            .ok_or("cannot apply the edit: the file has diverged on disk")?;
-        std::fs::write(&edit.path, content)
-            .map_err(|e| format!("failed to write {}: {e}", edit.path.display()))?;
-        self.push_pins();
-        Ok(())
-    }
-
-    /// One event, as one line of JSON on stdout — where a driving agent reads
-    /// them, unlike the server's own narration, which goes to stderr.
-    ///
-    /// Written field by field rather than serialised from a map, for the same
-    /// reason the narration is: `type` first, `ts` last, and the rest in the
-    /// order they were written, so the line reads the way it was designed to.
-    fn emit(&self, kind: &str, fields: &[(&str, serde_json::Value)]) {
-        if !self.emit_events {
-            return;
-        }
-        let line = tinymist_project::event_line(kind, fields);
-        // Kept as well as printed: an agent that asks what happened while it
-        // was thinking gets these alongside everything else the server said.
-        tinymist_project::record_event(serde_json::from_str(&line).unwrap_or_default());
-        use std::io::Write;
-        let mut out = std::io::stdout().lock();
-        let _ = out.write_all(line.as_bytes());
-        let _ = out.write_all(b"\n");
-        let _ = out.flush();
-    }
-}
-
-impl AnnotationServer for DiskAnnotationServer {
-    fn annotate(&self, req: annotations::AnnotateRequest) -> Result<String, String> {
-        let art = self.art()?;
-        let edit = annotations::commit_sidecar(&art, || {
-            let edit = annotations::prepare_annotate(
-                &art,
-                &req,
-                tinymist_query::PositionEncoding::Utf16,
-            )?;
-            Ok((edit.sidecar.clone(), edit.sidecar_content.clone(), edit))
-        })?;
-        self.apply_doc(&edit)?;
-        let record = annotations::parse_records(&edit.sidecar_content)
-            .into_iter()
-            .find(|rec| rec.uuid == edit.uuid);
-        if let Some(record) = record {
-            self.emit(
-                "annotation_added",
-                &[("value", serde_json::to_value(&record).unwrap_or_default())],
-            );
-        }
-        Ok(edit.uuid)
-    }
-
-    fn remove(&self, uuid: &str) -> Result<(), String> {
-        let art = self.art()?;
-        let edit = annotations::commit_sidecar(&art, || {
-            let edit = annotations::prepare_delete(
-                &art,
-                uuid,
-                tinymist_query::PositionEncoding::Utf16,
-            )?;
-            Ok((edit.sidecar.clone(), edit.sidecar_content.clone(), edit))
-        })?;
-        self.apply_doc(&edit)?;
-        self.emit("annotation_deleted", &[("uuid", uuid.into())]);
-        Ok(())
-    }
-
-    fn reply(&self, uuid: &str, text: &str, author: Option<&str>) -> Result<(), String> {
-        let art = self.art()?;
-        annotations::commit_sidecar(&art, || {
-            let (path, content) = annotations::prepare_reply(&art, uuid, text, author)?;
-            Ok((path, content, ()))
-        })?;
-        self.push_pins();
-        self.emit(
-            "discussion_extended",
-            &[
-                ("uuid", uuid.into()),
-                ("author", annotations::local_author().into()),
-                ("text", text.into()),
-            ],
-        );
-        Ok(())
-    }
-
-    fn set_status(&self, uuid: &str, status: &str) -> Result<(), String> {
-        let art = self.art()?;
-        annotations::commit_sidecar(&art, || {
-            let (path, content) = annotations::prepare_status(&art, uuid, status)?;
-            Ok((path, content, ()))
-        })?;
-        self.push_pins();
-        self.emit(
-            "annotation_status_changed",
-            &[("uuid", uuid.into()), ("status", status.into())],
-        );
-        Ok(())
-    }
-
-    fn probe(&self, page: usize, x: f64, y: f64) -> Result<annotations::ProbeResult, String> {
-        annotations::probe_annotate(&self.art()?, page, x, y)
-    }
-
-    fn block(&self, uuid: &str, context: bool) -> Result<annotations::SourceBlock, String> {
-        annotations::block_of(&self.art()?, uuid, context)
-    }
-
-    fn replace_block(
-        &self,
-        uuid: &str,
-        block_id: &str,
-        new_text: &str,
-        policy: annotations::AnchorPolicy,
-    ) -> Result<Vec<String>, String> {
-        let art = self.art()?;
-        let edit = annotations::prepare_block_replace(&art, uuid, block_id, new_text, policy)?;
-        std::fs::write(&edit.path, &edit.content)
-            .map_err(|err| format!("cannot write {}: {err}", edit.path.display()))?;
-        // The anchors the rewrite dropped were dropped on purpose, so their
-        // annotations go too — an entry with nothing to point at is litter.
-        for uuid in &edit.dropped {
-            // The anchor is already gone with the text; only the entry is left.
-            if let Ok((path, content)) = annotations::remove_record(&art, uuid) {
-                let _ = std::fs::write(path, content);
-            }
-        }
-        self.emit(
-            "block_replaced",
-            &[
-                ("uuid", uuid.into()),
-                ("file", edit.path.display().to_string().into()),
-                ("dropped", serde_json::to_value(&edit.dropped).unwrap_or_default()),
-            ],
-        );
-        Ok(edit.dropped)
-    }
-
-    fn compile_revision(&self) -> u64 {
-        self.last_art
-            .lock()
-            .as_ref()
-            .map(|art| {
-                let rev = art.graph.snap.world.revision();
-                rev.get() as u64
-            })
-            .unwrap_or(0)
-    }
-
-    fn diagnostics(&self) -> (bool, Vec<String>) {
-        let Ok(art) = self.art() else {
-            return (false, vec!["nothing compiled yet".into()]);
-        };
-        let payload = diagnostics_payload(&art, None);
-        (payload.ok, payload.messages)
-    }
-
-    fn records(&self) -> Result<Vec<annotations::AnnotationRecord>, String> {
-        let art = self.art()?;
-        let sidecar =
-            annotations::sidecar_path(&art).ok_or("cannot determine the sidecar path")?;
-        Ok(annotations::read_sidecar(&sidecar).0)
-    }
-
-    fn probe_span(
-        &self,
-        a: (usize, f64, f64),
-        b: (usize, f64, f64),
-    ) -> Result<annotations::ProbeResult, String> {
-        annotations::probe_span(&self.art()?, a, b)
-    }
-
-    fn layout(&self) -> Result<annotations::LayoutMap, String> {
-        Ok(annotations::layout_map(&self.art()?))
-    }
-
-    fn words(&self, s: usize, e: usize) -> Result<Vec<annotations::LayoutWord>, String> {
-        Ok(annotations::words_in_range(&self.art()?, s..e))
     }
 }
 

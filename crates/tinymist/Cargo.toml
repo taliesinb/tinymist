@@ -39,6 +39,8 @@ lsp-types.workspace = true
 log.workspace = true
 open = { workspace = true, optional = true }
 parking_lot.workspace = true
+resvg = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
 paste.workspace = true
 rayon.workspace = true
 reflexo.workspace = true
@@ -120,6 +122,7 @@ battery = ["tinymist-std/battery"]
 dap = ["sync-ls/dap", "tinymist-dap", "tinymist-debug"]
 # Enables preview server.
 preview = [
+    "dep:sha2",
     "http-body-util",
     "hyper",
     "hyper-util",
@@ -128,12 +131,18 @@ preview = [
     "tinymist-preview",
     "tinymist-preview/clap",
 ]
+# Enables the document server: a file or a directory served to a browser, with
+# annotations, captures and an endpoint agents talk to. Built on the preview
+# server's compile pipeline, which is why it takes `preview` with it.
+serve = ["preview", "dep:resvg"]
 # Enables tinymist.lock
 lock = []
 # Enables export command.
 export = []
-# Enables trace command.
-trace = []
+# Enables trace command, whose report is served over HTTP: the same server
+# crates the preview uses, which is why it asks for them itself rather than
+# borrowing them from a feature it has nothing to do with.
+trace = ["http-body-util", "hyper", "hyper-util"]
 # Enables open feature. (open by system app after export.)
 open = ["dep:open"]
 

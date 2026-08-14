@@ -34,6 +34,13 @@ pub struct CachedBody {
 pub struct SiteCache {
     /// The directory everything is written under.
     dir: PathBuf,
+    /// Where this server's version numbers start.
+    ///
+    /// Counting from one in every server would let a browser hold a body from
+    /// the *previous* server on this port, ask whether version one is still
+    /// current, and be told yes — a page a restart could not refresh. Starting
+    /// from the clock means no two servers ever answer for the same number.
+    epoch: u64,
     /// What has been written, by the document it was rendered from.
     written: parking_lot::Mutex<HashMap<PathBuf, CachedBody>>,
 }
@@ -42,8 +49,15 @@ impl SiteCache {
     /// A cache under a directory of its own, made now.
     pub fn new(dir: PathBuf) -> std::io::Result<Self> {
         std::fs::create_dir_all(&dir)?;
+        let epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_secs())
+            .unwrap_or(0);
         Ok(Self {
             dir,
+            // Room for a million rewrites before one server's numbers could
+            // reach the next second's, which is more than a document sees.
+            epoch: epoch << 20,
             written: parking_lot::Mutex::new(HashMap::new()),
         })
     }
@@ -88,7 +102,10 @@ impl SiteCache {
             }
         }
         std::fs::write(&path, body).ok()?;
-        let version = written.get(doc).map(|it| it.version + 1).unwrap_or(1);
+        let version = written
+            .get(doc)
+            .map(|it| it.version + 1)
+            .unwrap_or(self.epoch + 1);
         let entry = CachedBody { path, version };
         written.insert(doc.to_path_buf(), entry.clone());
         Some(entry)

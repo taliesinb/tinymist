@@ -17,14 +17,25 @@
 //! papers is thirty compilers if they all start at once, and a reader opens
 //! one.
 
+pub mod annotations;
 mod cache;
-pub mod hub;
-pub mod mcp;
-pub mod registry;
+pub mod capture;
+pub mod pins;
+pub mod http;
+pub mod sidecar;
 
-pub use registry::{
+pub use crate::tool::registry::{
     announce_server, running_servers, slug_for, withdraw_server, ServerNote,
 };
+
+pub use annotations::{
+    dev_asset, dev_asset_in, sidecar_path, AnchorPolicy, AnnotateRequest, AnnotationRecord,
+    AnnotationServer, DiskAnnotationServer, SourceBlock, ANCHOR_PREFIX,
+};
+
+pub use crate::tool::render::html::doc_file;
+
+pub use http::{make_http_server, HttpServer};
 
 pub use cache::{
     drop_site_cache, site_cache, sweep_stale_sites, temp_site_dir, use_site_cache, CachedBody,
@@ -39,12 +50,12 @@ use std::sync::Arc;
 pub struct DocServices {
     /// The document's own name, for the window and the web app.
     pub title: String,
-    /// Diagnostics, annotations and asset versions, pushed to the page.
-    pub diag_rx: Option<crate::tool::preview::DiagRx>,
-    /// Reading and writing annotations.
-    pub annot: Option<Arc<dyn crate::tool::preview::AnnotationServer>>,
-    /// The document as labelled HTML, in HTML mode.
-    pub html: Option<Arc<dyn crate::tool::preview::html_annotations::HtmlAnnotationServer>>,
+    /// Diagnostics, annotation and asset versions, pushed to the page.
+    pub diag_rx: crate::tool::preview::DiagRx,
+    /// Reading and writing its annotations.
+    pub annot: Arc<dyn annotations::AnnotationServer>,
+    /// The document as labelled HTML.
+    pub body: Arc<dyn crate::tool::render::html::HtmlBody>,
 }
 
 /// One document as a listing shows it: what it is called, where it is, and how
@@ -100,8 +111,8 @@ pub trait DocumentSite: Send + Sync + 'static {
 /// What a server does on its way out, however it was asked: withdraw its note
 /// from the register, clear up what it rendered, and go.
 pub fn shutdown() -> ! {
-    if let Some(port) = registry::my_port() {
-        registry::withdraw_server(port);
+    if let Some(port) = crate::tool::registry::my_port() {
+        crate::tool::registry::withdraw_server(port);
     }
     cache::drop_site_cache();
     std::process::exit(0);
@@ -182,7 +193,7 @@ fn annotation_count(doc: &Path) -> usize {
     let Ok(text) = std::fs::read_to_string(sidecar) else {
         return 0;
     };
-    let entry = format!("<{}", crate::tool::preview::ANCHOR_PREFIX);
+    let entry = format!("<{}", annotations::ANCHOR_PREFIX);
     text.match_indices(&entry)
         // The prelude shows what an entry looks like; the example in it is not
         // an annotation.
@@ -278,10 +289,10 @@ pub fn anyone_working(sidecars: &[PathBuf]) -> bool {
 /// edited without a rebuild — as the annotator's own script and stylesheet are.
 /// The page holds no documents: it asks for them.
 pub fn listing_html() -> String {
-    crate::tool::preview::dev_asset_in(
+    annotations::dev_asset_in(
         "serve",
         "listing.html",
-        include_str!("serve/listing.html"),
+        include_str!("../static/serve/listing.html"),
     )
 }
 

@@ -75,9 +75,6 @@ pub struct OverlayPayload {
     /// background. `None` means unknown; the frontend keeps its previous
     /// value.
     pub doc_dark: Option<bool>,
-    /// The annotations of the current main file, resolved onto the last
-    /// successful render.
-    pub annotations: Vec<super::annotations::AnnotationPin>,
     /// Bumped when a dev asset (the overlay script) changes on disk; the
     /// frontend reloads the page when it sees a new version.
     pub asset_version: u64,
@@ -85,6 +82,10 @@ pub struct OverlayPayload {
     /// again when this moves, and stays where it is otherwise: a compile that
     /// produced the same page is not a reason to redraw one.
     pub doc_version: u64,
+    /// Bumped when the annotations of the document change without the document
+    /// itself changing — somebody replied, an agent claimed something, a file
+    /// was edited outside the compile. A page fetches them again when it moves.
+    pub anno_version: u64,
 }
 
 /// The vertical extent of a block on a page.
@@ -114,9 +115,9 @@ impl Default for OverlayPayload {
             cursor: None,
             smart_invert: false,
             doc_dark: None,
-            annotations: vec![],
             asset_version: 0,
             doc_version: 0,
+            anno_version: 0,
         }
     }
 }
@@ -492,9 +493,9 @@ pub fn diagnostics_payload(
         cursor: None,
         smart_invert: false,
         doc_dark: None,
-        annotations: vec![],
         asset_version: 0,
         doc_version: 0,
+        anno_version: 0,
     }
 }
 
@@ -503,12 +504,12 @@ pub fn diagnostics_payload(
 /// The overlay script, loaded from the source tree when available so it can
 /// be edited without rebuilding (served per request via `/dev/overlay.js`).
 pub fn overlay_js() -> String {
-    super::annotations::dev_asset("error_overlay.js", include_str!("error_overlay.js"))
+    crate::tool::asset::dev_asset_in("preview", "overlay.js", include_str!("../../static/preview/overlay.js"))
 }
 
 /// The source-tree path of the overlay script, for dev asset watching.
 pub fn overlay_js_path() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tool/preview/error_overlay.js")
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/static/preview/overlay.js")
 }
 
 /// A tiny trap injected at the top of `<head>`: it records failures that
@@ -562,14 +563,3 @@ window.__tinymistErrors = [];
   setInterval(bare, 4000);
 })();
 "#;
-
-/// The annotation UI script, served separately (loaded only by /?annotate
-/// pages) and editable in the source tree like the overlay script.
-pub fn annotations_js() -> String {
-    super::annotations::dev_asset("annotations.js", include_str!("annotations.js"))
-}
-
-/// The source-tree path of the annotation script, for dev asset watching.
-pub fn annotations_js_path() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tool/preview/annotations.js")
-}

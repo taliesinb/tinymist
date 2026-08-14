@@ -110,7 +110,8 @@ pub fn open(url: &str, opts: &OpenOptions) {
             return;
         }
     }
-    let _ = Command::new("open").arg(url).spawn();
+    // Waited for, as above: this is the launcher exiting, not the browser.
+    let _ = Command::new("open").arg(url).status();
 }
 
 /// A web app installed from this URL, by the name its manifest gives.
@@ -133,12 +134,17 @@ fn installed_app(title: &str) -> Option<PathBuf> {
 }
 
 fn open_with(app: &Path, url: &str) -> bool {
+    // Waited for, not left running: `open` hands the URL to the application and
+    // exits, and a caller that is a one-shot command exits the moment this
+    // returns. A child still being started when its parent goes — and whose
+    // process group an editor's task runner may then tidy up — is a window that
+    // never appears.
     Command::new("open")
         .arg("-a")
         .arg(app)
         .arg(url)
-        .spawn()
-        .is_ok()
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 /// Chrome with flags: its own window, its own profile, and a debugging port if

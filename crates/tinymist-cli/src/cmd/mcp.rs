@@ -9,7 +9,7 @@
 //! making sure, and the second one through the door pays nothing.
 
 use clap::Parser;
-use tinymist::tool::serve::hub;
+use tinymist::tool::mcp::dispatch as hub;
 use tinymist_std::error::prelude::*;
 
 use crate::utils::block_on;
@@ -84,7 +84,7 @@ pub fn mcp_main(args: McpArgs) -> Result<()> {
 
     if args.serve {
         // The detached half: this one answers until it is killed.
-        tinymist::tool::preview::note_build_stamp();
+        tinymist::tool::webapp::note_build_stamp();
         return block_on(async move {
             hub::serve(args.port)
                 .await

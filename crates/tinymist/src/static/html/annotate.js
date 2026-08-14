@@ -51,7 +51,7 @@
   const RESOLVED_OPACITY = 0.45;
   const letterColor = (letter) =>
     PALETTE[Math.max(0, letterIndex(letter) - 1) % PALETTE.length];
-  const pinOpacity = (pin) => (pin.status === "resolved" ? RESOLVED_OPACITY : 1);
+  const pinOpacity = (pin) => (pin.resolved ? RESOLVED_OPACITY : 1);
   // The same colour taken down to something that can sit behind or inside it:
   // the halo around a mark, and the letter written on a chip. Black would do
   // the job and look like a different design; this keeps one hue per
@@ -200,6 +200,10 @@
     H6: "block",
     BLOCKQUOTE: "block",
     PRE: "block",
+    // A term list is a list: the term is its marker and the definition is the
+    // item, and an annotation in either belongs to the pair.
+    DT: "item",
+    DD: "item",
     FIGURE: "block",
     TABLE: "block",
     // A Typst `block` is a `<div>`, and a callout, a theorem environment or a
@@ -552,6 +556,9 @@
 
   // The word ending at an offset: what a word anchor names, since the label is
   // written just past the word it belongs to.
+  // How much closing markup may sit between a word and the anchor that names
+  // it: `*`, `_`, a backtick, a bracket — two of them is `_*word*_`.
+  const CLOSING_MARKUP = 4;
   const wordEndingAt = (offset) => {
     const inRun = (run) => {
       const at = charIn(run, offset);
@@ -575,6 +582,29 @@
     for (const run of covering) {
       const word = inRun(run);
       if (word) return word;
+    }
+    // A word written as `*word*<anno.X.word>` has its anchor a couple of bytes
+    // past the run, with the closing markup in between: what Typst renders is
+    // "word", what the source says is "word*". Placing one by clicking puts the
+    // anchor inside the markup instead, where the run ends — but a person
+    // writes it after, and that is the form Typst prefers, since it labels the
+    // emphasised run rather than the text inside it.
+    const nearest = runs
+      .filter((run) => run.e < offset && offset - run.e <= CLOSING_MARKUP)
+      .sort((a, b) => b.e - a.e)[0];
+    if (nearest) {
+      const at = nearest.text.length;
+      let start = at;
+      while (start > 0 && !/\s/.test(nearest.text[start - 1])) start -= 1;
+      if (start < at) {
+        return {
+          run: nearest,
+          start,
+          end: at,
+          s: byteAt(nearest, start),
+          e: byteAt(nearest, at),
+        };
+      }
     }
     return null;
   };
@@ -718,7 +748,33 @@
   const atomGroup = (atom) =>
     atom ? atoms.filter((a) => a.scope === atom.scope && a.anchor === atom.anchor) : [];
   const atomBoxes = (atom) =>
-    mergeLines(atomGroup(atom).flatMap((a) => Array.from(a.el.getClientRects())));
+    mergeLines(atomGroup(atom).flatMap((a) => Array.from(producedBy(a.el).flatMap(
+      (el) => Array.from(el.getClientRects()),
+    ))));
+
+  // What a call produced, given the element the server stamped.
+  //
+  // An equation, a link or a code fragment *is* an element, and the stamp is on
+  // it. Text a helper made is not: it arrives as ordinary runs, and the stamp
+  // goes on the first run after them — "what came before this was made rather
+  // than written". So the mark for one covers the runs behind the stamp, back
+  // to the last thing whose source position was believed.
+  const producedBy = (el) => {
+    // An element that is the content — an equation, a link, a code fragment —
+    // is measured as itself. A stamp on a plain run is a marker, not content.
+    const marker =
+      el.hasAttribute(ATOM_ATTR) &&
+      !el.hasAttribute(SRC_ATTR) &&
+      !["math", "svg", "a", "code"].includes(el.localName);
+    if (!marker) return [el];
+    const made = [];
+    let cursor = el.previousElementSibling;
+    while (cursor && !cursor.hasAttribute(TEXT_ATTR) && !cursor.hasAttribute(ATOM_ATTR)) {
+      made.unshift(cursor);
+      cursor = cursor.previousElementSibling;
+    }
+    return made.length ? made : [el];
+  };
 
   // The boxes of whole elements inside a source range, for an annotation that
   // covers something with no text of its own to measure — an equation, a
@@ -746,24 +802,32 @@
   // open a content block are all in between. So an offset a little short of a
   // region still belongs to it, but only if nothing contains it outright.
   const HEAD_SLACK = 48;
+  // And a little the other way, for an anchor written just past the end of a
+  // region rather than at its head. A heading takes its anchor at the end of
+  // the line — a label before the text would stop it being a heading — so an
+  // anchor a space or two beyond one belongs to it, not to whatever comes next.
+  // Typst's own labels attach to what precedes them, and so does this.
+  const TAIL_SLACK = 8;
   const blockCovering = (offset, kind) => {
-    const smallest = (slack, wanted) => {
+    const smallest = (before, after, wanted) => {
       let best = null;
       for (const b of blocks) {
         if (wanted && b.kind !== wanted) continue;
-        if (offset < b.lo - slack || offset > b.hi) continue;
+        if (offset < b.lo - before || offset > b.hi + after) continue;
         if (!best || b.hi - b.lo < best.hi - best.lo) best = b;
       }
       return best;
     };
     // An annotation says what kind of region it is on, and regions nest: a
     // definition box holds paragraphs, and the innermost thing covering the
-    // anchor is not necessarily the thing that was annotated.
-    return (
-      (kind && (smallest(0, kind) || smallest(HEAD_SLACK, kind))) ||
-      smallest(0) ||
-      smallest(HEAD_SLACK)
-    );
+    // anchor is not necessarily the thing that was annotated. Failing an
+    // outright container, what the anchor is just past beats what it is just
+    // short of.
+    const nearest = (wanted) =>
+      smallest(0, 0, wanted) ||
+      smallest(0, TAIL_SLACK, wanted) ||
+      smallest(HEAD_SLACK, 0, wanted);
+    return (kind && nearest(kind)) || nearest(null);
   };
 
   // ------------------------------------------------------------- the marks
@@ -886,7 +950,18 @@
       );
       return { scope, boxes: inkOf(atom.el), block: { el: atom.el, depth: 0 }, enclosed };
     }
-    if (scope === "word" || scope === "sentence") {
+    if (scope === "sentence") {
+      // The server found where the sentence starts and ends; a browser has no
+      // idea where one sentence stops and the next begins.
+      const range = rangeFor(pin.start, pin.end);
+      const boxes = rectsOf(range);
+      if (boxes.length) return { scope, boxes };
+      // A sentence the runs cannot express — one made by a helper, say — is
+      // still worth marking at its head.
+      const word = wordEndingAt(pin.start);
+      return word ? { scope, boxes: rectsOf(runRange(word)) } : null;
+    }
+    if (scope === "word") {
       const word = wordEndingAt(pin.start);
       if (!word) return null;
       return { scope, boxes: rectsOf(runRange(word)) };
@@ -1496,7 +1571,7 @@
       }
       const el = hoverMark(host, "tm-chip");
       el.style.pointerEvents = "none";
-      drawBubble(el, { uuid: "hover", letter: nextLetter(), status: "created" }, "right", true);
+      drawBubble(el, { uuid: "hover", letter: nextLetter() }, "right", true);
       place(el, line.point - CHIP_GAP - el.__w, line.mid - el.__h / 2);
       return;
     }
@@ -1626,7 +1701,7 @@
     return true;
   };
 
-  const shell = (status, letter, stateText, acts) => {
+  const shell = (letter, stateText, acts) => {
     if (!closeBox()) return null;
     const box = document.createElement("div");
     box.id = BOX_ID;
@@ -1745,23 +1820,26 @@
   };
 
   const pinSig = (pin) =>
-    JSON.stringify([pin.status, pin.type, pin.letter, pin.author, pin.time, pin.content,
-                    pin.discussion]);
+    JSON.stringify([pin.claimed, pin.resolved, pin.mtime, pin.type, pin.letter, pin.author,
+                    pin.time, pin.content, pin.discussion]);
   const currentDraft = () => {
     const box = document.getElementById(BOX_ID);
     const ta = box && box.querySelector("textarea");
     return ta ? { draft: ta.value, focused: document.activeElement === ta } : null;
   };
-  const changeStatus = (pin, status) => {
-    post("/dev/annotate/status", { uuid: pin.uuid, status });
-    showAnnot({ ...pin, status }, currentDraft());
+  // Claimed and resolved are separate facts: an agent can be holding something
+  // it has already answered, and a reopened thread is not the same as one
+  // nobody has touched. Only what is passed is changed.
+  const setFlags = (pin, flags) => {
+    post("/dev/annotate/flags", { uuid: pin.uuid, ...flags });
+    showAnnot({ ...pin, ...flags }, currentDraft());
   };
 
   const showAnnot = (pin, restore) => {
-    const status = pin.status || "created";
+    const state = pin.resolved ? "resolved" : pin.claimed ? "claimed" : "open";
     const acts = [];
-    if (status === "resolved") acts.push(["reopen", () => changeStatus(pin, "created")]);
-    else acts.push(["resolve", () => changeStatus(pin, "resolved")]);
+    if (pin.resolved) acts.push(["reopen", () => setFlags(pin, { resolved: false })]);
+    else acts.push(["resolve", () => setFlags(pin, { resolved: true, claimed: false })]);
     acts.push([
       "delete",
       () => {
@@ -1770,7 +1848,7 @@
         closeBox(true);
       },
     ]);
-    const parts = shell(status, pin.letter || "?", `${status} ${pin.type || "comment"}`, acts);
+    const parts = shell(pin.letter || "?", `${state} ${pin.type || "comment"}`, acts);
     if (!parts) return;
     openUuid = pin.uuid;
     openSig = pinSig(pin);
@@ -1781,7 +1859,7 @@
     }
     const { wrap, ta } = replyField(
       hue,
-      status === "resolved" ? "Type reply to re-open" : "Type reply",
+      pin.resolved ? "Type reply to re-open" : "Type reply",
       "⏎ send",
       1,
       false,
@@ -1789,9 +1867,9 @@
         const text = field.value.trim();
         if (!text) return;
         post("/dev/annotate/reply", { uuid: pin.uuid, text }).then(refresh);
-        if (status === "resolved") {
-          post("/dev/annotate/status", { uuid: pin.uuid, status: "ongoing" });
-        }
+        // Answering a closed thread opens it again: the reply is the point,
+        // and it would otherwise land somewhere nobody is looking.
+        if (pin.resolved) post("/dev/annotate/flags", { uuid: pin.uuid, resolved: false });
         field.value = "";
         field.dispatchEvent(new Event("input"));
         saveDraft(draftKey(pin), "");
@@ -1838,7 +1916,7 @@
       }
       closeBox(true);
     };
-    const parts = shell("created", letter, `new ${kind}`, [
+    const parts = shell(letter, `new ${kind}`, [
       ["save", () => submit(document.querySelector(`#${BOX_ID} textarea`))],
       ["cancel", () => closeBox()],
     ]);
@@ -1847,7 +1925,7 @@
     const { wrap, ta } = replyField(letterColor(letter), "Type comment", "⏎ save", 3, true, submit);
     parts.content.append(wrap);
     ta.focus();
-    ghost = { uuid: "tinymist-ghost", status: "created", letter, ...ghostPin };
+    ghost = { uuid: "tinymist-ghost", letter, ...ghostPin };
     render();
   };
 
@@ -2058,17 +2136,27 @@
   // A compile error is something you want to paste somewhere — into an issue,
   // into a message, into a search. Selecting it by dragging fights the
   // annotation gestures, so the whole panel copies itself on a click.
+  // How much of the bottom of the window the status panel is taking, published
+  // for whatever else lives down there.
+  const measureStatus = () => {
+    const el = document.getElementById(STATUS_ID);
+    const height = el && !el.hidden ? el.offsetHeight : 0;
+    document.documentElement.style.setProperty("--tm-status-height", `${height}px`);
+  };
+
   const showStatus = (lines) => {
     const el = document.getElementById(STATUS_ID);
     if (!el) return;
     if (!lines || !lines.length) {
       el.hidden = true;
       el.textContent = "";
+      measureStatus();
       return;
     }
     const text = lines.join("\n");
     el.hidden = false;
     el.textContent = text;
+    measureStatus();
     el.title = "Click to copy";
     el.onclick = (ev) => {
       ev.stopPropagation();
@@ -2215,7 +2303,6 @@
     const button = document.getElementById(TOGGLE_ID);
     if (button) {
       button.dataset.on = annotating ? "1" : "";
-      button.textContent = annotating ? "● annotate" : "○ annotate";
       button.title = annotating
         ? "Annotating: click the text to comment on it"
         : "Reading: the document behaves as a page";
@@ -2225,6 +2312,13 @@
   const buildToggle = () => {
     const button = document.createElement("button");
     button.id = TOGGLE_ID;
+    // The box is an element rather than a character: a glyph is whatever the
+    // platform's font has, and this one has to line up with its label.
+    const box = document.createElement("span");
+    box.className = "tm-check";
+    const label = document.createElement("span");
+    label.textContent = "annotate";
+    button.append(box, label);
     button.onclick = (ev) => {
       ev.stopPropagation();
       annotating = !annotating;
@@ -2268,6 +2362,9 @@
   };
   document.addEventListener("scroll", onScroll, { capture: true, passive: true });
   window.addEventListener("resize", render);
+  // The panel wraps differently at a different width, so its height is not a
+  // thing to measure once.
+  window.addEventListener("resize", measureStatus);
   refresh().then(listen);
   // Fonts and images settle after the first paint and move everything below
   // them; a slow tick keeps the marks on their text without watching for it.

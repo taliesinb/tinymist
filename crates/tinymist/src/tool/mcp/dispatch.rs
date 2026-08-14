@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
-use super::registry::{self, ServerNote};
+use crate::tool::registry::{self, ServerNote};
 
 /// Where the hub answers, always. Above the range document servers derive
 /// their ports from, so that reserving it takes nothing away from them: the
@@ -133,7 +133,7 @@ fn server_for(args: &Value) -> Result<ServerNote, String> {
 
 /// Starts a server for a path, and waits for it to answer.
 fn start_server(path: &Path, show: bool) -> Result<ServerNote, String> {
-    let binary = std::env::current_exe().map_err(|err| err.to_string())?;
+    let binary = talimist_binary().map_err(|err| err.to_string())?;
     let mut command = std::process::Command::new(binary);
     command
         .arg("serve")
@@ -208,7 +208,7 @@ pub fn handle(request: Value) -> Option<Value> {
                 })
                 .and_then(|body| serde_json::from_str::<Value>(&body).ok())
                 .and_then(|answer| answer.pointer("/result/tools").cloned())
-                .or_else(|| Some(super::mcp::tool_list().get("tools")?.clone()))
+                .or_else(|| Some(super::tools::tool_list().get("tools")?.clone()))
                 .unwrap_or_else(|| json!([]));
             for tool in forwarded.as_array().cloned().unwrap_or_default() {
                 // Every forwarded tool gains the server it is about.
@@ -428,7 +428,7 @@ pub async fn serve(port: u16) -> std::io::Result<()> {
                     (false, "/dev/build") => answer(
                         hyper::StatusCode::OK,
                         "text/plain",
-                        crate::tool::preview::build_stamp(),
+                        crate::tool::webapp::build_stamp(),
                     ),
                     (true, "/m") | (true, "/m/") => {
                         let request: Value = body
@@ -473,6 +473,12 @@ pub async fn serve(port: u16) -> std::io::Result<()> {
     }
 }
 
+/// The binary to start a hub with: this one. Every mode is a subcommand of it,
+/// so whatever is running can start the hub.
+fn talimist_binary() -> std::io::Result<PathBuf> {
+    std::env::current_exe()
+}
+
 /// Makes sure a hub is running, and says whether this call started it.
 ///
 /// Idempotent on purpose: it is meant to be run at the start of every agent
@@ -481,8 +487,7 @@ pub fn ensure_running(port: u16) -> std::io::Result<bool> {
     if registry::answers(port) {
         return Ok(false);
     }
-    let binary = std::env::current_exe()?;
-    std::process::Command::new(binary)
+    let mut child = std::process::Command::new(talimist_binary()?)
         .arg("mcp")
         .arg("--serve")
         .arg("--port")
@@ -496,7 +501,15 @@ pub fn ensure_running(port: u16) -> std::io::Result<bool> {
         if registry::answers(port) {
             return Ok(true);
         }
+        // A child that has already exited is not coming up, and waiting out the
+        // timeout for it is ten seconds of nothing: whoever is starting a
+        // server is usually waiting for a window to open.
+        if let Ok(Some(status)) = child.try_wait() {
+            return Err(std::io::Error::other(format!(
+                "the agent endpoint exited immediately ({status})"
+            )));
+        }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    Err(std::io::Error::other("the hub did not come up"))
+    Err(std::io::Error::other("the agent endpoint did not come up"))
 }

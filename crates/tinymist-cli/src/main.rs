@@ -14,13 +14,18 @@ mod cmd {
     pub mod lsp;
     #[cfg(feature = "export")]
     pub mod package;
+    pub mod procs;
     #[cfg(feature = "preview")]
     pub mod preview;
     #[cfg(feature = "preview")]
-    pub mod docsite;
+    pub mod open_preview;
     #[cfg(feature = "preview")]
+    pub mod render;
+    #[cfg(feature = "serve")]
+    pub mod server;
+    #[cfg(feature = "serve")]
     pub mod mcp;
-    #[cfg(feature = "preview")]
+    #[cfg(feature = "serve")]
     pub mod serve;
     pub mod query;
     pub mod test;
@@ -100,15 +105,24 @@ enum Commands {
     #[clap(hide(true))] // still in development
     #[clap(subcommand)]
     Query(crate::query::QueryCommands),
+    /// List or stop the servers that are running
+    #[clap(subcommand)]
+    Procs(crate::procs::ProcsCommands),
     /// Serve a file or directory as HTML
-    #[cfg(feature = "preview")]
+    #[cfg(feature = "serve")]
     Serve(crate::serve::ServeArgs),
     /// Answer agents, at one address, about every document being served
-    #[cfg(feature = "preview")]
+    #[cfg(feature = "serve")]
     Mcp(crate::mcp::McpArgs),
-    /// Run preview server
+    /// Preview a document as pages, for an editor to follow
     #[cfg(feature = "preview")]
     Preview(tinymist::tool::preview::PreviewCliArgs),
+    /// Open the preview the language server is already running for a project
+    #[cfg(feature = "preview")]
+    OpenPreview(crate::open_preview::OpenPreviewArgs),
+    /// Print what a server would send: the rendered document, or its drawings
+    #[cfg(feature = "preview")]
+    Render(crate::render::RenderArgs),
     /// Run compile command like `typst-cli compile`
     #[cfg(feature = "export")]
     #[clap(alias = "c")]
@@ -167,7 +181,7 @@ fn main() -> Result<()> {
     // Starts logging
     let verbose = match &cmd {
         // Short-running commands, usually run from the CLI.
-        Commands::Completion(..) | Commands::Probe => false,
+        Commands::Completion(..) | Commands::Probe | Commands::Procs(..) => false,
         #[cfg(feature = "export")]
         Commands::Compile(..) => false,
         Commands::Lint(..) => false,
@@ -179,8 +193,12 @@ fn main() -> Result<()> {
         #[cfg(feature = "preview")]
         Commands::Preview(preview) => preview.verbose,
         #[cfg(feature = "preview")]
-        Commands::Serve(serve) => serve.verbose,
+        Commands::Render(..) => false,
         #[cfg(feature = "preview")]
+        Commands::OpenPreview(..) => false,
+        #[cfg(feature = "serve")]
+        Commands::Serve(serve) => serve.verbose,
+        #[cfg(feature = "serve")]
         Commands::Mcp(..) => false,
 
         // Long-running commands, usually run from an editor.
@@ -201,9 +219,9 @@ fn main() -> Result<()> {
     // Serving prints its own address block; the preview server's own address
     // logging would arrive alongside it as two decoys for the one line worth
     // copying, so that target is turned down unless asked for.
-    #[cfg(feature = "preview")]
+    #[cfg(feature = "serve")]
     let quiet_preview = !verbose && matches!(cmd, Commands::Serve(..));
-    #[cfg(not(feature = "preview"))]
+    #[cfg(not(feature = "serve"))]
     let quiet_preview = false;
     let _ = tinymist::init_log(tinymist::InitLogOpts {
         verbose,
@@ -227,11 +245,16 @@ fn main() -> Result<()> {
         Commands::TraceLsp(args) => crate::trace_lsp::trace_lsp_main(args),
 
         Commands::Query(cmds) => crate::query::query_main(cmds),
+        Commands::Procs(cmds) => crate::procs::procs_main(cmds),
+        #[cfg(feature = "preview")]
+        Commands::Render(args) => crate::render::render_main(args),
         #[cfg(feature = "preview")]
         Commands::Preview(args) => block_on(crate::preview::preview_main(args)),
         #[cfg(feature = "preview")]
+        Commands::OpenPreview(args) => crate::open_preview::open_preview_main(args),
+        #[cfg(feature = "serve")]
         Commands::Serve(args) => crate::serve::serve_main(args),
-        #[cfg(feature = "preview")]
+        #[cfg(feature = "serve")]
         Commands::Mcp(args) => crate::mcp::mcp_main(args),
         #[cfg(feature = "export")]
         Commands::Compile(args) => block_on(crate::compile::compile_main(args)),

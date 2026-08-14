@@ -8,6 +8,9 @@
   --tm-fg: #1a1a1a;
   --tm-rule: rgba(0, 0, 0, 0.12);
   --tm-halo: #ffffff;
+  /* The one colour the UI chooses for itself, rather than taking from an
+     annotation: what "on" looks like. */
+  --tm-accent: #3f74c8;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -16,6 +19,7 @@
     --tm-fg: #e6e6e6;
     --tm-rule: rgba(255, 255, 255, 0.16);
     --tm-halo: #0e0e0e;
+    --tm-accent: #5b90e0;
   }
 }
 
@@ -442,7 +446,13 @@ math {
 #tinymist-annotate-toggle {
   position: fixed;
   left: 12px;
-  bottom: 12px;
+  /* Above whatever the status panel is currently saying: it is anchored to the
+     bottom of the window and grows upwards, and a toggle sitting under it is a
+     toggle nobody can read or press. */
+  bottom: calc(12px + var(--tm-status-height, 0px));
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   z-index: 2147483647;
   padding: 3px 9px;
   border: 1px solid var(--tm-rule);
@@ -460,4 +470,35 @@ math {
 
 #tinymist-annotate-toggle[data-on] {
   opacity: 0.85;
+}
+
+/* A checkbox rather than a dot: this switches something on, and a box that
+   fills and takes a tick says so without a legend. */
+#tinymist-annotate-toggle .tm-check {
+  position: relative;
+  width: 11px;
+  height: 11px;
+  border: 1px solid currentColor;
+  border-radius: 3px;
+  opacity: 0.7;
+}
+
+#tinymist-annotate-toggle[data-on] .tm-check {
+  background: var(--tm-accent);
+  border-color: var(--tm-accent);
+  opacity: 1;
+}
+
+/* The tick: two sides of a box, turned. Drawn rather than typed, so it is the
+   same mark in every browser and sits where it is put. */
+#tinymist-annotate-toggle[data-on] .tm-check::after {
+  content: "";
+  position: absolute;
+  left: 3px;
+  top: 0px;
+  width: 3px;
+  height: 6px;
+  border: solid #fff;
+  border-width: 0 1.5px 1.5px 0;
+  transform: rotate(42deg);
 }

@@ -25,7 +25,7 @@ pub use server::*;
 pub use sync_ls::LspClient;
 pub use tinymist_project::world;
 pub use tinymist_query as query;
-pub use world::{CompileFontArgs, CompileOnceArgs, CompilePackageArgs};
+pub use world::{CompileFontArgs, CompileOnceArgs, CompilePackageArgs, ThemeArg};
 
 #[cfg(feature = "export")]
 pub use task::export2 as export;

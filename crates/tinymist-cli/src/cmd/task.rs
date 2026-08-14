@@ -5,11 +5,11 @@ use tinymist_std::error::prelude::*;
 
 #[cfg(feature = "preview")]
 use tinymist::tool::preview::PreviewArgs;
-#[cfg(feature = "preview")]
+#[cfg(feature = "lock")]
 use tinymist_project::DocNewArgs;
-#[cfg(feature = "preview")]
+#[cfg(feature = "lock")]
 use tinymist_project::LockFile;
-#[cfg(feature = "preview")]
+#[cfg(feature = "lock")]
 use tinymist_task::Id;
 #[cfg(feature = "preview")]
 use tinymist_task::TaskWhen;

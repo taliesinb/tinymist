@@ -1,15 +1,17 @@
-//! Annotations over an HTML-rendered document.
+//! A document as HTML: what the exporter drops put back, and every element
+//! labelled with where in the source it came from.
 //!
-//! The paged mode annotates a picture of a document: it walks rendered frames
-//! for geometry, hit-tests boxes, and positions marks in page coordinates. HTML
-//! has none of that and needs none of it. Every element that Typst emits knows
-//! the span it came from, so the document itself can say where each piece of it
-//! lives in the source, and the browser can do the rest with ordinary DOM
-//! geometry.
+//! Rendering, not serving. An editor's previewer and a document server both
+//! show the same page — this is where that page is made — and only the server
+//! goes on to hang annotations off it. What the annotator adds is in
+//! `tool/serve`; what it needs from a document is here.
 //!
-//! Kept apart from `annotations.rs` on purpose. The two modes share the sidecar
-//! format and the anchor labels — the things that are about annotations — and
-//! nothing about how a document is drawn.
+//! Typst's HTML export is incomplete: layout elements are dropped along with
+//! everything inside them, so a diagram becomes an empty box. The document is
+//! compiled through a wrapper that installs show rules recovering them
+//! (`static/html/shims.typ`), which also means the compile's main file is the
+//! wrapper rather than the document — hence [`doc_file`], which says where the
+//! document went.
 
 use std::sync::Arc;
 
@@ -20,9 +22,12 @@ use typst::World;
 use typst::syntax::{FileId, Source, Span};
 use typst_html::{HtmlElement, HtmlNode};
 
-use super::annotations::{
-    AnnotationRecord, Scope, dev_asset, doc_file, find_anchors, read_sidecar, sidecar_path,
-};
+use crate::tool::asset::{dev_asset_in, dev_asset_path};
+
+/// An asset of the HTML client, from `src/static/html`.
+fn asset(rel: &str, embedded: &'static str) -> String {
+    dev_asset_in("html", rel, embedded)
+}
 
 /// The attribute carrying an element's source range, as `start:end` byte
 /// offsets into the file being served.
@@ -42,29 +47,29 @@ pub const TEXT_ATTR: &str = "data-typst-text";
 /// The page that hosts an HTML-mode document: its own shell, its own script,
 /// its own stylesheet. It shares nothing with the paged frontend.
 pub fn shell_html() -> String {
-    dev_asset("html_annotations.html", include_str!("html_annotations.html"))
+    asset("shell.html", include_str!("../../static/html/shell.html"))
 }
 
 /// The HTML-mode client script, read from the source tree when there is one so
 /// it can be edited without rebuilding.
 pub fn client_js() -> String {
-    dev_asset("html_annotations.js", include_str!("html_annotations.js"))
+    asset("annotate.js", include_str!("../../static/html/annotate.js"))
 }
 
 /// The HTML-mode stylesheet.
 pub fn client_css() -> String {
-    dev_asset("html_annotations.css", include_str!("html_annotations.css"))
+    asset("annotate.css", include_str!("../../static/html/annotate.css"))
 }
 
 /// The export shims: show rules that recover what Typst's HTML export drops.
 /// Read from the source tree when there is one, so they can be edited live.
 pub fn shims_typ() -> String {
-    dev_asset("html_shims.typ", include_str!("html_shims.typ"))
+    asset("shims.typ", include_str!("../../static/html/shims.typ"))
 }
 
 /// The source-tree path of the shims, for watching.
 pub fn shims_path() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tool/preview/html_shims.typ")
+    dev_asset_path("html", "shims.typ")
 }
 
 /// The generated file that is compiled in the document's place: the shims,
@@ -85,6 +90,19 @@ fn wrapper_vpath(main: FileId) -> Option<typst::syntax::VirtualPath> {
     let path = main.vpath().get_with_slash();
     let (dir, name) = path.rsplit_once('/')?;
     typst::syntax::VirtualPath::new(format!("{dir}/.talimist-html.{name}")).ok()
+}
+
+/// Where a document's wrapper lives on disk, and the name of the document it
+/// includes. Beside the document, as `wrapper_vpath` places it, so relative
+/// imports resolve the same either way.
+///
+/// For callers that install the wrapper as a memory file rather than through a
+/// universe of their own — the editor's previewer holds no universe; the
+/// compiler does.
+pub fn wrapper_path_for(main: &std::path::Path) -> Option<(std::path::PathBuf, String)> {
+    let name = main.file_name()?.to_str()?.to_owned();
+    let dir = main.parent()?;
+    Some((dir.join(format!(".talimist-html.{name}")), name))
 }
 
 /// Compiles the document through a wrapper that installs the shims.
@@ -128,7 +146,7 @@ pub fn install_shims(verse: &mut tinymist_project::LspUniverse) -> Result<ShimEn
         .map_err(|err| format!("cannot compile through the HTML shims: {err:?}"))?;
     // Named per wrapper: one process can serve a directory, and every document
     // in it is compiled through a wrapper of its own.
-    super::annotations::set_doc_file(wrapper_main, main);
+    set_doc_file(wrapper_main, main);
 
     Ok(ShimEntry {
         path,
@@ -147,51 +165,41 @@ pub struct ShimEntry {
 
 /// The source-tree paths of the HTML-mode assets, for dev asset watching.
 pub fn asset_paths() -> Vec<std::path::PathBuf> {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tool/preview");
-    [
-        "html_annotations.html",
-        "html_annotations.js",
-        "html_annotations.css",
-        "html_shims.typ",
-    ]
-    .iter()
-    .map(|name| dir.join(name))
-    .collect()
+    ["shell.html", "annotate.js", "annotate.css", "shims.typ"]
+        .iter()
+        .map(|name| dev_asset_path("html", name))
+        .collect()
 }
 
-/// One annotation, as the HTML client needs it: everything the sidecar holds,
-/// plus where its anchors sit in the source. The client finds the element that
-/// covers that offset; the server does not need to know how it is drawn.
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct HtmlPin {
-    /// The annotation kind.
-    #[serde(rename = "type")]
-    pub rtype: String,
-    /// The unique id.
-    pub uuid: String,
-    /// The display letter.
-    pub letter: String,
-    /// The author.
-    pub author: String,
-    /// The message.
-    pub content: String,
-    /// Creation time, ISO 8601 UTC.
-    pub time: String,
-    /// The status.
-    pub status: String,
-    /// The discussion thread.
-    pub discussion: Vec<super::annotations::AnnotationReply>,
-    /// What the annotation refers to.
-    pub scope: String,
-    /// The colour it was made in, as `#rrggbb`, or empty when it predates the
-    /// field: the client falls back to its palette then.
-    pub color: String,
-    /// The byte offset of the anchor in the source.
-    pub start: usize,
-    /// The byte offset the annotation reaches to: the end anchor of a span, or
-    /// the start again for everything else.
-    pub end: usize,
+/// The file being served, which is not always the file being compiled: HTML
+/// mode compiles a generated wrapper that installs export shims and includes
+/// the real document, and every annotation belongs to the document, not to the
+/// wrapper.
+///
+/// A map rather than one file, because one process can serve a directory: each
+/// wrapper names the document it was made for, and an annotation written
+/// through one server must not land in another server's document.
+static DOC_FILES: std::sync::RwLock<
+    Option<std::collections::HashMap<typst::syntax::FileId, typst::syntax::FileId>>,
+> = std::sync::RwLock::new(None);
+
+/// Declares which file annotations belong to when `wrapper` is what is being
+/// compiled.
+pub fn set_doc_file(wrapper: typst::syntax::FileId, doc: typst::syntax::FileId) {
+    if let Ok(mut slot) = DOC_FILES.write() {
+        slot.get_or_insert_with(Default::default).insert(wrapper, doc);
+    }
+}
+
+/// The file annotations belong to: the served document behind whatever is
+/// being compiled, or that file itself when it is served directly.
+pub fn doc_file<W: World + ?Sized>(world: &W) -> typst::syntax::FileId {
+    let main = world.main();
+    DOC_FILES
+        .read()
+        .ok()
+        .and_then(|slot| slot.as_ref()?.get(&main).copied())
+        .unwrap_or(main)
 }
 
 /// The document as HTML, with every element labelled with its source range.
@@ -387,63 +395,132 @@ fn span_range(span: Span, source: &Source, main: FileId) -> Option<std::ops::Ran
     typst_shim::syntax::source_range(source, span)
 }
 
-/// Every annotation with the source offsets of its anchors.
-pub fn html_pins(art: &LspCompiledArtifact) -> Vec<HtmlPin> {
-    let Some(sidecar) = sidecar_path(art) else {
-        return vec![];
-    };
-    let (records, _) = read_sidecar(&sidecar);
-    if records.is_empty() {
-        return vec![];
-    }
-    let world = art.world();
-    let Ok(source) = world.source(doc_file(world)) else {
-        return vec![];
-    };
-    let text = source.text();
-
-    records
-        .iter()
-        .filter_map(|rec| pin_for(rec, text))
-        .collect()
+/// A drawing found in a rendered body: the source range it belongs to, and the
+/// SVG itself.
+#[derive(Debug, Clone)]
+pub struct FramedDrawing {
+    /// The source range of the innermost thing around it that came from the
+    /// document.
+    pub range: std::ops::Range<usize>,
+    /// The drawing, as it stands in the page.
+    pub svg: String,
 }
 
-fn pin_for(rec: &AnnotationRecord, text: &str) -> Option<HtmlPin> {
-    let anchors = find_anchors(text, &rec.uuid);
-    let (at, scope, label) = anchors.first().cloned()?;
-    // A span's text lies *between* its two labels, so it starts past the first
-    // one: the label itself is not part of what was annotated, and a range that
-    // includes it reaches back into whatever came before.
-    let (start, end) = match scope {
-        Scope::Span => (
-            at + label.len(),
-            anchors
-                .iter()
-                .rev()
-                .find(|(off, _, l)| *off > at && l.ends_with(".end>"))
-                .map(|(off, _, _)| *off)
-                .unwrap_or(at + label.len()),
-        ),
-        _ => (at, at),
-    };
-    Some(HtmlPin {
-        rtype: rec.rtype.clone(),
-        uuid: rec.uuid.clone(),
-        letter: rec.letter.clone(),
-        author: rec.author.clone(),
-        content: rec.content.clone(),
-        time: rec.time.clone(),
-        status: rec.status.clone(),
-        discussion: rec.discussion.clone(),
-        scope: scope.as_str().into(),
-        color: rec.color.clone(),
-        start,
-        end,
-    })
+/// Every framed drawing in a rendered body, with the piece of document it sits
+/// inside.
+///
+/// Read out of the rendered text rather than out of the document tree. A framed
+/// drawing is not an element there — it is a laid-out frame that only becomes
+/// SVG when the page is written — so it cannot be labelled on the way past, and
+/// what it belongs to has to be recovered here: the innermost enclosing element
+/// that says where it came from, which the walk keeps on a stack.
+pub fn framed_drawings(body: &str) -> Vec<FramedDrawing> {
+    /// Tags that never close, and so never nest anything.
+    const VOID: &[&str] = &[
+        "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source",
+        "track", "wbr",
+    ];
+    let mut found = Vec::new();
+    let mut open_ranges: Vec<Option<std::ops::Range<usize>>> = Vec::new();
+    let mut at = 0;
+    while let Some(rel) = body[at..].find('<') {
+        let open = at + rel;
+        let rest = &body[open + 1..];
+        if rest.starts_with('/') {
+            open_ranges.pop();
+            at = open + 1 + rest.find('>').map(|i| i + 1).unwrap_or(1);
+            continue;
+        }
+        if rest.starts_with('!') {
+            at = open + 1 + rest.find('>').map(|i| i + 1).unwrap_or(1);
+            continue;
+        }
+        let Some(tag_end) = tag_end(body, open) else {
+            break;
+        };
+        let tag: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+            .collect();
+        if tag.is_empty() {
+            at = open + 1;
+            continue;
+        }
+        if tag == "svg" {
+            // The SVG is the drawing; what it is a picture of is whatever the
+            // document last opened around it.
+            if let Some(range) = open_ranges.iter().rev().flatten().next().cloned() {
+                if let Some(end) = closing_svg(body, tag_end) {
+                    found.push(FramedDrawing {
+                        range,
+                        svg: body[open..end].to_owned(),
+                    });
+                    at = end;
+                    continue;
+                }
+            }
+        }
+        let closes_itself = body[open..tag_end].ends_with("/>");
+        if !closes_itself && !VOID.contains(&tag.as_str()) {
+            open_ranges.push(attr_range(&body[open..tag_end]));
+        }
+        at = tag_end;
+    }
+    found
+}
+
+/// Where an open tag beginning at `open` ends, ignoring `>` inside attribute
+/// values.
+fn tag_end(body: &str, open: usize) -> Option<usize> {
+    let bytes = body.as_bytes();
+    let mut quote: Option<u8> = None;
+    for (offset, byte) in bytes.iter().enumerate().skip(open) {
+        match (quote, byte) {
+            (Some(q), b) if *b == q => quote = None,
+            (Some(_), _) => {}
+            (None, b'"') | (None, b'\'') => quote = Some(*byte),
+            (None, b'>') => return Some(offset + 1),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The source range an open tag carries, if it carries one.
+fn attr_range(open_tag: &str) -> Option<std::ops::Range<usize>> {
+    let needle = format!("{SRC_ATTR}=\"");
+    let at = open_tag.find(&needle)? + needle.len();
+    let end = at + open_tag[at..].find('"')?;
+    let (start, stop) = open_tag[at..end].split_once(':')?;
+    Some(start.parse().ok()?..stop.parse().ok()?)
+}
+
+/// Where the `</svg>` that closes an SVG opened before `from` sits, counting
+/// the ones nested inside it.
+fn closing_svg(body: &str, from: usize) -> Option<usize> {
+    let mut depth = 1usize;
+    let mut at = from;
+    loop {
+        let open = body[at..].find("<svg").map(|i| at + i);
+        let close = body[at..].find("</svg>").map(|i| at + i)?;
+        match open {
+            Some(open) if open < close => {
+                depth += 1;
+                at = open + 4;
+            }
+            _ => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(close + "</svg>".len());
+                }
+                at = close + "</svg>".len();
+            }
+        }
+    }
 }
 
 /// What an HTML-mode server can answer.
-pub trait HtmlAnnotationServer: Send + Sync {
+pub trait HtmlBody: Send + Sync {
     /// The document as HTML, labelled with source ranges.
     fn document(&self) -> Result<String, String>;
     /// The rendered body and the version it was rendered at: read from the
@@ -452,8 +529,6 @@ pub trait HtmlAnnotationServer: Send + Sync {
     fn body(&self) -> (String, u64) {
         (String::new(), 0)
     }
-    /// Every annotation, with the source offsets of its anchors.
-    fn pins(&self) -> Vec<HtmlPin>;
 }
 
 /// Holds the last compiled artifact, so both answers come from one document.
@@ -462,7 +537,7 @@ pub struct ArtifactHtmlServer {
     pub last_art: Arc<parking_lot::Mutex<Option<LspCompiledArtifact>>>,
 }
 
-impl HtmlAnnotationServer for ArtifactHtmlServer {
+impl HtmlBody for ArtifactHtmlServer {
     fn document(&self) -> Result<String, String> {
         let art = self.last_art.lock().clone().ok_or("nothing compiled yet")?;
         html_document(&art)
@@ -473,9 +548,10 @@ impl HtmlAnnotationServer for ArtifactHtmlServer {
         let Some(art) = art else {
             return (String::new(), 0);
         };
-        // What was written when this document last compiled. Rendering here is
-        // the fallback for a page that asked before the writer did — the first
-        // request of the first compile.
+        // What was written when this document last compiled, if anything writes
+        // to disk: a document server renders once for everyone who asks, while
+        // an editor's previewer has one reader and renders on request.
+        #[cfg(feature = "serve")]
         let cached = crate::tool::serve::site_cache().and_then(|cache| {
             let world = art.world();
             let path = world
@@ -485,6 +561,8 @@ impl HtmlAnnotationServer for ArtifactHtmlServer {
             let body = cache.body(path.as_ref())?;
             Some((std::fs::read_to_string(&body.path).ok()?, body.version))
         });
+        #[cfg(not(feature = "serve"))]
+        let cached: Option<(String, u64)> = None;
         cached.unwrap_or_else(|| {
             let body = html_document(&art)
                 .map(|html| fragment(&html).body)
@@ -493,10 +571,63 @@ impl HtmlAnnotationServer for ArtifactHtmlServer {
         })
     }
 
-    fn pins(&self) -> Vec<HtmlPin> {
-        let Some(art) = self.last_art.lock().clone() else {
-            return vec![];
-        };
-        html_pins(&art)
-    }
+}
+
+/// A drawing's identity: enough of SHA-256 to never collide in a document,
+/// short enough to read in a sidecar. What a capture is stored under, and how
+/// an unchanged drawing is recognised as the one already kept.
+/// document, short enough to read in a sidecar.
+pub fn hash_of(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    digest[..8].iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// How big a drawing is on the page, in CSS pixels.
+///
+/// Best effort, and calibrated against the page rather than the file: the
+/// exporter writes an SVG's size in points, a browser lays it out at 4/3 of
+/// that, and the stylesheet only ever shrinks it to fit the column. So this is
+/// what the reader sees when the column is wide enough, which is the usual case
+/// and the only one the file itself can answer for.
+pub fn pixel_size(svg: &str) -> Option<(u32, u32)> {
+    let open = &svg[..svg.find('>')?];
+    let attr = |name: &str| -> Option<f32> {
+        let needle = format!(" {name}=\"");
+        let at = open.find(&needle)? + needle.len();
+        let value = &open[at..at + open[at..].find('"')?];
+        css_px(value)
+    };
+    let sized = attr("width").zip(attr("height"));
+    let (w, h) = match sized {
+        Some(size) => size,
+        // No size of its own: a `viewBox` is user units, which a browser treats
+        // as pixels.
+        None => {
+            let needle = " viewBox=\"";
+            let at = open.find(needle)? + needle.len();
+            let value = &open[at..at + open[at..].find('"')?];
+            let mut parts = value.split_whitespace().skip(2);
+            (
+                parts.next()?.parse().ok()?,
+                parts.next()?.parse().ok()?,
+            )
+        }
+    };
+    Some((w.round().max(0.0) as u32, h.round().max(0.0) as u32))
+}
+
+/// A CSS length in pixels, for the handful of units an exporter writes.
+fn css_px(value: &str) -> Option<f32> {
+    let value = value.trim();
+    let (number, factor) = match value {
+        _ if value.ends_with("pt") => (&value[..value.len() - 2], 4.0 / 3.0),
+        _ if value.ends_with("px") => (&value[..value.len() - 2], 1.0),
+        _ if value.ends_with("mm") => (&value[..value.len() - 2], 96.0 / 25.4),
+        _ if value.ends_with("cm") => (&value[..value.len() - 2], 96.0 / 2.54),
+        _ if value.ends_with("in") => (&value[..value.len() - 2], 96.0),
+        // A bare number is user units, which are pixels.
+        _ => (value, 1.0),
+    };
+    Some(number.trim().parse::<f32>().ok()? * factor)
 }

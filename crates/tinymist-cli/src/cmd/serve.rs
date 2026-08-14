@@ -6,20 +6,17 @@
 //! path it was given, so a document keeps its URL — and therefore its web app
 //! and its icon — across restarts.
 //!
-//! Reached as `talimist serve` and as the `talimist-serve` binary, which is
-//! the same code under a name a process list can pick out.
-
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
-use tinymist::tool::preview::icons::IconRole;
+use tinymist::tool::webapp::icons::IconRole;
 use tinymist_std::error::prelude::*;
 
 use crate::utils::block_on;
 
 #[derive(Debug, Clone, Parser)]
 #[clap(
-    name = "talimist-serve",
+    name = "talimist serve",
     author,
     version,
     about = "Serves Typst documents over HTTP, with no editor attached"
@@ -77,6 +74,11 @@ pub struct ServeArgs {
     /// for several.
     #[clap(long = "input", value_name = "KEY=VALUE")]
     pub inputs: Vec<String>,
+
+    /// Which appearance the document is compiled for: `auto` follows the
+    /// desktop, so a document read in a dark window is written for one.
+    #[clap(long = "theme", value_name = "THEME", default_value = "light")]
+    pub theme: tinymist::ThemeArg,
 
     /// Print the URL this document is served at and exit, without serving it.
     #[clap(long = "print-url")]
@@ -140,7 +142,7 @@ pub struct ServeArgs {
 /// counts.
 fn is_live(host: &str, port: u16) -> bool {
     matches!(probe(host, port).as_deref(), Some(stamp)
-        if stamp == tinymist::tool::preview::build_stamp())
+        if stamp == tinymist::tool::webapp::build_stamp())
 }
 
 /// Which build is answering on this address, if anything is.
@@ -190,7 +192,7 @@ fn wait_for_port(host: &str, port: u16) {
 /// Opens a URL as the arguments ask, the same way the preview does.
 fn open_url(url: &str, args: &ServeArgs, port: u16) {
     use tinymist::tool::preview::open;
-    let identity = tinymist::tool::preview::WebAppIdentity {
+    let identity = tinymist::tool::webapp::WebAppIdentity {
         role: if args.anno {
             IconRole::Annotate
         } else {
@@ -199,7 +201,7 @@ fn open_url(url: &str, args: &ServeArgs, port: u16) {
         color: args
             .icon_color
             .as_deref()
-            .and_then(tinymist::tool::preview::icons::parse_hex),
+            .and_then(tinymist::tool::webapp::icons::parse_hex),
         name: args.root_name.clone().or_else(|| {
             args.path
                 .file_name()
@@ -260,7 +262,7 @@ pub fn derive_port(canonical: &Path, role: IconRole, salt: Option<&str>) -> u16 
 }
 
 
-/// Serves one path, as `talimist serve` and as `talimist-serve` both do.
+/// Serves one path.
 /// Holds the rendered site for as long as the server runs, and removes it
 /// afterwards: a cache outliving the process that made it is litter.
 struct SiteGuard(std::sync::Arc<tinymist::tool::serve::SiteCache>);
@@ -291,7 +293,7 @@ pub fn serve_main(args: ServeArgs) -> Result<()> {
         filter: (!args.verbose).then(|| "tinymist::compat::preview=warn".to_string()),
         output: None,
     });
-    tinymist::tool::preview::note_build_stamp();
+    tinymist::tool::webapp::note_build_stamp();
     // A person is watching this in a terminal, so it narrates: what changed on
     // disk, and who is connected. The LSP shares its streams with the editor
     // and stays silent.
@@ -322,7 +324,7 @@ pub fn serve_main(args: ServeArgs) -> Result<()> {
         .port
         .unwrap_or_else(|| derive_port(&canonical, role, args.port_salt.as_deref()));
 
-    let path = tinymist::tool::preview::role_prefix(role);
+    let path = tinymist::tool::webapp::role_prefix(role);
     let url = format!("http://{}:{port}{path}", args.host);
     if args.print_url {
         println!("{url}");
@@ -333,7 +335,7 @@ pub fn serve_main(args: ServeArgs) -> Result<()> {
     // replaced has already exited on its own. Asking for it again means "show
     // it to me", not "bind this port twice".
     match probe(&args.host, port) {
-        Some(stamp) if stamp == tinymist::tool::preview::build_stamp() => {
+        Some(stamp) if stamp == tinymist::tool::webapp::build_stamp() => {
             eprintln!("already serving {url}");
             if args.open {
                 open_url(&url, &args, port);
@@ -368,67 +370,33 @@ pub fn serve_main(args: ServeArgs) -> Result<()> {
         })
     });
 
-    // One pipeline, driven through the preview CLI's own arguments.
-    let mut argv: Vec<String> = vec![
-        "talimist-serve".into(),
-        format!("--data-plane-host={}:{port}", args.host),
-        "--control-plane-host=127.0.0.1:0".into(),
-        "--invert-colors=smart".into(),
-        format!("--root={}", root.display()),
-    ];
-    argv.push("--format=html".into());
-    if args.anno {
-        argv.push("--annotate".into());
-    }
-    // A served document is read, not previewed: the role decides the icon, the
-    // name, and the `/v/` its pages live under.
-    argv.push("--role=serve".into());
-    if args.mcp {
-        argv.push("--mcp".into());
-    }
-    if args.daemon {
-        argv.push("--daemon".into());
-    }
-    if args.shutdown_on_last_client {
-        argv.push("--shutdown-on-last-client".into());
-    }
-    if args.open {
-        argv.push("--open".into());
-    } else {
-        argv.push("--no-open".into());
-    }
-    if args.verbose {
-        argv.push("--verbose".into());
-    }
-    if let Some(app) = &args.open_in {
-        argv.push(format!("--open-in={app}"));
-    }
-    if args.open_isolated {
-        argv.push("--open-isolated".into());
-    }
-    if let Some(port) = &args.open_cdp {
-        argv.push(format!("--open-cdp={port}"));
-    }
-    if let Some(name) = &name {
-        argv.push(format!("--root-name={name}"));
-    }
-    if let Some(color) = &args.icon_color {
-        argv.push(format!("--icon-color={color}"));
-    }
-    for origin in &args.allowed_origins {
-        argv.push(format!("--allowed-origin={origin}"));
-    }
-    for input in &args.inputs {
-        argv.push(format!("--input={input}"));
-    }
-    // A directory has no one document to name: each is set as the input when it
-    // is built.
-    if !is_dir {
-        argv.push(entry.display().to_string());
-    }
-
-    let mut preview_args = tinymist::tool::preview::PreviewCliArgs::parse_from(&argv);
-    preview_args.annotate = args.anno;
+    // What the document server needs, said once: no command line to format and
+    // parse back, and nothing about a page renderer this mode does not use.
+    let cfg = crate::cmd::server::DocConfig {
+        compile: tinymist::CompileOnceArgs {
+            root: Some(root.clone()),
+            theme: args.theme,
+            inputs: args
+                .inputs
+                .iter()
+                .filter_map(|input| input.split_once('='))
+                .map(|(key, value)| (key.to_owned(), value.to_owned()))
+                .collect(),
+            ..Default::default()
+        },
+        annotate: args.anno,
+        allowed_origins: args.allowed_origins.clone(),
+        data_plane_host: format!("{}:{port}", args.host),
+        identity: tinymist::tool::webapp::WebAppIdentity {
+            role,
+            color: args.icon_color.as_deref().and_then(
+                tinymist::tool::webapp::icons::parse_hex,
+            ),
+            name: name.clone(),
+        },
+        shutdown_on_last_client: args.shutdown_on_last_client,
+        mcp: args.mcp,
+    };
     // The site goes when the server does.
     let _site = SiteGuard(site);
     // The note that says this server exists, for whoever is looking for it: an
@@ -446,6 +414,9 @@ pub fn serve_main(args: ServeArgs) -> Result<()> {
         mcp: args.mcp,
         directory: is_dir,
         pid: std::process::id(),
+        ppid: tinymist::tool::registry::parent_pid(),
+        // This process serves this and nothing else.
+        hosted: false,
         started: tinymist_project::iso_now(),
     };
     if let Err(err) = tinymist::tool::serve::announce_server(&note) {
@@ -456,43 +427,45 @@ pub fn serve_main(args: ServeArgs) -> Result<()> {
         // The address agents are told about is one, fixed, and not this: make
         // sure it is there, since this server being up is usually the reason
         // somebody is about to ask it something.
-        match tinymist::tool::serve::hub::ensure_running(tinymist::tool::serve::hub::HUB_PORT) {
-            Ok(true) => log::info!("started talimist mcp"),
-            Ok(false) => {}
-            Err(err) => log::warn!("cannot start talimist mcp: {err}"),
+        //
+        // Off the critical path, though. Nothing here is needed to serve the
+        // document, and the person who ran this is waiting for a window.
+        std::thread::spawn(|| {
+            match tinymist::tool::mcp::dispatch::ensure_running(tinymist::tool::mcp::dispatch::HUB_PORT) {
+                Ok(true) => log::info!("started the agent endpoint"),
+                Ok(false) => {}
+                Err(err) => log::warn!("cannot start the agent endpoint: {err}"),
+            }
+        });
+    }
+    // One document or a directory of them: the same server, told which.
+    let opener = args.clone();
+    let mcp = args.mcp;
+    let subject = canonical.clone();
+    let announce = move |port: u16| {
+        println!();
+        println!(
+            "{}",
+            tinymist::tool::webapp::WebAppIdentity {
+                role,
+                color: None,
+                name: subject
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned()),
+            }
+            .title(port)
+        );
+        println!("  {:<9} {url}", if is_dir { "documents" } else { "document" });
+        if mcp {
+            println!("  agents    http://{}:{port}/m/", opener.host);
         }
-    }
+        if opener.open {
+            open_url(&url, &opener, port);
+        }
+    };
     if is_dir {
-        let host = args.host.clone();
-        let opener = args.clone();
-        let shutdown = args.shutdown_on_last_client;
-        let mcp = args.mcp;
-        return block_on(crate::cmd::docsite::serve_directory(
-            preview_args,
-            canonical.clone(),
-            host,
-            role,
-            shutdown,
-            mcp,
-            move |port| {
-                println!();
-                println!("{}", tinymist::tool::preview::WebAppIdentity {
-                    role,
-                    color: None,
-                    name: canonical
-                        .file_name()
-                        .map(|name| name.to_string_lossy().into_owned()),
-                }
-                .title(port));
-                println!("  documents  {url}");
-                if mcp {
-                    println!("  agents     http://{}:{port}/m/", opener.host);
-                }
-                if opener.open {
-                    open_url(&url, &opener, port);
-                }
-            },
-        ));
+        block_on(crate::cmd::server::serve_directory(cfg, canonical, announce))
+    } else {
+        block_on(crate::cmd::server::serve_file(cfg, canonical, announce))
     }
-    block_on(crate::cmd::preview::preview_main(preview_args))
 }

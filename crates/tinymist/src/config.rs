@@ -1093,10 +1093,40 @@ pub enum SemanticTokensMode {
     Enable,
 }
 
+/// How the editor's preview draws a document.
+///
+/// Independent of who is driving it: a preview that follows the editor can be
+/// either, and the choice is what the document is. Pages mirror what a PDF
+/// would look like, which is what a paper wants; HTML reflows and compiles much
+/// faster, which is what technical writing wants. Pages by default — partial
+/// rendering keeps a long document responsive while it is being typed in, which
+/// HTML has no equivalent of.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PreviewRenderMode {
+    /// Pages, drawn as SVG.
+    #[default]
+    PagedSvg,
+    /// The document as HTML.
+    Html,
+}
+
+impl From<PreviewRenderMode> for tinymist_task::ExportTarget {
+    fn from(mode: PreviewRenderMode) -> Self {
+        match mode {
+            PreviewRenderMode::PagedSvg => Self::Paged,
+            PreviewRenderMode::Html => Self::Html,
+        }
+    }
+}
+
 /// The preview features.
 #[derive(Debug, Default, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PreviewFeat {
+    /// How the preview draws the document: `pagedSvg` or `html`.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub mode: PreviewRenderMode,
     /// The browsing preview options.
     #[serde(default, deserialize_with = "deserialize_null_default")]
     pub browsing: BrowsingPreviewOpts,

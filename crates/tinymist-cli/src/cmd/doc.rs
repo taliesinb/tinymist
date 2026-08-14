@@ -1,9 +1,9 @@
 use std::path::Path;
 
-#[cfg(feature = "preview")]
+#[cfg(feature = "lock")]
 use tinymist_project::LockFile;
 use tinymist_std::error::prelude::*;
-#[cfg(feature = "preview")]
+#[cfg(feature = "lock")]
 use tinymist_task::Id;
 
 /// Project document commands' main

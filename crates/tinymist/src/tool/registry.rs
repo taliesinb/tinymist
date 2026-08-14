@@ -35,6 +35,23 @@ pub struct ServerNote {
     pub directory: bool,
     /// The process serving it.
     pub pid: u32,
+    /// The process that started that one, as it was at the time.
+    ///
+    /// Says who owns a server, which a pid on its own does not: a preview whose
+    /// parent is the editor was started by the editor, and one whose parent is
+    /// a shell was started by hand. Recorded when the note is written, since a
+    /// process that is reparented later — its starter having gone — reads as a
+    /// child of `init` and no longer says where it came from.
+    #[serde(default)]
+    pub ppid: u32,
+    /// Whether that process serves this among other things.
+    ///
+    /// A document server is its own process and stopping it stops exactly what
+    /// it serves. An editor's preview is served by the language server, which
+    /// is also answering completions and diagnostics for a person who is
+    /// typing: the note points at a process that is not ours to kill.
+    #[serde(default)]
+    pub hosted: bool,
     /// When it started, ISO 8601 UTC.
     pub started: String,
 }
@@ -91,6 +108,18 @@ pub fn announce_server(note: &ServerNote) -> std::io::Result<PathBuf> {
     Ok(path)
 }
 
+/// The process that started this one, where that can be asked.
+pub fn parent_pid() -> u32 {
+    #[cfg(unix)]
+    {
+        std::os::unix::process::parent_id()
+    }
+    #[cfg(not(unix))]
+    {
+        0
+    }
+}
+
 /// Takes the note away.
 pub fn withdraw_server(port: u16) {
     let _ = std::fs::remove_file(registry_dir().join(format!("{port}.json")));
@@ -138,6 +167,30 @@ pub fn running_servers() -> Vec<ServerNote> {
         }
     }
     out.sort_by(|a, b| a.server.cmp(&b.server));
+    out
+}
+
+/// Every note in the register, said or unsaid, with nothing removed.
+///
+/// `running_servers` tidies as it reads, which is right for a caller that wants
+/// to talk to something; a caller that wants to *report* on the register needs
+/// to see the notes that are not answering, because those are the interesting
+/// ones. Each is paired with whether its port answers.
+pub fn all_notes() -> Vec<(ServerNote, bool)> {
+    let Ok(entries) = std::fs::read_dir(registry_dir()) else {
+        return vec![];
+    };
+    let mut out: Vec<(ServerNote, bool)> = entries
+        .flatten()
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+        .filter_map(|entry| {
+            let text = std::fs::read_to_string(entry.path()).ok()?;
+            let note: ServerNote = serde_json::from_str(&text).ok()?;
+            let live = answers(note.port);
+            Some((note, live))
+        })
+        .collect();
+    out.sort_by(|a, b| a.0.server.cmp(&b.0.server));
     out
 }
 

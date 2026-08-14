@@ -9,7 +9,7 @@
 //!
 //! The glyphs are baked alpha masks (512×512, one byte per pixel, zlib
 //! deflated) rather than a font: rendering a τ at runtime would mean shipping a
-//! rasteriser for one character. `icons/gen_icons.html` regenerates them.
+//! rasteriser for one character. `src/static/icons/gen_icons.html` regenerates them.
 
 use std::io::Read;
 
@@ -31,9 +31,9 @@ impl IconRole {
     /// The baked alpha mask for this role.
     fn mask(self) -> &'static [u8] {
         match self {
-            IconRole::Lsp => include_bytes!("icons/glyph-lsp.z"),
-            IconRole::Serve => include_bytes!("icons/glyph-serve.z"),
-            IconRole::Annotate => include_bytes!("icons/glyph-anno.z"),
+            IconRole::Lsp => include_bytes!("../../static/icons/glyph-lsp.z"),
+            IconRole::Serve => include_bytes!("../../static/icons/glyph-serve.z"),
+            IconRole::Annotate => include_bytes!("../../static/icons/glyph-anno.z"),
         }
     }
 

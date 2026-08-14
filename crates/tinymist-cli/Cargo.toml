@@ -19,14 +19,6 @@ name = "talimist"
 path = "src/main.rs"
 doc = false
 
-[[bin]]
-# The document server: no editor attached, so restarting it never disturbs a
-# session.
-name = "talimist-serve"
-path = "src/serve.rs"
-required-features = ["preview"]
-doc = false
-
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
@@ -114,6 +106,7 @@ default = [
     "export",
     "open",
     "preview",
+    "serve",
     "trace",
     "embed-fonts",
     "no-content-hint",
@@ -149,6 +142,9 @@ export = ["tinymist/export"]
 lock = ["tinymist/lock"]
 open = ["tinymist/open", "dep:open"]
 preview = ["tinymist/preview", "tinymist-preview", "hyper-tungstenite"]
+# The document server and the agent endpoint, which are built on the preview
+# server's compile pipeline.
+serve = ["preview", "tinymist/serve"]
 trace = ["tinymist/trace"]
 battery = ["tinymist/battery"]
 

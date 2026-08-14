@@ -10,6 +10,37 @@ pub fn exit_on_ctrl_c() {
     });
 }
 
+/// The same, for the language server, which has a note of its own to put away.
+///
+/// The editor's preview is served from inside this process, so the register has
+/// a note pointing at it — and `talimist procs shutdown` stops it on purpose,
+/// so that the editor notices and starts a fresh one. What it must not do is
+/// leave the note behind, pointing at a port nothing answers on.
+///
+/// SIGKILL cannot be caught, so a note can still outlive its process; a reader
+/// that finds a note whose port does not answer treats it as what it is.
+pub fn tidy_up_lsp_on_signals(handle: &tokio::runtime::Handle) {
+    use tokio::signal::unix::{signal, SignalKind};
+    handle.spawn(async move {
+        let (Ok(mut terminate), Ok(mut interrupt)) = (
+            signal(SignalKind::terminate()),
+            signal(SignalKind::interrupt()),
+        ) else {
+            log::warn!("cannot listen for signals: the language server's note may outlive it");
+            return;
+        };
+        tokio::select! {
+            _ = terminate.recv() => log::info!("asked to stop"),
+            _ = interrupt.recv() => log::info!("interrupted"),
+        }
+        #[cfg(feature = "preview")]
+        if let Some(port) = tinymist::tool::registry::my_port() {
+            tinymist::tool::registry::withdraw_server(port);
+        }
+        std::process::exit(0);
+    });
+}
+
 /// Leaves properly when asked to stop, however it is asked.
 ///
 /// A server has things to put away — the note that says it is running, the
@@ -38,7 +69,12 @@ pub fn tidy_up_on_signals() {
             _ = terminate.recv() => log::info!("asked to stop"),
             _ = interrupt.recv() => log::info!("interrupted"),
         }
+        // A document server puts its things away — its note in the register,
+        // what it rendered — on the way out; anything else just goes.
+        #[cfg(feature = "serve")]
         tinymist::tool::serve::shutdown();
+        #[cfg(not(feature = "serve"))]
+        std::process::exit(0);
     });
 }
 

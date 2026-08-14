@@ -140,6 +140,98 @@ impl ServerState {
         self.project.restart_dedicate(dedicate, entry)
     }
 
+    /// The same, for a project rendered to something other than the primary's
+    /// target — an HTML preview of a document the editor is asking paged
+    /// questions about.
+    #[cfg(feature = "preview")]
+    pub fn restart_dedicate_as(
+        &mut self,
+        dedicate: &str,
+        entry: Option<ImmutPath>,
+        export_target: tinymist_task::ExportTarget,
+    ) -> Result<ProjectInsId> {
+        let entry = self.config.entry_resolver.resolve(entry);
+        self.project.restart_dedicate_as(dedicate, entry, export_target)
+    }
+
+    /// Starts a dedicated project that renders the file as HTML.
+    ///
+    /// HTML export needs the shims, and the shims need a wrapper file that
+    /// includes the document — so the instance's main file is the wrapper and
+    /// the document is what the wrapper points at. The wrapper is a memory
+    /// file: nothing is written beside the user's document.
+    #[cfg(feature = "preview")]
+    pub fn restart_dedicate_html(
+        &mut self,
+        dedicate: &str,
+        entry: Option<ImmutPath>,
+    ) -> Result<ProjectInsId> {
+        use crate::tool::render::html;
+
+        // Nothing focused yet, or nothing focused that can be previewed: the
+        // project exists and compiles nothing, so the page has somewhere to
+        // connect to while it waits for a document.
+        let Some(entry) = entry else {
+            let empty = self.config.entry_resolver.resolve(None);
+            return self.project.restart_dedicate_as(
+                dedicate,
+                empty,
+                tinymist_task::ExportTarget::Html,
+            );
+        };
+
+        let (wrapper, name) = html::wrapper_path_for(&entry)
+            .ok_or_else(|| tinymist_std::error_once!("cannot place the HTML shim wrapper"))?;
+        let wrapper: ImmutPath = wrapper.as_path().into();
+        self.create_source(wrapper.clone(), html::wrapper_source(&name))?;
+
+        // Labelling happens against the document, not the wrapper it is
+        // compiled through: everything downstream — anchors, edits, the
+        // sidecar — addresses the file the user is editing.
+        let doc = self.config.entry_resolver.resolve(Some(entry));
+        let wrapper_entry = self.config.entry_resolver.resolve(Some(wrapper));
+        if let (Some(wrapper_main), Some(doc_main)) = (wrapper_entry.main(), doc.main()) {
+            html::set_doc_file(wrapper_main, doc_main);
+        }
+
+        self.project.restart_dedicate_as(
+            dedicate,
+            wrapper_entry,
+            tinymist_task::ExportTarget::Html,
+        )
+    }
+
+    /// Re-points the HTML previews that follow the editor at the file it has
+    /// moved to.
+    ///
+    /// A paged preview follows by riding the primary compile; an HTML preview
+    /// is a project of its own, so following is this: same task, same page in
+    /// the browser, a different document under it.
+    #[cfg(feature = "preview")]
+    pub fn follow_html_previews(&mut self, entry: Option<ImmutPath>) {
+        let moved: Vec<String> = {
+            let followers = self.preview.html_followers.lock();
+            followers
+                .iter()
+                .filter(|(_, showing): &(&String, &Option<ImmutPath>)| {
+                    showing.as_deref() != entry.as_deref()
+                })
+                .map(|(task, _)| task.clone())
+                .collect()
+        };
+        for task in moved {
+            match self.restart_dedicate_html(&task, entry.clone()) {
+                Ok(_) => {
+                    self.preview
+                        .html_followers
+                        .lock()
+                        .insert(task, entry.clone());
+                }
+                Err(err) => log::warn!("cannot follow the editor with the HTML preview: {err}"),
+            }
+        }
+    }
+
     /// Create a fresh [`ProjectState`].
     pub fn project(
         config: &Config,
@@ -407,6 +499,16 @@ impl ProjectState {
         entry: EntryState,
     ) -> Result<ProjectInsId> {
         self.compiler.restart_dedicate(group, entry)
+    }
+
+    /// The same, rendered to something other than the primary's target.
+    pub(crate) fn restart_dedicate_as(
+        &mut self,
+        group: &str,
+        entry: EntryState,
+        export_target: ExportTarget,
+    ) -> Result<ProjectInsId> {
+        self.compiler.restart_dedicate_as(group, entry, export_target)
     }
 }
 
@@ -877,9 +979,17 @@ impl CompileHandler<LspCompilerFeat, ProjectInsStateExt> for CompileHandlerImpl 
             // rendered site are about the document, not about the wrapper the
             // shims put in front of it.
             let doc_path: Option<std::path::PathBuf> = {
-                use tinymist_project::WorldProvider as _;
                 let world = art.world();
-                let doc = crate::tool::preview::doc_file(world);
+                // What the compile's main file stands for. A served document is
+                // compiled through a wrapper that installs the HTML shims, so
+                // the two differ there; a previewer compiles the file itself.
+                #[cfg(feature = "serve")]
+                let doc = crate::tool::serve::doc_file(world);
+                #[cfg(not(feature = "serve"))]
+                let doc = {
+                    use typst::World as _;
+                    world.main()
+                };
                 world
                     .path_for_id(doc)
                     .ok()
@@ -909,16 +1019,26 @@ impl CompileHandler<LspCompilerFeat, ProjectInsStateExt> for CompileHandlerImpl 
                 );
             }
             // The rendering goes to disk, once, for everyone who asks for it —
-            // rather than being made again in the answer to each request.
+            // rather than being made again in the answer to each request. Only
+            // a document server renders to disk; a previewer draws pages.
+            #[cfg(feature = "serve")]
             let rendered = match (crate::tool::serve::site_cache(), &doc_path) {
                 (Some(cache), Some(path)) => {
-                    crate::tool::preview::html_annotations::html_document(art)
+                    let body = crate::tool::render::html::html_document(art)
                         .ok()
-                        .map(|html| crate::tool::preview::html_annotations::fragment(&html))
-                        .and_then(|frag| cache.write_body(path, &frag.body))
+                        .map(|html| crate::tool::render::html::fragment(&html).body);
+                    // What the drawings look like now, kept for the annotations
+                    // that point at them: an agent asked about a plot has no
+                    // other way of seeing it.
+                    if let Some(body) = &body {
+                        crate::tool::serve::pins::record_captures(art, body);
+                    }
+                    body.and_then(|body| cache.write_body(path, &body))
                 }
                 _ => None,
             };
+            #[cfg(not(feature = "serve"))]
+            let rendered: Option<()> = None;
             if let Some(diag_tx) = self.preview.diag_tx(art.id()) {
                 let last_edit = self.last_edit.lock().clone();
                 let payload = crate::tool::preview::diagnostics_payload(
@@ -926,17 +1046,26 @@ impl CompileHandler<LspCompilerFeat, ProjectInsStateExt> for CompileHandlerImpl 
                     last_edit.as_ref().map(|(path, offset)| (path.as_ref(), *offset)),
                 );
                 let doc_dark = crate::tool::preview::doc_is_dark(art);
-                let annotations = crate::tool::preview::annotation_pins(art);
+                #[cfg(feature = "serve")]
                 let doc_version = rendered.as_ref().map(|body| body.version);
+                #[cfg(not(feature = "serve"))]
+                let doc_version: Option<u64> = rendered.map(|_: ()| 0);
                 diag_tx.send_modify(|state| {
-                    if let Some(version) = doc_version {
-                        state.doc_version = version;
+                    match doc_version {
+                        // A document server renders to disk and versions what
+                        // it wrote; the version a page holds is the version of
+                        // the file it fetched.
+                        Some(version) => state.doc_version = version,
+                        // An editor's previewer renders on request, so there
+                        // is nothing to version — but a page still has to be
+                        // told the document moved, and every compile that got
+                        // this far produced a new one.
+                        None => state.doc_version += 1,
                     }
                     state.ok = payload.ok;
                     state.messages = payload.messages;
                     state.locations = payload.locations;
                     state.smart_invert = self.smart_invert;
-                    state.annotations = annotations;
                     if doc_dark.is_some() {
                         state.doc_dark = doc_dark;
                     }

@@ -26,6 +26,10 @@ pub fn lsp_main(args: LspArgs) -> Result<()> {
     log::info!("tinymist version information: {pairs:?}");
     log::info!("starting language server: {args:?}");
 
+    // The preview this server hosts leaves a note in the register; a stop
+    // signal has to take the note with it.
+    crate::utils::tidy_up_lsp_on_signals(crate::RUNTIMES.tokio_runtime.handle());
+
     let is_replay = !args.mirror.replay.is_empty();
     with_stdio_transport::<LspMessage>(args.mirror.clone(), |conn| {
         let client = client_root(conn.sender);

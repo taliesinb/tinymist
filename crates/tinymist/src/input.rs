@@ -190,12 +190,19 @@ impl ServerState {
             return Err(error_once!("entry file must be absolute", path: path.unwrap().display()));
         }
 
-        let task = self.resolve_task_or(path);
+        let task = self.resolve_task_or(path.clone());
 
         // Skip the interrupt if the primary entry is unchanged. An
         // entry-change interrupt is not cheap: it forgets the last success
         // document and forces a recompilation, and implicit focus may request
         // the current entry frequently (e.g. on every code action request).
+        // An HTML preview is a project of its own and cannot ride along with
+        // this one, so it is told where the editor went — before the check
+        // below, which is about the primary and says nothing about where a
+        // follower is pointed.
+        #[cfg(feature = "preview")]
+        self.follow_html_previews(path);
+
         let unchanged = task.inputs.is_none()
             && task
                 .entry
