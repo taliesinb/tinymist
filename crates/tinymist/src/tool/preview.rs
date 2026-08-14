@@ -2,8 +2,9 @@
 
 pub use compile::{PreviewCompileView, ProjectPreviewHandler};
 pub use annotations::{
-    annotation_pins, dev_asset, dev_asset_in, doc_file, sidecar_path, AnnotateRequest,
-    AnnotationPin, AnnotationServer, ANCHOR_PREFIX,
+    annotation_pins, dev_asset, dev_asset_in, doc_file, sidecar_path, AnchorPolicy,
+    AnnotateRequest, AnnotationPin, AnnotationRecord, AnnotationServer, SourceBlock,
+    ANCHOR_PREFIX,
 };
 
 pub use error_overlay::{
@@ -251,6 +252,12 @@ pub struct PreviewCliArgs {
     /// prefix everything is served under. `--annotate` implies `annotate`.
     #[clap(long = "role", value_name = "ROLE", default_value = "preview")]
     pub role: icons::IconRole,
+
+    /// Also answer agents, at `/m/`: an MCP endpoint over the same port, with
+    /// tools for hearing about annotations, reading the source they point at,
+    /// rewriting it, and replying. The pages are unaffected.
+    #[clap(long = "mcp")]
+    pub mcp: bool,
 
     /// Give the document a window of its own: a web app installed from this
     /// URL if there is one, else the nearest thing the browser offers.
@@ -1139,6 +1146,8 @@ impl PreviewState {
                 }),
                 // The editor owns this one's lifetime.
                 false,
+                // An editor's preview has no agents talking to it.
+                false,
                 WebAppIdentity {
                     role: icons::IconRole::Lsp,
                     color: args.icon_color.as_deref().and_then(icons::parse_hex),
@@ -1365,6 +1374,7 @@ impl AnnotationServer for LspAnnotationServer {
         annotations::probe_annotate(&self.art()?, page, x, y)
     }
 
+
     fn probe_span(
         &self,
         a: (usize, f64, f64),
@@ -1438,14 +1448,10 @@ impl DiskAnnotationServer {
         if !self.emit_events {
             return;
         }
-        let mut line = format!("{{\"type\":{}", serde_json::Value::from(kind));
-        for (key, value) in fields {
-            line.push_str(&format!(",{}:{value}", serde_json::Value::from(*key)));
-        }
-        line.push_str(&format!(
-            ",\"ts\":{}}}",
-            serde_json::Value::from(tinymist_project::iso_now())
-        ));
+        let line = tinymist_project::event_line(kind, fields);
+        // Kept as well as printed: an agent that asks what happened while it
+        // was thinking gets these alongside everything else the server said.
+        tinymist_project::record_event(serde_json::from_str(&line).unwrap_or_default());
         use std::io::Write;
         let mut out = std::io::stdout().lock();
         let _ = out.write_all(line.as_bytes());
@@ -1527,6 +1533,66 @@ impl AnnotationServer for DiskAnnotationServer {
 
     fn probe(&self, page: usize, x: f64, y: f64) -> Result<annotations::ProbeResult, String> {
         annotations::probe_annotate(&self.art()?, page, x, y)
+    }
+
+    fn block(&self, uuid: &str, context: bool) -> Result<annotations::SourceBlock, String> {
+        annotations::block_of(&self.art()?, uuid, context)
+    }
+
+    fn replace_block(
+        &self,
+        uuid: &str,
+        block_id: &str,
+        new_text: &str,
+        policy: annotations::AnchorPolicy,
+    ) -> Result<Vec<String>, String> {
+        let art = self.art()?;
+        let edit = annotations::prepare_block_replace(&art, uuid, block_id, new_text, policy)?;
+        std::fs::write(&edit.path, &edit.content)
+            .map_err(|err| format!("cannot write {}: {err}", edit.path.display()))?;
+        // The anchors the rewrite dropped were dropped on purpose, so their
+        // annotations go too — an entry with nothing to point at is litter.
+        for uuid in &edit.dropped {
+            // The anchor is already gone with the text; only the entry is left.
+            if let Ok((path, content)) = annotations::remove_record(&art, uuid) {
+                let _ = std::fs::write(path, content);
+            }
+        }
+        self.emit(
+            "block_replaced",
+            &[
+                ("uuid", uuid.into()),
+                ("file", edit.path.display().to_string().into()),
+                ("dropped", serde_json::to_value(&edit.dropped).unwrap_or_default()),
+            ],
+        );
+        Ok(edit.dropped)
+    }
+
+    fn compile_revision(&self) -> u64 {
+        self.last_art
+            .lock()
+            .as_ref()
+            .map(|art| {
+                let rev = art.graph.snap.world.revision();
+                rev.get() as u64
+            })
+            .unwrap_or(0)
+    }
+
+    fn diagnostics(&self) -> (bool, Vec<String>) {
+        let Ok(art) = self.art() else {
+            return (false, vec!["nothing compiled yet".into()]);
+        };
+        let payload = diagnostics_payload(&art, None);
+        (payload.ok, payload.messages)
+    }
+
+    fn records(&self) -> Result<Vec<annotations::AnnotationRecord>, String> {
+        let art = self.art()?;
+        let sidecar =
+            annotations::sidecar_path(&art).ok_or("cannot determine the sidecar path")?;
+        Ok(annotations::read_sidecar(&sidecar).0)
     }
 
     fn probe_span(

@@ -29,6 +29,8 @@ pub async fn make_http_server(
     websocket_tx: mpsc::UnboundedSender<HyperWebsocket>,
     site: std::sync::Arc<dyn crate::tool::serve::DocumentSite>,
     shutdown_on_last_client: bool,
+    // Whether the machine face is served at `/m/`.
+    mcp: bool,
     identity: super::WebAppIdentity,
     allowed_origins: Vec<String>,
 ) -> HttpServer {
@@ -77,8 +79,15 @@ pub async fn make_http_server(
     // Clients are numbered from zero as they arrive, so the line that says one
     // has gone can name which one it was.
     let next_client = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // When an agent last called. A page says it is there by holding its event
+    // stream open, which is what "is anyone there" counts; an agent asks a
+    // question and goes away to think about the answer, so it says it is there
+    // by having asked recently.
+    let started = std::time::Instant::now();
+    let last_call = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let site = site.clone();
     let make_service = {
+        let last_call = last_call.clone();
         let site = site.clone();
         let live = live.clone();
         let served_anyone = served_anyone.clone();
@@ -86,6 +95,7 @@ pub async fn make_http_server(
         let allowed_origins = allowed_origins.clone();
         let next_client = next_client.clone();
         move |peer: std::net::SocketAddr| {
+        let last_call = last_call.clone();
         let frontend_html = frontend_html.clone();
         let websocket_tx = websocket_tx.clone();
         let static_file_addr = static_file_addr.clone();
@@ -98,6 +108,7 @@ pub async fn make_http_server(
         service_fn(move |mut req: hyper::Request<Incoming>| {
             let identity = identity.clone();
             let allowed_origins = allowed_origins.clone();
+            let last_call = last_call.clone();
             let frontend_html = frontend_html.clone();
             let websocket_tx = websocket_tx.clone();
             let static_file_addr = static_file_addr.clone();
@@ -265,6 +276,127 @@ pub async fn make_http_server(
                     let res = hyper::Response::builder()
                         .header(hyper::header::CONTENT_TYPE, "text/html")
                         .body(Body::new(Full::<Bytes>::from(page)))
+                        .unwrap();
+                    Ok(res)
+                } else if raw_path == "/m" || raw_path.starts_with("/m/") {
+                    // The machine face, beside the pages rather than instead of
+                    // them: a person reads `/a/`, an agent calls `/m/`.
+                    if !mcp {
+                        let res = hyper::Response::builder()
+                            .status(hyper::StatusCode::NOT_FOUND)
+                            .header(hyper::header::CONTENT_TYPE, "text/plain")
+                            .body(Body::new(Full::<Bytes>::from(
+                                "this server was not started with --mcp\n",
+                            )))
+                            .unwrap();
+                        return Ok(res);
+                    }
+                    if req.method() != hyper::Method::POST {
+                        // The stream a client may open to be spoken to first is
+                        // not offered: everything here is asked for, including
+                        // waiting for something to happen.
+                        let res = hyper::Response::builder()
+                            .status(hyper::StatusCode::METHOD_NOT_ALLOWED)
+                            .header(hyper::header::ALLOW, "POST")
+                            .body(Body::new(Full::<Bytes>::default()))
+                            .unwrap();
+                        return Ok(res);
+                    }
+                    use http_body_util::BodyExt;
+                    last_call.store(
+                        started.elapsed().as_secs().max(1),
+                        std::sync::atomic::Ordering::SeqCst,
+                    );
+                    let body = req.into_body().collect().await?.to_bytes();
+                    let request: serde_json::Value =
+                        serde_json::from_slice(&body).unwrap_or_default();
+                    let answer = match request {
+                        // A batch, which the protocol allows.
+                        serde_json::Value::Array(calls) => {
+                            let mut answers = vec![];
+                            for call in calls {
+                                if let Some(answer) =
+                                    crate::tool::serve::mcp::handle(&site, call).await
+                                {
+                                    answers.push(answer);
+                                }
+                            }
+                            (!answers.is_empty())
+                                .then(|| serde_json::Value::Array(answers))
+                        }
+                        one => crate::tool::serve::mcp::handle(&site, one).await,
+                    };
+                    let res = match answer {
+                        Some(answer) => hyper::Response::builder()
+                            .header(hyper::header::CONTENT_TYPE, "application/json")
+                            .body(Body::new(Full::<Bytes>::from(answer.to_string())))
+                            .unwrap(),
+                        // A notification is answered with silence, which over
+                        // HTTP is an empty acceptance.
+                        None => hyper::Response::builder()
+                            .status(hyper::StatusCode::ACCEPTED)
+                            .body(Body::new(Full::<Bytes>::default()))
+                            .unwrap(),
+                    };
+                    Ok(res)
+                } else if raw_path == "/dev/stop" {
+                    // Asked to stop, which is not the same as being killed: the
+                    // rendered site is cleared up and the register is told.
+                    // Loopback only, like everything else that writes here.
+                    log::info!(
+                        target: crate::PREVIEW_COMPAT_LOG_TARGET,
+                        "asked to stop by {peer}"
+                    );
+                    let res = hyper::Response::builder()
+                        .header(hyper::header::CONTENT_TYPE, "text/plain")
+                        .body(Body::new(Full::<Bytes>::from("stopping\n")))
+                        .unwrap();
+                    tokio::spawn(async {
+                        // After the answer has gone out.
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        crate::tool::serve::shutdown();
+                    });
+                    Ok(res)
+                } else if path == "/dev/events" {
+                    // What the server has said, with numbers on it. A client
+                    // asks with the last id it saw and waits for the next: a
+                    // loop is then the length of what happened, not of how
+                    // often it asked.
+                    let query = req.uri().query().unwrap_or("");
+                    let param = |name: &str| -> Option<String> {
+                        query.split('&').find_map(|pair| {
+                            let (key, value) = pair.split_once('=')?;
+                            (key == name).then(|| value.to_owned())
+                        })
+                    };
+                    let since = param("since").and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+                    let wait = param("wait")
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .unwrap_or(0)
+                        .min(300);
+                    let (mut events, mut cursor) = tinymist_project::events_since(since);
+                    if events.is_empty() && wait > 0 {
+                        let mut signal = tinymist_project::event_signal();
+                        let waited = tokio::time::timeout(
+                            std::time::Duration::from_secs(wait),
+                            signal.changed(),
+                        )
+                        .await;
+                        if waited.is_ok() {
+                            let fresh = tinymist_project::events_since(since);
+                            events = fresh.0;
+                            cursor = fresh.1;
+                        }
+                    }
+                    let payload = serde_json::json!({
+                        "ok": true,
+                        "events": events,
+                        "cursor": cursor,
+                    });
+                    let res = hyper::Response::builder()
+                        .header(hyper::header::CONTENT_TYPE, "application/json")
+                        .header(hyper::header::CACHE_CONTROL, "no-store")
+                        .body(Body::new(Full::<Bytes>::from(payload.to_string())))
                         .unwrap();
                     Ok(res)
                 } else if path == "/dev/docs" && listing {
@@ -697,13 +829,31 @@ pub async fn make_http_server(
     // to outlive it. A short grace period covers a page reload, which drops
     // every connection for a moment before opening new ones.
     const IDLE_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+    // What an agent's silence is worth. Closing a window is a decision, and it
+    // is what ends a server — but a server an agent opened a window on is being
+    // read *and* worked on, and the reader finishing does not mean the work is.
+    // An agent between two questions has not gone anywhere; one that has said
+    // nothing for half an hour has.
+    //
+    // Only the pause needs saying: a server nobody has ever connected to does
+    // not shut down at all, since shutting down is what happens when the last
+    // client leaves and there has to have been one.
+    const AGENT_GRACE: u64 = 30 * 60;
     if shutdown_on_last_client {
         let live = live.clone();
         let served_anyone = served_anyone.clone();
+        let last_call = last_call.clone();
         tokio::spawn(async move {
             use std::sync::atomic::Ordering::SeqCst;
             loop {
                 tokio::time::sleep(IDLE_GRACE).await;
+                if mcp {
+                    let called = last_call.load(SeqCst);
+                    let running = started.elapsed().as_secs();
+                    if called > 0 && running.saturating_sub(called) < AGENT_GRACE {
+                        continue;
+                    }
+                }
                 log::debug!(
                     target: crate::PREVIEW_COMPAT_LOG_TARGET,
                     "idle check: pages={} served={}",

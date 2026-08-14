@@ -18,6 +18,13 @@
 //! one.
 
 mod cache;
+pub mod hub;
+pub mod mcp;
+pub mod registry;
+
+pub use registry::{
+    announce_server, running_servers, slug_for, withdraw_server, ServerNote,
+};
 
 pub use cache::{
     drop_site_cache, site_cache, sweep_stale_sites, temp_site_dir, use_site_cache, CachedBody,
@@ -81,6 +88,16 @@ pub trait DocumentSite: Send + Sync + 'static {
         &'a self,
         slug: &'a str,
     ) -> futures::future::BoxFuture<'a, Option<Arc<DocServices>>>;
+}
+
+/// What a server does on its way out, however it was asked: withdraw its note
+/// from the register, clear up what it rendered, and go.
+pub fn shutdown() -> ! {
+    if let Some(port) = registry::my_port() {
+        registry::withdraw_server(port);
+    }
+    cache::drop_site_cache();
+    std::process::exit(0);
 }
 
 /// The `.typ` files directly under a directory, sorted, as listing entries.

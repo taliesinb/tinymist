@@ -46,6 +46,79 @@ pub fn iso_now() -> String {
     )
 }
 
+/// The events this process has narrated, so that something arriving later can
+/// still hear them.
+///
+/// Narration on a stream is for whoever was watching at the time; an agent
+/// asking "what happened while I was thinking?" needs the same events with
+/// numbers on them. The last few hundred are kept — enough for any client that
+/// is not asleep, and bounded so a long-running server does not grow a diary.
+const KEPT_EVENTS: usize = 1024;
+
+struct EventLog {
+    /// The events, oldest first, each with the id it was given.
+    events: std::sync::Mutex<std::collections::VecDeque<(u64, serde_json::Value)>>,
+    /// The id of the last event, which waiters watch for a change in.
+    latest: tokio::sync::watch::Sender<u64>,
+}
+
+static EVENTS: std::sync::OnceLock<EventLog> = std::sync::OnceLock::new();
+
+fn log() -> &'static EventLog {
+    EVENTS.get_or_init(|| EventLog {
+        events: std::sync::Mutex::new(std::collections::VecDeque::new()),
+        latest: tokio::sync::watch::channel(0).0,
+    })
+}
+
+/// Records an event, whatever else is done with it. Called by both narrators:
+/// the one that writes lines to stderr for a person, and the one that writes
+/// them to stdout for an agent driving the server.
+pub fn record_event(event: serde_json::Value) {
+    let log = log();
+    let id = {
+        let Ok(mut events) = log.events.lock() else {
+            return;
+        };
+        let id = events.back().map(|(id, _)| id + 1).unwrap_or(1);
+        events.push_back((id, event));
+        while events.len() > KEPT_EVENTS {
+            events.pop_front();
+        }
+        id
+    };
+    let _ = log.latest.send(id);
+}
+
+/// The events after `since`, and the id to ask with next time.
+///
+/// A `since` older than what is kept returns what there is: an event that has
+/// fallen off the end is one nobody can be told about, and saying so by
+/// skipping is better than pretending the gap is not there — the ids show it.
+pub fn events_since(since: u64) -> (Vec<serde_json::Value>, u64) {
+    let log = log();
+    let Ok(events) = log.events.lock() else {
+        return (vec![], since);
+    };
+    let mut out = vec![];
+    let mut cursor = since;
+    for (id, event) in events.iter() {
+        if *id > since {
+            out.push(event.clone());
+            cursor = *id;
+        }
+    }
+    if out.is_empty() {
+        cursor = events.back().map(|(id, _)| *id).unwrap_or(since);
+    }
+    (out, cursor)
+}
+
+/// A handle that says when an event has been recorded, for waiting on one.
+pub fn event_signal() -> tokio::sync::watch::Receiver<u64> {
+    log().latest.subscribe()
+}
+
 /// Says what just happened, as one line of JSON on stderr.
 ///
 /// One event per line, machine-readable, because the things worth narrating —
@@ -60,12 +133,19 @@ pub fn announce(kind: &str, fields: &[(&str, serde_json::Value)]) {
     if !announcing() {
         return;
     }
+    let line = event_line(kind, fields);
+    record_event(serde_json::from_str(&line).unwrap_or_default());
+    eprintln!("{line}");
+}
+
+/// One event as one line of JSON, with `type` first and `ts` last.
+pub fn event_line(kind: &str, fields: &[(&str, serde_json::Value)]) -> String {
     let mut line = format!("{{\"type\":{}", serde_json::Value::from(kind));
     for (key, value) in fields {
         line.push_str(&format!(",{}:{value}", serde_json::Value::from(*key)));
     }
     line.push_str(&format!(",\"ts\":{}}}", serde_json::Value::from(iso_now())));
-    eprintln!("{line}");
+    line
 }
 
 /// When something last changed on disk, as this process saw it.

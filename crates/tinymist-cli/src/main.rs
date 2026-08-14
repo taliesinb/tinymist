@@ -19,6 +19,8 @@ mod cmd {
     #[cfg(feature = "preview")]
     pub mod docsite;
     #[cfg(feature = "preview")]
+    pub mod mcp;
+    #[cfg(feature = "preview")]
     pub mod serve;
     pub mod query;
     pub mod test;
@@ -101,6 +103,9 @@ enum Commands {
     /// Serve a file or directory as HTML
     #[cfg(feature = "preview")]
     Serve(crate::serve::ServeArgs),
+    /// Answer agents, at one address, about every document being served
+    #[cfg(feature = "preview")]
+    Mcp(crate::mcp::McpArgs),
     /// Run preview server
     #[cfg(feature = "preview")]
     Preview(tinymist::tool::preview::PreviewCliArgs),
@@ -175,6 +180,8 @@ fn main() -> Result<()> {
         Commands::Preview(preview) => preview.verbose,
         #[cfg(feature = "preview")]
         Commands::Serve(serve) => serve.verbose,
+        #[cfg(feature = "preview")]
+        Commands::Mcp(..) => false,
 
         // Long-running commands, usually run from an editor.
         Commands::Lsp(..) => true,
@@ -224,6 +231,8 @@ fn main() -> Result<()> {
         Commands::Preview(args) => block_on(crate::preview::preview_main(args)),
         #[cfg(feature = "preview")]
         Commands::Serve(args) => crate::serve::serve_main(args),
+        #[cfg(feature = "preview")]
+        Commands::Mcp(args) => crate::mcp::mcp_main(args),
         #[cfg(feature = "export")]
         Commands::Compile(args) => block_on(crate::compile::compile_main(args)),
         Commands::Lint(args) => crate::lint::lint_main(args),

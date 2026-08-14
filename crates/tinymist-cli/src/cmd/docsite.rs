@@ -280,6 +280,7 @@ pub async fn serve_directory(
     host: String,
     role: icons::IconRole,
     shutdown_on_last_client: bool,
+    mcp: bool,
     ready: impl FnOnce(u16),
 ) -> Result<()> {
     if !matches!(args.preview.export_target(), tinymist_task::ExportTarget::Html) {
@@ -303,6 +304,7 @@ pub async fn serve_directory(
         websocket_tx,
         site,
         shutdown_on_last_client,
+        mcp,
         identity,
         allowed_origins,
     )

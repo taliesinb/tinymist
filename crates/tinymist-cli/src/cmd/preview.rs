@@ -62,6 +62,7 @@ pub async fn preview_main(mut args: PreviewCliArgs) -> Result<()> {
     exit_on_ctrl_c();
 
     let shutdown_on_last_client = args.shutdown_on_last_client;
+    let mcp = args.mcp;
     // `annotate` and `preview` are the same server wearing different faces.
     let cli_role = if args.annotate {
         tinymist::tool::preview::icons::IconRole::Annotate
@@ -285,6 +286,7 @@ pub async fn preview_main(mut args: PreviewCliArgs) -> Result<()> {
                 }),
                 // The control plane serves the editor, not a browser.
                 false,
+                false,
                 tinymist::tool::preview::WebAppIdentity::new(
                     tinymist::tool::preview::icons::IconRole::Serve,
                 ),
@@ -450,6 +452,7 @@ pub async fn preview_main(mut args: PreviewCliArgs) -> Result<()> {
                 websocket_tx.clone(),
                 site.clone(),
                 shutdown_on_last_client,
+                args.mcp,
                 identity.clone(),
                 allowed_origins.clone(),
             )
@@ -466,6 +469,7 @@ pub async fn preview_main(mut args: PreviewCliArgs) -> Result<()> {
             websocket_tx,
             site,
             shutdown_on_last_client,
+            mcp,
             identity.clone(),
             allowed_origins,
         )
@@ -520,6 +524,10 @@ pub async fn preview_main(mut args: PreviewCliArgs) -> Result<()> {
         println!();
         println!("{}", identity.title(port));
         println!("  document  http://{static_server_addr}{path}");
+        if mcp {
+            // The line to paste into an agent's configuration.
+            println!("  agents    http://{static_server_addr}/m/");
+        }
         #[cfg(feature = "open")]
         if let Some(cdp) = open_cdp
             .as_deref()

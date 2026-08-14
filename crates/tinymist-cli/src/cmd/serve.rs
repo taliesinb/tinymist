@@ -54,6 +54,13 @@ pub struct ServeArgs {
     #[clap(long = "port", value_name = "PORT")]
     pub port: Option<u16>,
 
+    /// Also answer agents, at `/m/`: an MCP endpoint on this same port, with
+    /// tools for hearing about annotations, reading the block of source each
+    /// points at, rewriting it, and replying. Reading the document in a browser
+    /// is unaffected — the pages are where they were.
+    #[clap(long = "mcp")]
+    pub mcp: bool,
+
     /// A word mixed into the derived port, so that servers started by different
     /// things stay apart. An editor task passing `--port-salt zed` gets its own
     /// server for a document, rather than reusing — and being able to shut down
@@ -258,6 +265,15 @@ pub fn derive_port(canonical: &Path, role: IconRole, salt: Option<&str>) -> u16 
 /// afterwards: a cache outliving the process that made it is litter.
 struct SiteGuard(std::sync::Arc<tinymist::tool::serve::SiteCache>);
 
+/// Withdraws this server's note when it stops.
+struct RegistryGuard(u16);
+
+impl Drop for RegistryGuard {
+    fn drop(&mut self) {
+        tinymist::tool::serve::withdraw_server(self.0);
+    }
+}
+
 impl Drop for SiteGuard {
     fn drop(&mut self) {
         tinymist::tool::serve::drop_site_cache();
@@ -367,6 +383,9 @@ pub fn serve_main(args: ServeArgs) -> Result<()> {
     // A served document is read, not previewed: the role decides the icon, the
     // name, and the `/v/` its pages live under.
     argv.push("--role=serve".into());
+    if args.mcp {
+        argv.push("--mcp".into());
+    }
     if args.daemon {
         argv.push("--daemon".into());
     }
@@ -412,16 +431,49 @@ pub fn serve_main(args: ServeArgs) -> Result<()> {
     preview_args.annotate = args.anno;
     // The site goes when the server does.
     let _site = SiteGuard(site);
+    // The note that says this server exists, for whoever is looking for it: an
+    // agent asked about "the comments on MATH" has a name, not a port.
+    let note = tinymist::tool::serve::ServerNote {
+        server: tinymist::tool::serve::slug_for(&canonical),
+        path: canonical.display().to_string(),
+        url: url.clone(),
+        port,
+        role: match role {
+            IconRole::Annotate => "annotate".into(),
+            IconRole::Lsp => "preview".into(),
+            IconRole::Serve => "serve".into(),
+        },
+        mcp: args.mcp,
+        directory: is_dir,
+        pid: std::process::id(),
+        started: tinymist_project::iso_now(),
+    };
+    if let Err(err) = tinymist::tool::serve::announce_server(&note) {
+        log::warn!("cannot leave a note in the register: {err}");
+    }
+    let _registered = RegistryGuard(port);
+    if args.mcp {
+        // The address agents are told about is one, fixed, and not this: make
+        // sure it is there, since this server being up is usually the reason
+        // somebody is about to ask it something.
+        match tinymist::tool::serve::hub::ensure_running(tinymist::tool::serve::hub::HUB_PORT) {
+            Ok(true) => log::info!("started talimist mcp"),
+            Ok(false) => {}
+            Err(err) => log::warn!("cannot start talimist mcp: {err}"),
+        }
+    }
     if is_dir {
         let host = args.host.clone();
         let opener = args.clone();
         let shutdown = args.shutdown_on_last_client;
+        let mcp = args.mcp;
         return block_on(crate::cmd::docsite::serve_directory(
             preview_args,
             canonical.clone(),
             host,
             role,
             shutdown,
+            mcp,
             move |port| {
                 println!();
                 println!("{}", tinymist::tool::preview::WebAppIdentity {
@@ -433,6 +485,9 @@ pub fn serve_main(args: ServeArgs) -> Result<()> {
                 }
                 .title(port));
                 println!("  documents  {url}");
+                if mcp {
+                    println!("  agents     http://{}:{port}/m/", opener.host);
+                }
                 if opener.open {
                     open_url(&url, &opener, port);
                 }
