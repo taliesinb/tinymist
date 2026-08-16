@@ -11,9 +11,6 @@
 // endpoints (/dev/annotate*), which are about annotations rather than about
 // how a document is drawn. Nothing else.
 (() => {
-  const SRC_ATTR = "data-typst-src";
-  const TEXT_ATTR = "data-typst-text";
-  const ATOM_ATTR = "data-typst-atom";
   const DOC_ID = "tinymist-doc";
   const MARKS_ID = "tinymist-marks";
   const BOX_ID = "tinymist-annot-box";
@@ -123,26 +120,49 @@
   // it is the base to resolve them against.
   const BASE = location.pathname.replace(/[^/]*$/, "");
   const url = (path) => BASE + path.replace(/^\/?(dev\/)?/, "dev/");
-  const post = (path, payload) =>
-    fetch(url(path), { method: "POST", body: JSON.stringify(payload) })
+  // Whether the server is answering. Everything that needs the server goes
+  // through here, so one failed request is enough to know, and one that
+  // succeeds is enough to know again.
+  let online = true;
+  let flying = false; // airplane mode: the page pretends the server is gone
+  const listeners = [];
+  const onConnection = (fn) => listeners.push(fn);
+  const setOnline = (state) => {
+    if (online === state) return;
+    online = state;
+    for (const fn of listeners) fn(online);
+  };
+  const offline = () => ({ ok: false, error: "no connection to the server" });
+
+  const post = (path, payload) => {
+    if (flying) return Promise.resolve(offline());
+    return fetch(url(path), { method: "POST", body: JSON.stringify(payload) })
       .then((r) => r.json())
       .then((r) => {
+        setOnline(true);
         if (!r.ok) console.warn("tinymist annotation:", r.error);
         return r;
       })
       .catch((e) => {
         console.warn("tinymist annotation:", e);
+        setOnline(false);
         return { ok: false, error: String(e) };
       });
-  const getJson = (path) =>
-    fetch(url(path))
-      .then((r) => r.json())
-      .catch((e) => ({ ok: false, error: String(e) }));
-
-  const freshUuid = () => {
-    const rand = crypto.getRandomValues(new Uint8Array(2));
-    return Array.from(rand, (b) => b.toString(16).padStart(2, "0").toUpperCase()).join("");
   };
+  const getJson = (path) => {
+    if (flying) return Promise.resolve(offline());
+    return fetch(url(path))
+      .then((r) => r.json())
+      .then((r) => {
+        setOnline(true);
+        return r;
+      })
+      .catch((e) => {
+        setOnline(false);
+        return { ok: false, error: String(e) };
+      });
+  };
+
 
   // "5s", "5m", "11h", "3d" — largest unit only
   const timeAgo = (iso) => {
@@ -181,312 +201,88 @@
   const nextLetter = () =>
     indexLetter(Math.max(0, ...pins.map((p) => letterIndex(p.letter))) + 1);
 
-  // ------------------------------------------------------- the source index
-  // Every text run the server emitted is wrapped in a span carrying the source
-  // range it came from, so a source offset and a place in the document are the
-  // same thing said two ways. Everything below — where a pin's mark goes, what
-  // a click would annotate — is a lookup in this index.
+  // ------------------------------------------------------------- the index
+  // Every part of the rendering that can be referred to carries `data-uid`, and
+  // the map that came with the document says what each id is. A location names
+  // an id; drawing one and making one are both lookups by id. The client never
+  // sees a position in the `.typ` file.
   let pins = [];
-  let runs = []; // { el, node, s, e, text, exact }
-  let blocks = []; // { el, kind, anchor, lo, hi }
-  const BLOCK_TAGS = {
-    LI: "item",
-    P: "para",
-    H1: "block",
-    H2: "block",
-    H3: "block",
-    H4: "block",
-    H5: "block",
-    H6: "block",
-    BLOCKQUOTE: "block",
-    PRE: "block",
-    // A term list is a list: the term is its marker and the definition is the
-    // item, and an annotation in either belongs to the pair.
-    DT: "item",
-    DD: "item",
-    FIGURE: "block",
-    TABLE: "block",
-    // A Typst `block` is a `<div>`, and a callout, a theorem environment or a
-    // definition box is a block before it is anything else. Divs with no text
-    // in them — the spacers and wrappers the export leaves behind — are
-    // dropped below.
-    DIV: "block",
-    SECTION: "block",
-    ARTICLE: "block",
-    ASIDE: "block",
-  };
-  const BLOCK_SELECTOR = Object.keys(BLOCK_TAGS).join(",");
-  // Two runs further apart in the source than this came from different places
-  // in the file, not from the same passage. Runs within a passage are usually
-  // adjacent, separated only by the markup between them; a helper's own text
-  // and the text it was called with are separated by the rest of the helper.
-  const CLUSTER_GAP = 96;
+  let renderId = null; // which rendering the page is showing
+  let nodeKinds = {}; // uid -> kind, from the map
+  let runs = []; // { el, uid, node, text }
+  let atoms = []; // { el, uid, kind }
+  let blocks = []; // { el, uid, kind }
+  const byUid = new Map();
 
-  const parseRange = (el, attr) => {
-    const raw = el.getAttribute(attr);
-    if (!raw) return null;
-    const [s, e] = raw.split(":").map((n) => parseInt(n, 10));
-    return Number.isFinite(s) && Number.isFinite(e) ? { s, e } : null;
+  const BLOCK_KINDS = ["block", "para", "item", "math_block", "math.block", "svg", "image"];
+  const ATOM_KINDS = ["math", "link", "raw", "inline"];
+  const BLOCK_SELECTOR =
+    "p,li,dt,dd,figure,table,blockquote,pre,div,section,article,aside,h1,h2,h3,h4,h5,h6";
+
+  // What a region is called: the map says, and a click on one asks for an
+  // annotation of that kind.
+  const blockKind = (el, kind) => (kind === "math_block" ? "math.block" : kind);
+
+  // A drawing carries its id in `id` rather than in `data-uid`: an SVG can only
+  // be given the attribute Typst already writes for it.
+  const uidOf = (el) => {
+    if (!el || !el.getAttribute) return null;
+    return el.getAttribute("data-uid") || (el.localName === "svg" ? el.getAttribute("id") : null);
   };
 
   const indexDocument = () => {
     runs = [];
-    blocks = [];
     atoms = [];
+    blocks = [];
+    byUid.clear();
     const doc = document.getElementById(DOC_ID);
     if (!doc) return;
-    // One walk of the document, in order, over the two things that carry a
-    // source position: runs of text, and atoms — the elements annotated whole.
-    // A run inside an atom is not a run: an equation has no words, and the
-    // text inside a link belongs to the link.
-    const atomEls = Array.from(doc.querySelectorAll(ATOM_SELECTOR));
-    const pending = [];
-    let atomIdx = 0;
-    let inside = null;
-    for (const el of doc.querySelectorAll(ATOM_SELECTOR + ", [" + TEXT_ATTR + "]")) {
-      if (inside && !inside.el.contains(el)) inside = null;
-      if (atomIdx < atomEls.length && atomEls[atomIdx] === el) {
-        atomIdx += 1;
-        if (inside) continue; // an atom within an atom: a link around a `code`
-        // A run of pure whitespace is not a thing: an atom for the space
-        // between two words draws a mark a couple of pixels wide and offers
-        // to annotate nothing at all. A drawing has no text in it and is very
-        // much a thing.
-        const drawing = el.localName === "svg" || el.localName === "math";
-        if (!drawing && !el.textContent.trim()) continue;
-        const told = parseInt(el.getAttribute(ATOM_ATTR) || "", 10);
-        inside = {
-          el,
-          scope: atomScope(el),
-          own: parseRange(el, SRC_ATTR),
-          told: Number.isFinite(told) ? told : null,
-        };
-        pending.push(inside);
-        continue;
-      }
-      if (inside) continue;
-      const range = parseRange(el, TEXT_ATTR);
+    for (const el of doc.querySelectorAll("[data-uid]")) {
+      const uid = uidOf(el);
+      const kind = nodeKinds[uid];
+      if (!uid || !kind) continue;
       const only = el.childNodes.length === 1 ? el.firstChild : null;
-      if (!range || !only || only.nodeType !== Node.TEXT_NODE) continue;
-      const text = only.nodeValue || "";
-      const run = {
-        el,
-        node: only,
-        s: range.s,
-        e: range.e,
-        text,
-        // A run whose source is exactly as long as its text maps character
-        // for character; anything else (escapes, smart quotes, a run the
-        // compiler assembled) is mapped by clamping, which still lands in
-        // the right run.
-        // Whether the run's source is exactly what it renders, measured in
-        // the bytes the source is counted in.
-        exact: range.e - range.s === byteLen(text),
-      };
-      pending.push(run);
+      const node = only && only.nodeType === Node.TEXT_NODE ? only : null;
+      const entry = { el, uid, kind, node, text: node ? node.nodeValue || "" : "" };
+      byUid.set(uid, entry);
+      if (kind === "text" && node) runs.push(entry);
+      else if (ATOM_KINDS.includes(kind)) atoms.push(entry);
+      else if (BLOCK_KINDS.includes(kind)) blocks.push(entry);
     }
-
-    // A document is written in order, and what it renders comes out in that
-    // order — unless a helper made it. Text a helper produced carries the
-    // helper's own position, which is somewhere else entirely and, worse, the
-    // *same* somewhere for every call: every `#defn(..)` title reports the one
-    // position inside `env`. Taken at face value, one title would be every
-    // title, and a word annotation would be written into the helper.
-    //
-    // So a position is believed only while it moves forward with the document.
-    // A run that jumps backwards is not this part of the file; it keeps its
-    // text but loses its offsets, and is annotated as a whole thing anchored
-    // between the runs that still make sense — which is to say, at the call.
-    // The mark moves with where each run *starts*, not where it ends: ranges
-    // overlap and enclose one another quite legitimately — a heading's
-    // numbering reports the range of the whole heading — and taking the end
-    // would leave the heading's own text looking like a step backwards.
-    let watermark = -Infinity;
-    for (const item of pending) {
-      if (item.scope) continue;
-      if (item.s >= watermark) {
-        item.trusted = true;
-        watermark = item.s;
-      }
-    }
-    for (const item of pending) {
-      if (item.scope || item.trusted) continue;
-      item.scope = "inline";
-      item.own = { s: item.s, e: item.e };
-      item.told = null;
-    }
-    for (const item of pending) {
-      if (!item.scope) runs.push(item);
-    }
-
-    // Each atom's anchor, from the runs on either side of it that the document
-    // still vouches for.
-    for (let i = 0; i < pending.length; i += 1) {
-      const atom = pending[i];
-      if (!atom.scope) continue;
-      let prev = null;
-      let next = null;
-      for (let j = i - 1; j >= 0; j -= 1) {
-        if (pending[j].trusted) {
-          prev = pending[j];
-          break;
-        }
-      }
-      for (let j = i + 1; j < pending.length; j += 1) {
-        if (pending[j].trusted) {
-          next = pending[j];
-          break;
-        }
-      }
-      const where = atomAnchor(atom.own, atom.told, prev, next);
-      if (where) atoms.push({ el: atom.el, scope: atom.scope, ...where });
-    }
-    for (const el of doc.querySelectorAll(Object.keys(BLOCK_TAGS).join(","))) {
-      blocks.push({ el, kind: BLOCK_TAGS[el.tagName], own: parseRange(el, SRC_ATTR) });
-    }
-    runs.sort((a, b) => a.s - b.s || a.e - b.e);
-    // What a region covers is what its text covers. Its own range, where it
-    // has one, says only where it began — a label written into a paragraph
-    // ends the paragraph's span there — and a region built by a helper has no
-    // range of its own at all.
-    blocks = blocks
-      .map((block) => {
-        const inside = runs.filter((run) => block.el.contains(run.node));
-        if (!inside.length) return null;
-        const body = dominantCluster(inside);
-        const own = block.own;
-        return {
-          ...block,
-          // Where a new annotation on this region anchors. A region that knows
-          // its own start is anchored there, marker and all — the server moves
-          // the label past a bullet or a heading's "=" itself.
-          anchor: own ? own.s : body.lo,
-          lo: Math.min(own ? own.s : body.lo, body.lo),
-          hi: Math.max(own ? own.e : body.hi, body.hi),
-        };
-      })
-      .filter(Boolean);
-    blocks.sort((a, b) => a.lo - b.lo || b.hi - a.hi);
-    // Regions nest, and so do their marks: a paragraph's strip sits closest to
-    // its own text, and every region that contains it stands one step further
-    // out. Without that, a definition box and the paragraph inside it put their
-    // strips within a few pixels of each other and the outer one can never be
-    // pointed at.
-    const bySize = blocks.slice().sort((a, b) => a.hi - a.lo - (b.hi - b.lo));
-    for (const block of bySize) {
-      // Whether anything else encloses it. Only the outermost mark may reach
-      // out into the margin; one that reaches from inside another covers its
-      // container's frame and takes the clicks meant for it.
+    // A block whose whole content is another block adds nothing to annotate:
+    // the exporter wraps headings and figures in spacing divs, and offering
+    // both means two frames around the same thing, one of them the width of
+    // the column.
+    blocks = blocks.filter((block) => {
+      const kids = [...block.el.children];
+      if (kids.length !== 1 || block.el.childNodes.length !== 1) return true;
+      const inner = byUid.get(uidOf(kids[0]));
+      return !(inner && BLOCK_KINDS.includes(inner.kind));
+    });
+    // Whether another region contains it, which decides how far into the margin
+    // its mark may reach: a paragraph on its own has the margin to itself, one
+    // inside a callout does not. Judged against the regions that are actually
+    // offered, so that a wrapper the exporter left behind does not count.
+    for (const block of blocks) {
       block.enclosed = blocks.some(
         (other) => other !== block && other.el.contains(block.el),
       );
-      block.depth = 0;
-      for (const inner of bySize) {
-        if (inner === block || inner.depth === undefined) continue;
-        if (block.el.contains(inner.el)) {
-          block.depth = Math.max(block.depth, inner.depth + 1);
-        }
-      }
+    }
+    // A drawing carries its id on the `<svg>` itself, which Typst writes as an
+    // `id` rather than as an attribute of ours.
+    for (const el of doc.querySelectorAll("svg[id]")) {
+      const uid = el.getAttribute("id");
+      if (!uid || byUid.has(uid) || nodeKinds[uid] !== "svg") continue;
+      const entry = { el, uid, kind: "svg", node: null, text: "" };
+      byUid.set(uid, entry);
+      blocks.push(entry);
     }
   };
 
-  // Content a helper produced carries the source position of the helper, not
-  // of the call: a definition box holds its title from wherever `env` was
-  // written and its body from where it was used. Those are two passages in one
-  // element, and the annotation belongs to the larger — the body.
-  const dominantCluster = (rs) => {
-    const sorted = rs.slice().sort((a, b) => a.s - b.s);
-    const groups = [];
-    for (const run of sorted) {
-      const last = groups[groups.length - 1];
-      if (last && run.s - last.hi <= CLUSTER_GAP) {
-        last.hi = Math.max(last.hi, run.e);
-        last.weight += run.e - run.s;
-      } else {
-        groups.push({ lo: run.s, hi: run.e, weight: run.e - run.s });
-      }
-    }
-    return groups.sort((a, b) => b.weight - a.weight)[0];
-  };
+  // ------------------------------------------------------- ranges and boxes
 
-  // Source offsets are byte offsets — that is what Typst counts in, and what
-  // the sidecar's anchors mean — while a JavaScript string is indexed in
-  // UTF-16 units. The two agree only while a run is pure ASCII, and a document
-  // of mathematics is anything but: without converting, a word's underline
-  // lands a few characters further along with every symbol earlier in the run.
-  const encoder = new TextEncoder();
-  const byteLen = (text) => encoder.encode(text).length;
-  // The byte offsets of every index in a run, worked out once.
-  const prefixOf = (run) => {
-    if (!run.prefix) {
-      const prefix = new Array(run.text.length + 1);
-      let at = 0;
-      prefix[0] = 0;
-      for (let i = 0; i < run.text.length; i += 1) {
-        at += byteLen(run.text[i]);
-        prefix[i + 1] = at;
-      }
-      run.prefix = prefix;
-    }
-    return run.prefix;
-  };
-  // An index in the run's text, as a source offset.
-  const byteAt = (run, index) =>
-    run.s + prefixOf(run)[Math.max(0, Math.min(index, run.text.length))];
-
-  // The run an offset falls in: the innermost, shortest run that covers it.
-  const runAt = (offset) => {
-    let best = null;
-    for (const run of runs) {
-      if (offset < run.s || offset > run.e) continue;
-      if (!best || run.e - run.s < best.e - best.s) best = run;
-    }
-    return best;
-  };
-  // A source offset, as an index in the run's text. A run whose source is not
-  // what it renders — an escape, a smart quote, a ligature — cannot be mapped
-  // through, so it is taken whole.
-  const charIn = (run, offset) => {
-    if (!run.exact) return run.text.length;
-    const want = offset - run.s;
-    const prefix = prefixOf(run);
-    if (want <= 0) return 0;
-    if (want >= prefix[run.text.length]) return run.text.length;
-    let lo = 0;
-    let hi = run.text.length;
-    while (lo < hi) {
-      const mid = (lo + hi) >> 1;
-      if (prefix[mid] < want) lo = mid + 1;
-      else hi = mid;
-    }
-    return lo;
-  };
-
-  // A DOM position for a source offset, and a DOM range for a source range.
-  const pointAt = (offset) => {
-    const run = runAt(offset);
-    if (run) return { node: run.node, index: charIn(run, offset), run };
-    // Not every offset lands in a run: an equation, a link and anything a
-    // helper produced have no words to land in. The nearest edge of the
-    // nearest run is where that offset is, as far as the document is
-    // concerned.
-    let before = null;
-    let after = null;
-    for (const other of runs) {
-      if (other.e <= offset && (!before || other.e > before.e)) before = other;
-      if (other.s >= offset && (!after || other.s < after.s)) after = other;
-    }
-    if (before && (!after || offset - before.e <= after.s - offset)) {
-      return { node: before.node, index: before.text.length, run: before };
-    }
-    return after ? { node: after.node, index: 0, run: after } : null;
-  };
-  // A range between two places in the document, in the document's own terms.
-  // Where both ends are known as DOM positions this is exact; going through
-  // source offsets is not, because a run whose text is not the same length as
-  // its source maps every offset to its end, and two such runs can produce a
-  // range that reaches halfway across the paragraph.
   const domRange = (a, b) => {
+    if (!a || !b) return null;
     const range = document.createRange();
     try {
       range.setStart(a.node, Math.min(a.at, (a.node.nodeValue || "").length));
@@ -494,48 +290,18 @@
     } catch (err) {
       return null;
     }
-    if (range.collapsed && (a.node !== b.node || a.at !== b.at)) {
-      try {
-        range.setStart(b.node, Math.min(b.at, (b.node.nodeValue || "").length));
-        range.setEnd(a.node, Math.min(a.at, (a.node.nodeValue || "").length));
-      } catch (err) {
-        return null;
-      }
-    }
     return range;
   };
-  const runRange = (word) =>
-    domRange({ node: word.run.node, at: word.start }, { node: word.run.node, at: word.end });
 
-  const rangeFor = (from, to) => {
-    const a = pointAt(from);
-    const b = pointAt(to);
-    if (!a || !b) return null;
-    const range = document.createRange();
-    try {
-      range.setStart(a.node, a.index);
-      range.setEnd(b.node, b.index);
-    } catch (err) {
-      return null;
-    }
-    return range.collapsed && from !== to ? null : range;
-  };
   // The boxes a range covers, as lines rather than as fragments. A range that
-  // crosses markup — an equation, a bold word, a label — comes back in pieces
-  // with slivers between them, and an underline drawn piece by piece reads as
-  // a dashed line with dots in it. One box per line says what the annotation
-  // covers.
+  // crosses markup — an equation, a bold word — comes back in pieces with
+  // slivers between them, and an underline drawn piece by piece reads as a
+  // dashed line. One box per line says what the annotation covers.
   const mergeLines = (rects) => {
     const lines = [];
-    // Sorted down the page, so a line is built from its own pieces before the
-    // next line's arrive.
     const boxes = Array.from(rects).sort((a, b) => a.top - b.top || a.left - b.left);
     for (const box of boxes) {
       if (box.width < 1 || box.height < 1) continue;
-      // Same line if they overlap vertically at all: an inline equation is
-      // taller than the words around it and sits a little lower, and drawing
-      // one underline for the words and another for the equation is two
-      // underlines for one line of text.
       const line = lines.find((l) => box.top < l.bottom - 2 && box.bottom > l.top + 2);
       if (line) {
         line.left = Math.min(line.left, box.left);
@@ -554,84 +320,136 @@
   };
   const rectsOf = (range) => (range ? mergeLines(Array.from(range.getClientRects())) : []);
 
-  // The word ending at an offset: what a word anchor names, since the label is
-  // written just past the word it belongs to.
-  // How much closing markup may sit between a word and the anchor that names
-  // it: `*`, `_`, a backtick, a bracket — two of them is `_*word*_`.
-  const CLOSING_MARKUP = 4;
-  const wordEndingAt = (offset) => {
-    const inRun = (run) => {
-      const at = charIn(run, offset);
-      let end = at;
-      while (end > 0 && /\s/.test(run.text[end - 1])) end -= 1;
-      let start = end;
-      while (start > 0 && !/\s/.test(run.text[start - 1])) start -= 1;
-      if (start === end) return null;
-      return { run, start, end, s: byteAt(run, start), e: byteAt(run, end) };
-    };
-    // A word that ends where the next run begins — one before a bold word, an
-    // equation, a link — sits in *two* runs by offset, and only the earlier of
-    // them has the word in it. Runs that end here are tried first, then the
-    // tightest.
-    const covering = runs
-      .filter((run) => offset >= run.s && offset <= run.e)
-      .sort(
-        (a, b) =>
-          (b.e === offset) - (a.e === offset) || a.e - a.s - (b.e - b.s),
-      );
-    for (const run of covering) {
-      const word = inRun(run);
-      if (word) return word;
-    }
-    // A word written as `*word*<anno.X.word>` has its anchor a couple of bytes
-    // past the run, with the closing markup in between: what Typst renders is
-    // "word", what the source says is "word*". Placing one by clicking puts the
-    // anchor inside the markup instead, where the run ends — but a person
-    // writes it after, and that is the form Typst prefers, since it labels the
-    // emphasised run rather than the text inside it.
-    const nearest = runs
-      .filter((run) => run.e < offset && offset - run.e <= CLOSING_MARKUP)
-      .sort((a, b) => b.e - a.e)[0];
-    if (nearest) {
-      const at = nearest.text.length;
-      let start = at;
-      while (start > 0 && !/\s/.test(nearest.text[start - 1])) start -= 1;
-      if (start < at) {
-        return {
-          run: nearest,
-          start,
-          end: at,
-          s: byteAt(nearest, start),
-          e: byteAt(nearest, at),
-        };
-      }
-    }
-    return null;
-  };
-  // The word around a character index, for a click.
-  const wordAround = (run, at) => {
-    const text = run.text;
-    if (!text.trim()) return null;
-    let start = Math.min(at, text.length - 1);
-    if (/\s/.test(text[start])) return null;
-    let end = start;
-    while (start > 0 && !/\s/.test(text[start - 1])) start -= 1;
-    while (end < text.length && !/\s/.test(text[end])) end += 1;
-    return { run, start, end, s: byteAt(run, start), e: byteAt(run, end) };
+  // ------------------------------------------------------------- locations
+  // The two conversions between what the page can see and what an annotation
+  // says: a location becomes boxes to draw, and a click becomes a location to
+  // send.
+
+  const runOf = (uid) => {
+    const entry = byUid.get(uid);
+    return entry && entry.node ? entry : null;
   };
 
-  // Where the pointer is, in document terms. Browsers disagree on the name of
-  // this, and on nothing else about it.
+  const charRects = (uid, from, to) => {
+    const run = runOf(uid);
+    if (!run) return [];
+    return rectsOf(domRange({ node: run.node, at: from }, { node: run.node, at: to }));
+  };
+
+  // Where a caret sits: the gap between two characters, as a box.
+  const caretBox = (uid, pos) => {
+    const run = runOf(uid);
+    if (!run) return null;
+    const text = run.text;
+    const at = Math.max(0, Math.min(pos, text.length));
+    // A zero-width range has no box in some browsers, so a character beside it
+    // is measured and its edge taken.
+    const before = at > 0 ? domRange({ node: run.node, at: at - 1 }, { node: run.node, at }) : null;
+    const after =
+      at < text.length ? domRange({ node: run.node, at }, { node: run.node, at: at + 1 }) : null;
+    const box = (range) => {
+      const rects = range ? Array.from(range.getClientRects()) : [];
+      return rects.length ? rects[rects.length - 1] : null;
+    };
+    const edge = (rect, at) => ({
+      left: at,
+      right: at + 1,
+      top: rect.top,
+      bottom: rect.bottom,
+      width: 1,
+      height: rect.height,
+    });
+    const left = box(before);
+    const right = box(after);
+    if (left) return edge(left, left.right);
+    if (right) return edge(right, right.left);
+    return null;
+  };
+
+  // A stretch from one position to another, which may cross runs.
+  const spanRects = (from, to) => {
+    const a = runOf(from.ref);
+    const b = runOf(to.ref);
+    if (!a || !b) return [];
+    const range = domRange({ node: a.node, at: from.pos }, { node: b.node, at: to.pos });
+    if (!range) return [];
+    if (range.collapsed) return [];
+    return rectsOf(range);
+  };
+
+  // The sentence containing a position: from the end of the previous sentence
+  // to the end of this one. A sentence ends at `.`, `!` or `?` followed by a
+  // space, which is wrong for "Dr. Who" and right the rest of the time.
+  const SENTENCE_END = /[.!?]["'\u201d\u2019]?(\s|$)/g;
+  const sentenceAround = (text, at) => {
+    let beg = 0;
+    let end = text.length;
+    SENTENCE_END.lastIndex = 0;
+    let match;
+    while ((match = SENTENCE_END.exec(text))) {
+      const stop = match.index + match[0].length;
+      if (stop <= at) {
+        beg = stop;
+        continue;
+      }
+      end = stop;
+      break;
+    }
+    while (beg < text.length && /\s/.test(text[beg])) beg += 1;
+    return end > beg ? { beg, end: Math.min(end, text.length) } : null;
+  };
+
+  // The line a position is on, as the browser laid it out: the characters
+  // whose boxes share its top edge.
+  const lineAround = (run, at) => {
+    const text = run.text;
+    const box = (index) => {
+      const range = domRange({ node: run.node, at: index }, { node: run.node, at: index + 1 });
+      const rects = range ? Array.from(range.getClientRects()) : [];
+      return rects.length ? rects[0] : null;
+    };
+    const here = box(Math.max(0, Math.min(at, text.length - 1)));
+    if (!here) return null;
+    const sameLine = (index) => {
+      const other = box(index);
+      return other && Math.abs(other.top - here.top) < 2;
+    };
+    let beg = Math.max(0, Math.min(at, text.length - 1));
+    let end = beg;
+    while (beg > 0 && sameLine(beg - 1)) beg -= 1;
+    while (end < text.length - 1 && sameLine(end)) end += 1;
+    return { beg, end: end + 1 };
+  };
+
+  const elementOf = (ref) => {
+    const entry = byUid.get(ref && ref.ref);
+    return entry ? entry.el : null;
+  };
+
+  // ---------------------------------------------------------- hit testing
+
+  // Where the pointer is, in the document's terms. Browsers disagree on the
+  // name of this and on nothing else about it.
+  // What is under the pointer in the document, looking past the marks drawn
+  // over it: an annotation's own hit area covers the text it is on, and the
+  // ground inside a framed region belongs to what is in it.
+  const documentAt = (x, y) => {
+    const doc = document.getElementById(DOC_ID);
+    if (!doc) return null;
+    const stack = document.elementsFromPoint
+      ? document.elementsFromPoint(x, y)
+      : [document.elementFromPoint(x, y)];
+    return stack.find((el) => el && doc.contains(el)) || null;
+  };
+
   const caretAt = (x, y) => {
-    // `caretRangeFromPoint` answers with the *nearest* position, which in the
-    // page's margin is the nearest word — and a preview would appear for text
-    // the pointer is nowhere near. What is actually under the pointer settles
-    // it: the column itself, or anything outside the document, is not text.
-    const under = document.elementFromPoint(x, y);
+    // `caretRangeFromPoint` answers with the nearest position, which in the
+    // margin is the nearest word, so a preview would appear for text the
+    // pointer is nowhere near. What is under the pointer settles it.
+    const under = documentAt(x, y);
     const doc = document.getElementById(DOC_ID);
     if (!under || !doc || under === doc || !doc.contains(under)) return null;
-    // An equation or a link is annotated whole; its innards are not words.
-    if (under.closest(ATOM_SELECTOR)) return null;
+    if (atomElementAt(x, y)) return null;
     let node = null;
     let offset = 0;
     if (document.caretRangeFromPoint) {
@@ -648,10 +466,9 @@
       }
     }
     if (!node || node.nodeType !== Node.TEXT_NODE) return null;
-    // Nearest is still not under: a point in a callout's padding, or in the
-    // space after the last word of a line, resolves to a character somewhere
-    // else entirely. The character's own box has to be near the pointer, with
-    // enough slack sideways that the gaps between words still count.
+    // Nearest is still not under: a point in a callout's padding resolves to a
+    // character somewhere else. The character's own box has to be near the
+    // pointer, with slack sideways so the gaps between words still count.
     const probe = document.createRange();
     probe.setStart(node, Math.max(0, offset - 1));
     probe.setEnd(node, Math.min((node.nodeValue || "").length, offset + 1));
@@ -663,173 +480,68 @@
     return run ? { run, at: offset } : null;
   };
 
-  // Some things in a document are one thing, not a run of words: an equation
-  // has no annotatable halves, and a link is a single destination however many
-  // words it wears. They are annotated whole, with the anchor written just
-  // after them in the source, and they carry a scope of their own so the
-  // annotation still says what it is about.
-  //
-  //   math   an inline equation, `$x + y$`
-  //   math.block  a block equation, `$ x + y $` standing on its own
-  //   link   a link, whatever its text
-  // `svg` is a drawing the shims laid out and embedded: one picture, with no
-  // source position of its own — where it sits is worked out from the text on
-  // either side of it, like anything else a helper produced.
-  const ATOM_SELECTOR = "math[" + SRC_ATTR + "], svg, a, code, [" + ATOM_ATTR + "]";
-  let atoms = []; // { el, scope, anchor }
-
-  const atomScope = (el) => {
-    if (el.localName === "math") {
-      // `localName`, not `tagName`: MathML is not HTML, and its tag names come
-      // back in the case they were written in rather than upper-cased.
-      return el.getAttribute("display") === "block" ? "math.block" : "math";
-    }
-    if (el.localName === "svg") return "svg";
-    if (el.localName === "a") return "link";
-    if (el.localName === "code") return "raw";
-    // Text a call produced: the call is the thing, and the server has said
-    // where it ends.
-    return "inline";
+  // The word around a character position.
+  const wordAround = (run, at) => {
+    const text = run.text;
+    if (!text.trim()) return null;
+    let start = Math.min(at, text.length - 1);
+    if (/\s/.test(text[start])) return null;
+    let end = start;
+    while (start > 0 && !/\s/.test(text[start - 1])) start -= 1;
+    while (end < text.length && !/\s/.test(text[end])) end += 1;
+    return { run, start, end, text: text.slice(start, end) };
   };
 
-  // Where an atom's anchor goes: immediately after it in the source.
-  //
-  // An element's own range is the first choice, but it cannot be trusted on
-  // its own — an element a helper produced carries the helper's position, and
-  // `#code(vertex_weight)` reports a range in the middle of a `#let` fifty
-  // lines up. The runs on either side say where the atom really sits, and an
-  // own range that does not lie between them is not this atom's position at
-  // all; then the anchor goes where the text after the atom begins, which in
-  // the source is exactly past it.
-  //
-  // The result is a stretch of source rather than a point: an annotation's
-  // label is written *into* that stretch, between the atom and the text after
-  // it, so the anchor recorded in the document sits at the head of it while a
-  // freshly measured "start of the next run" sits after it.
-  const atomAnchor = (own, told, prev, next) => {
-    const between = (at) =>
-      at !== null && (!prev || at >= prev.e - 2) && (!next || at <= next.s + 2);
-    // What the server worked out, when it belongs to this part of the file.
-    if (between(told)) return { anchor: told, lo: told, hi: told };
-    if (own && between(own.s) && between(own.e)) {
-      return { anchor: own.e, lo: own.e, hi: next ? Math.max(own.e, next.s) : own.e };
-    }
-    const lo = prev ? prev.e : next ? next.s : null;
-    if (lo === null) return null;
-    const hi = next ? next.s : lo;
-    return { anchor: hi, lo, hi: Math.max(lo, hi) };
-  };
-
-  const atomAt = (x, y) => {
-    const under = document.elementFromPoint(x, y);
-    let el = under && under.closest && under.closest(ATOM_SELECTOR);
-    // Atoms nest — a styled run inside a `code` inside a link — and only the
-    // outermost is registered, since that is the thing being annotated. The
-    // pointer lands on the innermost, so walk out until something is known.
+  // The element under the pointer that is annotated whole, if there is one.
+  const atomElementAt = (x, y) => {
+    let el = documentAt(x, y);
     while (el) {
-      const atom = atoms.find((known) => known.el === el);
-      // One that is already annotated is not offered again: the ground around
-      // an equation belongs to the mark already on it, and a click there opens
-      // that annotation rather than starting a second one over it.
-      if (atom) return takenBlocks.has(atom.el) ? null : atom;
-      el = el.parentElement && el.parentElement.closest(ATOM_SELECTOR);
+      const entry = byUid.get(uidOf(el));
+      if (entry && ATOM_KINDS.includes(entry.kind)) return entry;
+      if (entry && (entry.kind === "svg" || entry.kind === "math.block")) return entry;
+      el = el.parentElement;
     }
     return null;
   };
 
-  // The atom an annotation is on: the one whose anchor is where the label was
-  // written.
-  const atomEndingAt = (offset, scope) =>
-    atoms.find(
-      (atom) => atom.scope === scope && offset >= atom.lo && offset <= atom.hi,
-    ) || null;
-  // A call can render as several runs — `#src("src/proof.rs")` arrives as two —
-  // and they are one annotation between them, so they are marked as one.
-  const atomGroup = (atom) =>
-    atom ? atoms.filter((a) => a.scope === atom.scope && a.anchor === atom.anchor) : [];
-  const atomBoxes = (atom) =>
-    mergeLines(atomGroup(atom).flatMap((a) => Array.from(producedBy(a.el).flatMap(
-      (el) => Array.from(el.getClientRects()),
-    ))));
-
-  // What a call produced, given the element the server stamped.
-  //
-  // An equation, a link or a code fragment *is* an element, and the stamp is on
-  // it. Text a helper made is not: it arrives as ordinary runs, and the stamp
-  // goes on the first run after them — "what came before this was made rather
-  // than written". So the mark for one covers the runs behind the stamp, back
-  // to the last thing whose source position was believed.
-  const producedBy = (el) => {
-    // An element that is the content — an equation, a link, a code fragment —
-    // is measured as itself. A stamp on a plain run is a marker, not content.
-    const marker =
-      el.hasAttribute(ATOM_ATTR) &&
-      !el.hasAttribute(SRC_ATTR) &&
-      !["math", "svg", "a", "code"].includes(el.localName);
-    if (!marker) return [el];
-    const made = [];
-    let cursor = el.previousElementSibling;
-    while (cursor && !cursor.hasAttribute(TEXT_ATTR) && !cursor.hasAttribute(ATOM_ATTR)) {
-      made.unshift(cursor);
-      cursor = cursor.previousElementSibling;
-    }
-    return made.length ? made : [el];
+  const atomAt = (x, y) => {
+    const entry = atomElementAt(x, y);
+    if (!entry) return null;
+    // One that already carries an annotation is not offered again: the ground
+    // around it belongs to the mark already there.
+    const taken = takenBlocks.get(entry.el);
+    return taken && taken.size ? null : entry;
   };
 
-  // The boxes of whole elements inside a source range, for an annotation that
-  // covers something with no text of its own to measure — an equation, a
-  // figure, an image.
-  const elementBoxesIn = (from, to) => {
-    const doc = document.getElementById(DOC_ID);
-    if (!doc) return [];
-    const boxes = [];
-    // Equations only: they are the elements that hold no text of their own and
-    // whose range can be believed. Any element would let a paragraph whose own
-    // range is a helper's stand in for the annotation.
-    for (const el of doc.querySelectorAll("math[" + SRC_ATTR + "]")) {
-      const range = parseRange(el, SRC_ATTR);
-      if (!range || range.s < from || range.e > to) continue;
-      boxes.push(...el.getClientRects());
-    }
-    return mergeLines(boxes);
-  };
+  // How much text is kept either side of a position, to recognise the place
+  // again if the document has moved on by the time it is submitted.
+  const CONTEXT = 8;
 
-  // The innermost block that covers an offset — an item beats the paragraph it
-  // sits in, a heading beats the section around it.
-  //
-  // A region's anchor sits at the head of the region, which in the source is
-  // just before its first word: the bracket, the newline and the indent that
-  // open a content block are all in between. So an offset a little short of a
-  // region still belongs to it, but only if nothing contains it outright.
-  const HEAD_SLACK = 48;
-  // And a little the other way, for an anchor written just past the end of a
-  // region rather than at its head. A heading takes its anchor at the end of
-  // the line — a label before the text would stop it being a heading — so an
-  // anchor a space or two beyond one belongs to it, not to whatever comes next.
-  // Typst's own labels attach to what precedes them, and so does this.
-  const TAIL_SLACK = 8;
-  const blockCovering = (offset, kind) => {
-    const smallest = (before, after, wanted) => {
-      let best = null;
-      for (const b of blocks) {
-        if (wanted && b.kind !== wanted) continue;
-        if (offset < b.lo - before || offset > b.hi + after) continue;
-        if (!best || b.hi - b.lo < best.hi - best.lo) best = b;
-      }
-      return best;
-    };
-    // An annotation says what kind of region it is on, and regions nest: a
-    // definition box holds paragraphs, and the innermost thing covering the
-    // anchor is not necessarily the thing that was annotated. Failing an
-    // outright container, what the anchor is just past beats what it is just
-    // short of.
-    const nearest = (wanted) =>
-      smallest(0, 0, wanted) ||
-      smallest(0, TAIL_SLACK, wanted) ||
-      smallest(HEAD_SLACK, 0, wanted);
-    return (kind && nearest(kind)) || nearest(null);
-  };
+  // ---------------------------------------------------- building locations
 
+  const wordLocation = (kind, word) => ({
+    type: kind,
+    ref: {
+      type: "word",
+      ref: word.run.uid,
+      beg: word.start,
+      end: word.end,
+      w: word.text,
+    },
+  });
+
+  const cursorRef = (run, pos) => ({
+    type: "text_cursor",
+    ref: run.uid,
+    pos,
+    l: run.text.slice(Math.max(0, pos - CONTEXT), pos),
+    r: run.text.slice(pos, pos + CONTEXT),
+  });
+
+  const nodeLocation = (kind, entry) => ({
+    type: kind,
+    ref: { type: "node", ref: entry.uid },
+  });
   // ------------------------------------------------------------- the marks
   const marksHost = () => {
     let host = document.getElementById(MARKS_ID);
@@ -916,69 +628,96 @@
     return { top, bottom, left, right, width: right - left, height: bottom - top };
   };
 
+  // What to draw for a location, and where.
+  //
+  // The shape a mark takes is a property of the location's kind: text is
+  // underlined, a position is a caret, a region is framed. The boxes come from
+  // the elements the location names.
   const geometryOf = (pin) => {
-    const scope = pin.scope || "point";
-    if (scope === "span") {
-      const range = rangeFor(pin.start, pin.end);
-      const boxes = rectsOf(range);
-      // A span over an equation has no runs to measure; the equation's own box
-      // is the mark.
-      return { scope, boxes: boxes.length ? boxes : elementBoxesIn(pin.start, pin.end) };
+    const loc = pin && pin.location;
+    if (!loc) return null;
+    const kind = loc.type;
+    switch (kind) {
+      case "word": {
+        const ref = loc.ref;
+        const boxes = charRects(ref.ref, ref.beg, ref.end);
+        return boxes.length ? { scope: kind, boxes } : null;
+      }
+      case "line":
+      case "sentence": {
+        // The sidecar names a word; what is drawn is the sentence or line it
+        // is in, which only the rendering knows the extent of.
+        const ref = loc.ref;
+        const run = runOf(ref.ref);
+        if (!run) return null;
+        const range = kind === "sentence" ? sentenceAround(run.text, ref.end) : lineAround(run, ref.end);
+        if (!range) return null;
+        const boxes = charRects(ref.ref, range.beg, range.end);
+        return boxes.length ? { scope: kind, boxes } : null;
+      }
+      case "span.h": {
+        const boxes = spanRects(loc.begin, loc.end);
+        return boxes.length ? { scope: kind, boxes } : null;
+      }
+      case "pos.h": {
+        const box = caretBox(loc.ref.ref, loc.ref.pos);
+        return box ? { scope: "point", boxes: [box], caret: box } : null;
+      }
+      case "pos.v":
+      case "span.v": {
+        const el = elementOf(kind === "pos.v" ? loc.ref : loc.begin);
+        if (!el) return null;
+        const box = el.getBoundingClientRect();
+        const side = (kind === "pos.v" ? loc.ref.side : loc.begin.side) === "top";
+        const at = side ? box.top : box.bottom;
+        const edge = {
+          left: box.left,
+          right: box.right,
+          top: at,
+          bottom: at + 1,
+          width: box.width,
+          height: 1,
+        };
+        return { scope: "point", boxes: [edge], caret: edge };
+      }
+      case "math":
+      case "link":
+      case "raw":
+      case "opaque": {
+        const el = elementOf(loc.ref);
+        if (!el) return null;
+        return { scope: kind, boxes: mergeLines(Array.from(el.getClientRects())), el };
+      }
+      case "svg": {
+        // A drawing is a picture, marked as one: a frame around all of it.
+        const el = elementOf(loc.ref);
+        if (!el) return null;
+        const enclosed = !!(el.parentElement && el.parentElement.closest(BLOCK_SELECTOR));
+        return {
+          scope: kind,
+          boxes: [el.getBoundingClientRect()],
+          block: { el, depth: 0 },
+          enclosed,
+        };
+      }
+      case "math.block": {
+        // The element spans the whole column while the equation is centred in
+        // it, so the mark hangs off the equation's own ink.
+        const el = elementOf(loc.ref);
+        if (!el) return null;
+        const enclosed = !!(el.parentElement && el.parentElement.closest(BLOCK_SELECTOR));
+        return { scope: kind, boxes: inkOf(el), block: { el, depth: 0 }, enclosed };
+      }
+      default: {
+        // A region: the ink of the element, since its border box is the width
+        // of the column whatever is in it.
+        const el = elementOf(loc.ref);
+        if (!el) return null;
+        const entry = byUid.get(loc.ref.ref);
+        const scope = entry ? blockKind(el, kind) : kind;
+        return { scope, boxes: inkOf(el), block: { el, depth: 0 } };
+      }
     }
-    if (scope === "math" || scope === "link" || scope === "raw" || scope === "inline") {
-      const atom = atomEndingAt(pin.start, scope);
-      return atom ? { scope, boxes: atomBoxes(atom), el: atom.el } : null;
-    }
-    if (scope === "svg") {
-      // A drawing is a picture, marked as one: a frame around all of it.
-      const atom = atomEndingAt(pin.start, scope);
-      if (!atom) return null;
-      const box = atom.el.getBoundingClientRect();
-      const enclosed = !!(
-        atom.el.parentElement && atom.el.parentElement.closest(BLOCK_SELECTOR)
-      );
-      return { scope, boxes: [box], block: { el: atom.el, depth: 0 }, enclosed };
-    }
-    if (scope === "math.block") {
-      // A block equation is a region of the document, marked like one — but
-      // the element spans the whole column while the equation itself is
-      // centred in it, so the mark hangs off the equation's own ink.
-      const atom = atomEndingAt(pin.start, scope);
-      if (!atom) return null;
-      const enclosed = !!(
-        atom.el.parentElement && atom.el.parentElement.closest(BLOCK_SELECTOR)
-      );
-      return { scope, boxes: inkOf(atom.el), block: { el: atom.el, depth: 0 }, enclosed };
-    }
-    if (scope === "sentence") {
-      // The server found where the sentence starts and ends; a browser has no
-      // idea where one sentence stops and the next begins.
-      const range = rangeFor(pin.start, pin.end);
-      const boxes = rectsOf(range);
-      if (boxes.length) return { scope, boxes };
-      // A sentence the runs cannot express — one made by a helper, say — is
-      // still worth marking at its head.
-      const word = wordEndingAt(pin.start);
-      return word ? { scope, boxes: rectsOf(runRange(word)) } : null;
-    }
-    if (scope === "word") {
-      const word = wordEndingAt(pin.start);
-      if (!word) return null;
-      return { scope, boxes: rectsOf(runRange(word)) };
-    }
-    if (scope === "point") {
-      const point = pointAt(pin.start);
-      if (!point) return null;
-      const box = gapBox(point.node, point.index);
-      return { scope, boxes: [box], caret: box };
-    }
-    // A region: the ink of the element the anchor landed in, of the kind the
-    // annotation was made on. Its border box is the width of the column
-    // whatever is in it, so a figure holding a centred drawing would be marked
-    // with a rectangle reaching far past the picture on both sides.
-    const block = blockCovering(pin.start, scope);
-    if (!block) return null;
-    return { scope, boxes: inkOf(block.el), block };
   };
 
   // Where an item's bullet is, and the line it is on. A list marker is drawn
@@ -1059,7 +798,8 @@
     STRIP_GAP -
     STRIP_STEP * Math.min((block && block.depth) || 0, STRIP_DEPTH_MAX);
 
-  const drawPin = (host, pin, geom, dim) => {
+  const drawPin = (host, pin, geom, state) => {
+    const dim = !!state;
     if (!geom || !geom.boxes.length) return;
     const plain = pinColor(pin);
     const key = pin.uuid;
@@ -1069,6 +809,7 @@
     const paint = (el, vertical) => {
       if (dim) {
         crawlLine(el, plain, vertical);
+        if (state === "pending") el.classList.add("tm-hurry");
       } else {
         el.style.background = plain;
         el.style.boxShadow = `0 0 0 1.5px ${darkTint(plain)}`;
@@ -1092,6 +833,7 @@
       const el = mark(host, key + ":box", "tm-box");
       if (dim) {
         crawlBox(el, plain);
+        if (state === "pending") el.classList.add("tm-hurry");
       } else {
         el.style.border = `2px solid ${plain}`;
         el.style.boxShadow = haloRing(plain);
@@ -1158,6 +900,7 @@
           el.style.borderRadius = ring.round + "px";
           if (dim) {
             crawlBox(el, plain);
+            if (state === "pending") el.classList.add("tm-hurry");
           } else {
             el.style.border = `2px solid ${plain}`;
             el.style.boxShadow = haloRing(plain);
@@ -1182,7 +925,7 @@
         }
         const el = mark(host, key + ":chip", "tm-chip");
         el.style.opacity = opacity;
-        drawBubble(el, pin, "right", dim);
+        drawBubble(el, pin, "right", dim, state === "pending");
         place(el, line.point - CHIP_GAP - el.__w, line.mid - el.__h / 2);
         if (!dim) {
           const hit = mark(host, key + ":hit", "tm-hit");
@@ -1216,11 +959,12 @@
       return;
     }
     if (scope === "point") {
-      const el = mark(host, key + ":point", "tm-glyph tm-over");
+      const el = mark(host, key + ":point", "tm-mark tm-over");
       el.style.opacity = opacity;
-      drawChevron(el, plain);
-      const caretX = boxes[0].left - el.__w / 2;
-      const caretY = boxes[0].bottom + 1;
+      drawCaret(el, plain, boxes[0], dim);
+      if (state === "pending") el.classList.add("tm-hurry");
+      const caretX = boxes[0].left - CARET_W / 2;
+      const caretY = boxes[0].top - (el.__h - boxes[0].height) / 2;
       place(el, caretX, caretY);
       // A caret says where, the letter says which: without it a point
       // annotation is the one mark on the page that cannot be told from its
@@ -1228,7 +972,7 @@
       const glyph = mark(host, key + ":letter", "tm-glyph tm-over");
       glyph.style.opacity = opacity;
       drawLetter(glyph, pin);
-      place(glyph, caretX + el.__w + 1, caretY - 1);
+      place(glyph, caretX + CARET_W + 2, boxes[0].bottom + 1);
       if (!dim) {
         // Down over the caret and its letter, not merely over the line above
         // them: what the eye takes for the annotation is what the pointer has
@@ -1294,7 +1038,7 @@
 
   // The pointer chip: a rounded body with an apex, drawn in the direction it
   // points. Same shape as the paged mode's, so the two modes read alike.
-  const drawBubble = (el, pin, dir, hollow) => {
+  const drawBubble = (el, pin, dir, hollow, hurry) => {
     const letter = (pin.letter || "").toUpperCase();
     const selected = pin.uuid === openUuid;
     const w = Math.max(15, 5 + 6 * Math.max(letter.length, 1));
@@ -1341,7 +1085,7 @@
     }
     el.__w = svgW;
     el.__h = svgH;
-    const sig = ["bubble", letter, color, border, fill, dir, hollow].join("|");
+    const sig = ["bubble", letter, color, border, fill, dir, hollow, hurry].join("|");
     if (el.dataset.sig === sig) return;
     el.dataset.sig = sig;
     // A chip for an annotation that has not been made yet is an outline, and
@@ -1349,7 +1093,9 @@
     // as a dashed stroke because a path cannot carry a gradient.
     const shape = hollow
       ? `<path d="${path}" fill="none" stroke="${color}" stroke-width="2"` +
-        ` stroke-dasharray="2 3" stroke-linejoin="round" class="tm-crawl-stroke"></path>`
+        ` stroke-dasharray="2 3" stroke-linejoin="round" class="tm-crawl-stroke${
+          hurry ? " tm-hurry" : ""
+        }"></path>`
       : `<path d="${path}" fill="${color}" stroke="${border}" stroke-width="2"` +
         ` stroke-linejoin="round"></path>`;
     el.innerHTML =
@@ -1361,18 +1107,27 @@
       `</svg>`;
   };
 
-  const drawChevron = (el, color) => {
-    const w = 12;
-    const h = 7;
-    el.__w = w;
+  // A position between words is a caret: a line standing in the gap, as tall
+  // as a couple of lines of text so that it reads as a place rather than as a
+  // mark on a word. One that has not been made yet travels, like every other
+  // provisional mark.
+  const CARET_W = 2;
+  const caretHeight = (box) => Math.max(Math.round((box.height || 16) * 1.8), 20);
+  const drawCaret = (el, color, box, crawling) => {
+    const h = caretHeight(box);
+    el.__w = CARET_W;
     el.__h = h;
-    if (el.dataset.sig === "chevron|" + color) return;
-    el.dataset.sig = "chevron|" + color;
-    el.innerHTML =
-      `<svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}">` +
-      `<path d="M 1 ${h - 1} L ${w / 2} 1 L ${w - 1} ${h - 1}" fill="none"` +
-      ` stroke="${color}" stroke-width="2" stroke-linecap="round"` +
-      ` stroke-linejoin="round"></path></svg>`;
+    el.innerHTML = "";
+    el.style.width = CARET_W + "px";
+    el.style.height = h + "px";
+    el.style.borderRadius = "1px";
+    el.classList.remove("tm-crawl-v");
+    if (crawling) {
+      crawlLine(el, color, true);
+    } else {
+      el.style.background = color;
+      el.style.boxShadow = `0 0 0 1.5px ${darkTint(color)}`;
+    }
   };
 
   // Every annotation keeps a chip on a conveyor around the edge of the
@@ -1398,15 +1153,19 @@
   };
 
   const drawEdgeChips = (host, placements) => {
-    for (const [pin, x, y, state] of placements) {
+    for (const [pin, x, y, state, fade] of placements) {
       const el = mark(host, pin.uuid + ":edge", "tm-edge");
       const fresh = el.dataset.state === undefined;
       el.textContent = (pin.letter || "?").toUpperCase();
       el.title = (pin.author ? pin.author + ": " : "") + (pin.content || "");
       const selected = pin.uuid === openUuid;
-      el.style.background = pinColor(pin);
-      el.style.color = darkTint(pinColor(pin));
-      el.style.opacity = pinOpacity(pin);
+      // An annotation the server does not have yet is drawn hollow, as its
+      // mark is: the outline says the same thing the travelling dots do.
+      const hollow = !!pin.state;
+      el.style.background = hollow ? "var(--tm-bg)" : pinColor(pin);
+      el.style.color = hollow ? pinColor(pin) : darkTint(pinColor(pin));
+      el.style.border = hollow ? `1.5px solid ${pinColor(pin)}` : "";
+      el.style.opacity = pinOpacity(pin) * (fade === undefined ? 1 : fade);
       el.style.boxShadow = selected
         ? `0 0 6px 2px ${ownColor(pin)}, 0 0 12px 3px ${ownColor(pin)}66`
         : "";
@@ -1448,15 +1207,26 @@
     // Nearest to the viewport at the corner, farther ones extending leftward.
     above.sort((a, b) => b.y - a.y);
     below.sort((a, b) => a.y - b.y);
+    // A row of chips for what is off screen is a reminder, not a list: the few
+    // nearest the corner are what the reader is about to reach, and the rest
+    // fade out rather than filling the margin.
+    const ROW_SOLID = 6;
+    const ROW_LIMIT = 9;
+    const fade = (idx) =>
+      idx < ROW_SOLID ? 1 : 1 - (idx - ROW_SOLID + 1) / (ROW_LIMIT - ROW_SOLID + 1);
     const placements = above
-      .map(({ pin }, idx) => [pin, lane - SLOT * idx, 10, "top"])
+      .slice(0, ROW_LIMIT)
+      .map(({ pin }, idx) => [pin, lane - SLOT * idx, 10, "top", fade(idx)])
       .concat(
-        below.map(({ pin }, idx) => [
-          pin,
-          lane - SLOT * idx,
-          window.innerHeight - 30,
-          "bottom",
-        ]),
+        below
+          .slice(0, ROW_LIMIT)
+          .map(({ pin }, idx) => [
+            pin,
+            lane - SLOT * idx,
+            window.innerHeight - 30,
+            "bottom",
+            fade(idx),
+          ]),
       );
     // Chips in the lane track their text, and two annotations a line apart
     // would otherwise sit on top of each other. They are stacked instead: each
@@ -1469,7 +1239,7 @@
     for (const { pin, y } of inLane) {
       const top = Math.max(y - 10, free);
       free = top + CHIP_H + 2;
-      placements.push([pin, lane, top, "lane"]);
+      placements.push([pin, lane, top, "lane", 1]);
     }
     return placements;
   };
@@ -1486,14 +1256,24 @@
 
   // The whole overlay, redrawn from the pins and the document's current
   // geometry. Cheap enough to run on every scroll: it is a few dozen boxes.
-  let ghost = null;
+  // The annotations this page is holding on its own: one being written, and
+  // any that have been sent and not yet come back. They are drawn like the
+  // server's, and their state says how: `draft` while it is being written,
+  // `pending` while the server has it and the answer has not arrived.
+  let local = [];
+  // The id the annotation being written goes under, which is never a uuid.
+  const DRAFT_ID = "tinymist-draft";
+  const dropLocal = (id) => {
+    local = local.filter((pin) => pin.uuid !== id);
+  };
   // Which regions already carry a mark, by element and kind, so that the
   // margin that offers a new annotation stops offering one over an old.
   const takenBlocks = new Map();
   const render = () => {
     const host = marksHost();
     for (const el of host.children) el.dataset.seen = "";
-    const list = ghost ? pins.concat([ghost]) : pins;
+    const shown = showResolved ? pins : pins.filter((pin) => !pin.resolved);
+    const list = local.length ? shown.concat(local) : shown;
     const marked = [];
     takenBlocks.clear();
     for (const pin of list) {
@@ -1509,7 +1289,7 @@
       const bot = Math.max(...geom.boxes.map((b) => b.bottom));
       // The mark itself is only drawn where its text is; the chip is drawn
       // wherever the chip belongs.
-      if (bot > 0 && top < window.innerHeight) drawPin(host, pin, geom, pin === ghost);
+      if (bot > 0 && top < window.innerHeight) drawPin(host, pin, geom, pin.state);
       marked.push({ pin, y: (top + bot) / 2 });
     }
     drawEdgeChips(host, placeChips(marked));
@@ -1595,9 +1375,9 @@
   const previewPoint = (box) => {
     clearHover();
     const host = marksHost();
-    const el = hoverMark(host, "tm-glyph");
-    drawChevron(el, nextColor());
-    place(el, box.left - el.__w / 2, box.bottom + 1);
+    const el = hoverMark(host, "tm-mark");
+    drawCaret(el, nextColor(), box, true);
+    place(el, box.left - CARET_W / 2, box.top - (el.__h - box.height) / 2);
   };
 
   // The margin band that creates a region annotation: exactly the ground its
@@ -1632,10 +1412,11 @@
       // A region that already carries an annotation of this kind is not
       // offered a second one: the ground under the pointer belongs to the mark
       // that is already there, which is what a click there opens.
+      const kind = blockKind(block.el, block.kind);
       const taken = takenBlocks.get(block.el);
-      if (taken && taken.has(block.kind)) continue;
+      if (taken && taken.has(kind)) continue;
       const box = blockBox(block.el);
-      if (block.kind === "item") {
+      if (kind === "item") {
         // The marker's own ground: the ring around it, and the room its letter
         // takes to the left — and only on the item's first line, where the
         // marker is.
@@ -1655,7 +1436,10 @@
         const left = stripLeftOf(block, [box]);
         if (x < left - 12 || x > left + STRIP_W + 5) continue;
       }
-      if (!best || block.hi - block.lo < best.hi - best.lo) best = block;
+      // The innermost region under the pointer: an item beats the paragraph
+      // it sits in, a heading beats the section around it.
+      const area = box.width * box.height;
+      if (!best || area < best.area) best = { ...block, area };
     }
     return best;
   };
@@ -1684,9 +1468,26 @@
 
   const closeBox = (force) => {
     const box = document.getElementById(BOX_ID);
+    // Leaving a half-written annotation keeps it: it stays on the page as a
+    // draft, and clicking its mark takes up where it was left. An empty one is
+    // a misclick, and goes.
     if (box && composeActive && !force) {
       const ta = box.querySelector("textarea");
-      if (ta && ta.value.trim() && !confirm("Discard new comment?")) return false;
+      const text = ta ? ta.value.trim() : "";
+      const draft = local.find((pin) => pin.uuid === DRAFT_ID);
+      if (text && draft) {
+        draft.content = text;
+        box.remove();
+        if (escHandler) {
+          document.removeEventListener("keydown", escHandler, true);
+          escHandler = null;
+        }
+        composeActive = false;
+        openUuid = null;
+        openSig = null;
+        render();
+        return true;
+      }
     }
     if (box) box.remove();
     if (escHandler) {
@@ -1694,7 +1495,7 @@
       escHandler = null;
     }
     composeActive = false;
-    ghost = null;
+    dropLocal(DRAFT_ID);
     openUuid = null;
     openSig = null;
     render();
@@ -1732,11 +1533,13 @@
       "margin-left:auto;display:inline-flex;align-items:baseline;gap:5px;font-size:11px";
     const actsEl = document.createElement("span");
     actsEl.className = "ta-acts";
+    actsEl.style.color = darkTint(hue);
     acts.forEach(([label, fn], idx) => {
       if (idx > 0) {
         const sep = document.createElement("span");
         sep.textContent = "/";
-        sep.style.color = "rgba(255,255,255,0.55)";
+        sep.style.color = darkTint(hue);
+        sep.style.opacity = "0.55";
         actsEl.appendChild(sep);
       }
       const act = document.createElement("span");
@@ -1746,7 +1549,9 @@
       actsEl.appendChild(act);
     });
     const state = document.createElement("span");
-    state.style.color = "rgba(255,255,255,0.78)";
+    // The same dark tint of the annotation's own colour as its letter: white on
+    // a light hue is barely there, and every title bar carries a light hue.
+    state.style.color = darkTint(hue);
     state.textContent = stateText;
     right.append(actsEl, state);
     title.append(letterEl, right);
@@ -1830,13 +1635,47 @@
   // Claimed and resolved are separate facts: an agent can be holding something
   // it has already answered, and a reopened thread is not the same as one
   // nobody has touched. Only what is passed is changed.
+  // Flags applied here and sent, rather than waited for: setting one is a
+  // single small change that either lands or can be clicked again, and a
+  // window that does nothing until the server answers reads as broken.
+  const flagged = new Map();
   const setFlags = (pin, flags) => {
+    Object.assign(pin, flags);
+    const held = { ...(flagged.get(pin.uuid) || {}), ...flags };
+    flagged.set(pin.uuid, held);
     post("/dev/annotate/flags", { uuid: pin.uuid, ...flags });
-    showAnnot({ ...pin, ...flags }, currentDraft());
+    showAnnot(pin, currentDraft());
+    render();
+  };
+
+  // What the server sent, with any flag this page has set since. The override
+  // goes as soon as the server's own copy agrees with it.
+  const applyFlags = () => {
+    for (const pin of pins) {
+      const held = flagged.get(pin.uuid);
+      if (!held) continue;
+      if (Object.entries(held).every(([key, value]) => pin[key] === value)) {
+        flagged.delete(pin.uuid);
+        continue;
+      }
+      Object.assign(pin, held);
+    }
+  };
+
+  // A pin this page is holding rather than one the server sent: a draft goes
+  // back to being written, and one that is waiting to be sent says so.
+  const showLocal = (pin) => {
+    if (pin.state === "draft") {
+      const kind = pin.location && pin.location.type === "word" ? "comment" : pin.location.type;
+      compose(kind, pin.location, pin);
+    }
   };
 
   const showAnnot = (pin, restore) => {
-    const state = pin.resolved ? "resolved" : pin.claimed ? "claimed" : "open";
+    if (pin.state) return showLocal(pin);
+    // What it is, not what to do with it: an annotation nothing has happened to
+    // is a comment, and saying "open comment" reads as an instruction.
+    const state = pin.resolved ? "resolved " : pin.claimed ? "claimed " : "";
     const acts = [];
     if (pin.resolved) acts.push(["reopen", () => setFlags(pin, { resolved: false })]);
     else acts.push(["resolve", () => setFlags(pin, { resolved: true, claimed: false })]);
@@ -1848,7 +1687,7 @@
         closeBox(true);
       },
     ]);
-    const parts = shell(pin.letter || "?", `${state} ${pin.type || "comment"}`, acts);
+    const parts = shell(pin.letter || "?", `${state}${pin.type || "comment"}`, acts);
     if (!parts) return;
     openUuid = pin.uuid;
     openSig = pinSig(pin);
@@ -1907,16 +1746,32 @@
   // --------------------------------------------------------------- compose
   // A composed annotation is shown as a real one — same strip, same chip, same
   // letter — so the window always has a visible host to belong to.
-  const compose = (kind, payload, ghostPin) => {
-    const letter = nextLetter();
+  const compose = (kind, location, existing) => {
+    const letter = existing ? existing.letter : nextLetter();
+    const color = existing ? existing.color : nextColor();
     const submit = (field) => {
       const text = field.value.trim();
       if (text) {
-        post("/dev/annotate", { uuid: freshUuid(), text, color: nextColor(), ...payload }).then(refresh);
+        const draft = { location, render: renderId, text, color, snapshot: snapshotOf(location) };
+        dropDraft(draft);
+        // The mark stays where it was put while the server has it, so that
+        // pressing return does not make the annotation disappear and come back
+        // a moment later. It travels at twice the speed until then.
+        const held = `${DRAFT_ID}:${Date.now()}`;
+        local.push({
+          uuid: held,
+          state: "pending",
+          letter,
+          color,
+          location,
+          content: text,
+          draft,
+        });
+        send(held);
       }
       closeBox(true);
     };
-    const parts = shell(letter, `new ${kind}`, [
+    const parts = shell(letter, `draft ${kind}`, [
       ["save", () => submit(document.querySelector(`#${BOX_ID} textarea`))],
       ["cancel", () => closeBox()],
     ]);
@@ -1924,9 +1779,124 @@
     composeActive = true;
     const { wrap, ta } = replyField(letterColor(letter), "Type comment", "⏎ save", 3, true, submit);
     parts.content.append(wrap);
+    if (existing && existing.content) {
+      ta.value = existing.content;
+      ta.dispatchEvent(new Event("input"));
+    }
     ta.focus();
-    ghost = { uuid: "tinymist-ghost", letter, ...ghostPin };
+    dropLocal(DRAFT_ID);
+    local.push({
+      uuid: DRAFT_ID,
+      state: "draft",
+      letter,
+      color,
+      location,
+      content: existing ? existing.content : "",
+    });
     render();
+  };
+
+  // Sends a pending annotation, and keeps it on the page until the server has
+  // it. A send that fails leaves it pending: offline, its mark stands still
+  // with everything else, and it goes again when the connection returns.
+  const send = (held) => {
+    const pin = local.find((waiting) => waiting.uuid === held);
+    if (!pin || pin.sending) return Promise.resolve();
+    pin.sending = true;
+    render();
+    return post("/dev/annotate", pin.draft).then((res) => {
+      pin.sending = false;
+      if (res && res.ok) {
+        // Held until the server's own copy arrives, so there is no moment with
+        // nothing drawn.
+        pin.waiting = res.uuid;
+        dropDraft(pin.draft);
+        return refresh();
+      }
+      // A refusal is about this annotation and will not fix itself; no
+      // connection is about the page and will.
+      keepDraft(pin.draft, res && res.error, online);
+      if (online) dropLocal(held);
+      render();
+    });
+  };
+
+  // Everything written while the server was away, sent again now that it is
+  // back: what this page is still holding, and what a previous visit left in
+  // the browser.
+  const flush = () => {
+    for (const pin of local.filter((waiting) => waiting.state === "pending")) {
+      send(pin.uuid);
+    }
+    sendStored();
+  };
+
+  // Drafts from an earlier visit. Their locations were taken against a
+  // rendering this page no longer has, but the server keeps its last renderings
+  // and can still read them; one it cannot is reported and kept.
+  let sending = false;
+  const sendStored = () => {
+    if (sending || flying) return;
+    const held = readDrafts().filter((draft) => draft.location && draft.render);
+    if (!held.length) return;
+    sending = true;
+    const next = (rest) => {
+      if (!rest.length) {
+        sending = false;
+        return refresh();
+      }
+      const draft = rest[0];
+      return post("/dev/annotate", draft).then((res) => {
+        if (res && res.ok) dropDraft(draft);
+        else if (online) keepDraft(draft, res && res.error, true);
+        // Offline again: leave the rest for the next connection.
+        return online ? next(rest.slice(1)) : ((sending = false), undefined);
+      });
+    };
+    next(held);
+  };
+
+  // What the annotation was about, in the reader's own words: kept with the
+  // record so that an annotation whose anchor is later deleted can still say
+  // what it referred to.
+  const snapshotOf = (location) => {
+    const ref = location.ref || location.begin;
+    if (!ref) return undefined;
+    if (ref.type === "word") return ref.w;
+    if (ref.type === "text_cursor") {
+      const run = byUid.get(ref.ref);
+      return run ? run.text.slice(0, 60) : undefined;
+    }
+    const entry = byUid.get(ref.ref);
+    return entry ? (entry.el.textContent || "").trim().slice(0, 60) : undefined;
+  };
+
+  // Drafts the server has not taken. Kept in the browser so that a comment
+  // written offline, or against a document that has since changed, survives a
+  // reload and can be submitted or re-placed later.
+  const DRAFTS = "tinymist-html-drafts";
+  const readDrafts = () => {
+    try {
+      return JSON.parse(localStorage.getItem(DRAFTS) || "[]");
+    } catch (err) {
+      return [];
+    }
+  };
+  const writeDrafts = (list) => {
+    try {
+      localStorage.setItem(DRAFTS, JSON.stringify(list.slice(-32)));
+    } catch (err) {}
+  };
+  const keepDraft = (draft, error, say) => {
+    const list = readDrafts().filter((held) => held.text !== draft.text);
+    list.push({ ...draft, error: error || null, at: new Date().toISOString() });
+    writeDrafts(list);
+    // While the connection is down the page already says so; a second line
+    // about each comment would only repeat it.
+    if (say) showBanner("Not placed; kept locally: " + (error || "the server refused it"));
+  };
+  const dropDraft = (draft) => {
+    writeDrafts(readDrafts().filter((held) => held.text !== draft.text));
   };
 
   // ----------------------------------------------------------- interaction
@@ -1937,22 +1907,48 @@
     ev.target.closest &&
     ev.target.closest(`#${BOX_ID}, #${MARKS_ID}, #${STATUS_ID}`);
 
+  // Where the pointer was last, so that pressing or releasing the modifier
+  // changes what is offered without moving the mouse.
+  let pointer = null;
+
+  // The region the pointer is inside, whatever it is over: what a click offers
+  // while the modifier is held. A word is inside a paragraph, which is inside a
+  // figure — the innermost is the one meant.
+  const regionUnder = (x, y) => {
+    let el = documentAt(x, y);
+    while (el) {
+      const entry = byUid.get(uidOf(el));
+      if (entry && BLOCK_KINDS.includes(entry.kind)) {
+        const taken = takenBlocks.get(entry.el);
+        const kind = blockKind(entry.el, entry.kind);
+        if (!taken || !taken.has(kind)) return entry;
+      }
+      el = el.parentElement;
+    }
+    return null;
+  };
+
   const previewAt = (ev) => {
     if (scrolling) return;
+    pointer = { x: ev.clientX, y: ev.clientY, alt: ev.altKey };
+    if (ev.altKey) {
+      const region = regionUnder(ev.clientX, ev.clientY);
+      return region ? previewRegion(region) : clearHover();
+    }
     const region = regionZoneAt(ev.clientX, ev.clientY);
     if (region) return previewRegion(region);
     const atom = atomAt(ev.clientX, ev.clientY);
     if (atom) {
-      if (atom.scope === "math.block" || atom.scope === "svg") {
+      if (atom.kind === "math.block" || atom.kind === "svg") {
         return previewRegion({ el: atom.el, kind: "block", depth: 0 });
       }
-      return previewUnderline(atomBoxes(atom), false);
+      return previewUnderline(mergeLines(Array.from(atom.el.getClientRects())), false);
     }
     const caret = caretAt(ev.clientX, ev.clientY);
     if (!caret) return clearHover();
     const word = wordAround(caret.run, caret.at);
     if (word) {
-      previewUnderline(rectsOf(runRange(word)), false);
+      previewUnderline(charRects(word.run.uid, word.start, word.end), false);
       return;
     }
     // Between words: a click makes a point, anchored to the word on the left.
@@ -1968,7 +1964,7 @@
     let at = Math.min(caret.at, text.length);
     while (at > 0 && /\s/.test(text[at - 1])) at -= 1;
     if (at === 0) return null;
-    return { s: byteAt(caret.run, at), box: gapBox(caret.run.node, at) };
+    return { run: caret.run, at, box: gapBox(caret.run.node, at) };
   };
 
   // The space a point annotation marks: between the word that ends here and
@@ -2014,37 +2010,45 @@
     drag.moved = true;
     const caret = caretAt(ev.clientX, ev.clientY);
     if (!caret) return;
-    const from = wordAround(drag.start.run, drag.start.at) || {
-      s: byteAt(drag.start.run, drag.start.at),
-      e: byteAt(drag.start.run, drag.start.at),
+    // A drag covers whole words: it starts at the beginning of the word it
+    // began in and ends at the end of the word it is over.
+    const from = wordAround(drag.start.run, drag.start.at);
+    const to = wordAround(caret.run, caret.at);
+    drag.ends = {
+      begin: { run: drag.start.run, at: from ? from.start : drag.start.at },
+      end: { run: caret.run, at: to ? to.end : caret.at },
     };
-    const to = wordAround(caret.run, caret.at) || {
-      s: byteAt(caret.run, caret.at),
-      e: byteAt(caret.run, caret.at),
-    };
-    drag.range = { s: Math.min(from.s, to.s), e: Math.max(from.e, to.e) };
-    const ends = [
-      { node: drag.start.run.node, at: from.start !== undefined ? from.start : drag.start.at },
-      { node: caret.run.node, at: to.end !== undefined ? to.end : caret.at },
-    ];
-    previewUnderline(rectsOf(domRange(ends[0], ends[1])), true);
+    previewUnderline(
+      rectsOf(
+        domRange(
+          { node: drag.ends.begin.run.node, at: drag.ends.begin.at },
+          { node: drag.ends.end.run.node, at: drag.ends.end.at },
+        ),
+      ),
+      true,
+    );
   };
   const onMouseUp = (ev) => {
     if (!annotating || !drag) return;
     const d = drag;
     drag = null;
     clearHover();
-    if (!d.moved || !d.range || d.range.e <= d.range.s) return;
-    const word = wordAround(d.start.run, d.start.at);
+    if (!d.moved || !d.ends) return;
+    const { begin, end } = d.ends;
+    const empty = begin.run === end.run && begin.at >= end.at;
+    if (empty) return;
     // A drag that never left the word it started on is a plain click.
-    if (word && d.range.s === word.s && d.range.e === word.e) return;
+    const word = wordAround(d.start.run, d.start.at);
+    if (word && begin.run === end.run && begin.at === word.start && end.at === word.end) {
+      return;
+    }
     ev.preventDefault();
     ev.stopImmediatePropagation();
     swallowClick = true;
-    compose("span", { s: d.range.s, e: d.range.e }, {
-      scope: "span",
-      start: d.range.s,
-      end: d.range.e,
+    compose("span", {
+      type: "span.h",
+      begin: cursorRef(begin.run, begin.at),
+      end: cursorRef(end.run, end.at),
     });
   };
 
@@ -2070,16 +2074,15 @@
       return;
     }
     clearHover();
-    const region = regionZoneAt(ev.clientX, ev.clientY);
+    // Held down, the modifier means the region rather than what is in it.
+    const region = ev.altKey
+      ? regionUnder(ev.clientX, ev.clientY)
+      : regionZoneAt(ev.clientX, ev.clientY);
     if (region) {
       ev.preventDefault();
       ev.stopImmediatePropagation();
-      // The anchor goes at the head of the region; the server moves it past a
-      // list marker so the label binds to the text rather than to the bullet.
-      compose(region.kind, { s: region.anchor, scope: region.kind }, {
-        scope: region.kind,
-        start: region.anchor,
-      });
+      const kind = blockKind(region.el, region.kind);
+      compose(kind, nodeLocation(kind, region));
       return;
     }
     const atom = atomAt(ev.clientX, ev.clientY);
@@ -2094,10 +2097,7 @@
         inline: "inline",
         svg: "drawing",
       };
-      compose(named[atom.scope], { s: atom.anchor, scope: atom.scope }, {
-        scope: atom.scope,
-        start: atom.anchor,
-      });
+      compose(named[atom.kind] || atom.kind, nodeLocation(atom.kind, atom));
       return;
     }
     const caret = caretAt(ev.clientX, ev.clientY);
@@ -2106,11 +2106,13 @@
     ev.stopImmediatePropagation();
     const word = wordAround(caret.run, caret.at);
     if (word) {
-      compose("comment", { s: word.e, scope: "word" }, { scope: "word", start: word.e });
+      compose("comment", wordLocation("word", word));
       return;
     }
     const gap = gapAt(caret);
-    if (gap) compose("point", { s: gap.s, scope: "point" }, { scope: "point", start: gap.s });
+    if (gap) {
+      compose("point", { type: "pos.h", ref: cursorRef(gap.run, gap.at) });
+    }
   };
 
   // Up/down arrows walk the annotations in document order — selecting,
@@ -2121,8 +2123,8 @@
     const box = document.getElementById(BOX_ID);
     const ta = box && box.querySelector("textarea");
     if (ta && ta.value) return;
-    if (!pins.length) return;
-    const list = pins.slice().sort((a, b) => a.start - b.start);
+    const list = pins.filter((pin) => showResolved || !pin.resolved);
+    if (!list.length) return;
     let idx = list.findIndex((p) => p.uuid === openUuid);
     if (e.key === "ArrowDown") idx = idx < 0 ? 0 : Math.min(idx + 1, list.length - 1);
     else idx = idx < 0 ? list.length - 1 : Math.max(idx - 1, 0);
@@ -2213,31 +2215,46 @@
   // flicker the page.
   let shownBody = null;
   const loadDocument = () =>
-    fetch(BASE + "body.html", { cache: "no-cache" })
-      .then((r) => (r.ok ? r.text() : null))
-      .then((body) => {
-        if (body === null) {
-          if (!compileErrors) showStatus(["cannot load the document"]);
+    getJson("/dev/html/doc")
+      .then((res) => {
+        if (!res || !res.ok) {
+          if (!compileErrors) showBanner("Cannot load the document");
           return;
         }
         const doc = document.getElementById(DOC_ID);
         if (!doc) return;
-        if (shownBody !== body) {
-          shownBody = body;
-          doc.innerHTML = body;
-          indexDocument();
+        // The rendering and its map arrive together, so the ids in one always
+        // mean what the other says they mean.
+        renderId = res.render;
+        nodeKinds = {};
+        const nodes = (res.map && res.map.nodes) || {};
+        for (const uid of Object.keys(nodes)) nodeKinds[uid] = nodes[uid].kind;
+        if (shownBody !== res.body) {
+          shownBody = res.body;
+          doc.innerHTML = res.body;
         }
+        // Indexed on every fetch: the map may have changed even when the body
+        // did not, and the index is what everything else looks things up in.
+        indexDocument();
       })
       .catch(() => {
-        if (!compileErrors) showStatus(["cannot load the document"]);
+        if (!compileErrors) showBanner("Cannot load the document");
       });
 
   const loadPins = () =>
     getJson("/dev/html/pins").then((res) => {
-      if (res && res.ok) pins = res.pins || [];
+      if (res && res.ok) {
+        pins = res.pins || [];
+        applyFlags();
+      }
     });
 
   const refresh = () => Promise.all([loadDocument(), loadPins()]).then(() => {
+    // A pending annotation the server has now sent back is the server's; drop
+    // this page's copy of it.
+    local = local.filter(
+      (pin) => pin.state !== "pending" || !pins.some((known) => known.uuid === pin.waiting),
+    );
     render();
     refreshOpen();
   });
@@ -2247,6 +2264,7 @@
   const listen = () => {
     const sse = new EventSource(url("/dev/diagnostics"));
     sse.onmessage = (ev) => {
+      setOnline(true);
       let data = null;
       try {
         data = JSON.parse(ev.data);
@@ -2271,14 +2289,9 @@
       refresh();
     };
     sse.onerror = () => {
-      // The server went away; the page is a snapshot from here on.
-      // Nothing here is a preview of a print job; it is a document being
-      // served, and in this mode annotated.
-      showStatus([
-        ANNOTATE
-          ? "Disconnected from the annotation server"
-          : "Disconnected from the document server",
-      ]);
+      // The server went away. What is on the page stays on the page, and says
+      // so by standing still.
+      setOnline(false);
     };
   };
 
@@ -2292,6 +2305,77 @@
     if (localStorage.getItem(ANNOTATE_KEY) === "off") annotating = false;
   } catch (err) {}
 
+  // Annotations that are finished with are out of the way by default: what is
+  // left is what still wants doing.
+  const RESOLVED_KEY = "tinymist-show-resolved";
+  let showResolved = false;
+  try {
+    showResolved = localStorage.getItem(RESOLVED_KEY) === "on";
+  } catch (err) {}
+
+  // A line floating over the page, for something true right now rather than
+  // something that happened: no connection, and nothing else so far.
+  const BANNER_ID = "tinymist-banner";
+  // Two kinds of line share it: one that is true until it is not — no
+  // connection — and one that has just happened. The standing one wins, since
+  // a notice about one comment matters less than the page being cut off.
+  let standing = null;
+  let passing = null;
+  let passingTimer = null;
+  const paintBanner = () => {
+    const text = standing || passing;
+    let el = document.getElementById(BANNER_ID);
+    if (!text) {
+      if (el) el.remove();
+      return;
+    }
+    if (!el) {
+      el = document.createElement("div");
+      el.id = BANNER_ID;
+      document.body.appendChild(el);
+    }
+    el.textContent = text;
+  };
+  const holdBanner = (text) => {
+    standing = text || null;
+    paintBanner();
+  };
+  const showBanner = (text) => {
+    passing = text || null;
+    clearTimeout(passingTimer);
+    if (passing) passingTimer = setTimeout(() => showBanner(null), 5000);
+    paintBanner();
+  };
+
+  // Offline is a state of the page, not a message: the marks that travel stop
+  // travelling, and start again when the server answers.
+  const showConnection = () => {
+    document.documentElement.classList.toggle("tm-offline", !online);
+    // Its own banner rather than the status panel: this is a passing state of
+    // the page, and it should not move the annotation window.
+    holdBanner(online ? null : "No connection; changes stored locally");
+  };
+
+  // While the server is away, ask for something small every few seconds; the
+  // first answer puts the page back together.
+  let retrying = null;
+  const watchConnection = () => {
+    onConnection((up) => {
+      showConnection();
+      if (up) {
+        clearInterval(retrying);
+        retrying = null;
+        flush();
+        refresh();
+      } else if (!retrying) {
+        retrying = setInterval(() => {
+          if (flying) return;
+          getJson("/dev/build");
+        }, 3000);
+      }
+    });
+  };
+
   const applyMode = () => {
     const root = document.documentElement;
     root.classList.toggle("tm-annotate", annotating);
@@ -2302,33 +2386,86 @@
     }
     const button = document.getElementById(TOGGLE_ID);
     if (button) {
-      button.dataset.on = annotating ? "1" : "";
+      // Removed rather than emptied: the style that fills the box matches on
+      // the attribute being there, and `data-on=""` is there.
+      button.toggleAttribute("data-on", annotating);
       button.title = annotating
         ? "Annotating: click the text to comment on it"
         : "Reading: the document behaves as a page";
     }
   };
 
-  const buildToggle = () => {
+  // A checkbox: a box that fills and takes a tick, and a word beside it.
+  const checkbox = (id, text, onChange) => {
     const button = document.createElement("button");
-    button.id = TOGGLE_ID;
+    button.id = id;
+    button.className = "tm-toggle";
     // The box is an element rather than a character: a glyph is whatever the
     // platform's font has, and this one has to line up with its label.
     const box = document.createElement("span");
     box.className = "tm-check";
     const label = document.createElement("span");
-    label.textContent = "annotate";
+    label.textContent = text;
     button.append(box, label);
     button.onclick = (ev) => {
       ev.stopPropagation();
-      annotating = !annotating;
-      try {
-        localStorage.setItem(ANNOTATE_KEY, annotating ? "on" : "off");
-      } catch (err) {}
-      applyMode();
-      render();
+      onChange(!button.hasAttribute("data-on"));
     };
-    document.body.appendChild(button);
+    return button;
+  };
+
+  const buildToggle = () => {
+    const host = document.createElement("div");
+    host.id = "tinymist-toggles";
+    host.appendChild(
+      checkbox(TOGGLE_ID, "annotate", (on) => {
+        annotating = on;
+        try {
+          localStorage.setItem(ANNOTATE_KEY, annotating ? "on" : "off");
+        } catch (err) {}
+        applyMode();
+        render();
+      }),
+    );
+    host.appendChild(
+      checkbox("tinymist-resolved", "resolved", (on) => {
+        showResolved = on;
+        try {
+          localStorage.setItem(RESOLVED_KEY, showResolved ? "on" : "off");
+        } catch (err) {}
+        document
+          .getElementById("tinymist-resolved")
+          .toggleAttribute("data-on", showResolved);
+        // An annotation that has just been hidden cannot stay open.
+        if (!showResolved) {
+          const open = pins.find((pin) => pin.uuid === openUuid);
+          if (open && open.resolved) closeBox(true);
+        }
+        render();
+      }),
+    );
+    // Airplane mode: the page behaves as though the server were unreachable,
+    // which is the only way to see the offline behaviour without unplugging
+    // something.
+    host.appendChild(
+      checkbox("tinymist-airplane", "airplane", (on) => {
+        flying = on;
+        document
+          .getElementById("tinymist-airplane")
+          .toggleAttribute("data-on", flying);
+        if (flying) {
+          setOnline(false);
+        } else {
+          // Back at once rather than at the next tick, so the ants start
+          // moving as soon as the box is cleared.
+          getJson("/dev/build").then(refresh);
+        }
+      }),
+    );
+    document.body.appendChild(host);
+    document
+      .getElementById("tinymist-resolved")
+      .toggleAttribute("data-on", showResolved);
     applyMode();
   };
 
@@ -2340,6 +2477,13 @@
     window.addEventListener("mouseup", onMouseUp, true);
     document.addEventListener("click", onClick, true);
     document.addEventListener("keydown", onArrow, true);
+    const modifier = (e) => {
+      if (e.key !== "Alt" || !pointer) return;
+      if (openUuid !== null || composeActive) return;
+      previewAt({ clientX: pointer.x, clientY: pointer.y, altKey: e.type === "keydown" });
+    };
+    document.addEventListener("keydown", modifier, true);
+    document.addEventListener("keyup", modifier, true);
     document.addEventListener("keydown", (e) => {
       if (e.key === "Escape" && drag) {
         drag = null;
@@ -2365,7 +2509,10 @@
   // The panel wraps differently at a different width, so its height is not a
   // thing to measure once.
   window.addEventListener("resize", measureStatus);
-  refresh().then(listen);
+  watchConnection();
+  refresh()
+    .then(() => sendStored())
+    .then(listen);
   // Fonts and images settle after the first paint and move everything below
   // them; a slow tick keeps the marks on their text without watching for it.
   setInterval(render, 1000);

@@ -21,6 +21,7 @@ pub mod annotations;
 mod cache;
 pub mod capture;
 pub mod pins;
+pub mod renders;
 pub mod http;
 pub mod sidecar;
 
@@ -29,11 +30,11 @@ pub use crate::tool::registry::{
 };
 
 pub use annotations::{
-    dev_asset, dev_asset_in, sidecar_path, AnchorPolicy, AnnotateRequest, AnnotationRecord,
-    AnnotationServer, DiskAnnotationServer, SourceBlock, ANCHOR_PREFIX,
+    dev_asset, sidecar_path, AnchorPolicy, AnnotateRequest, AnnotationRecord, AnnotationServer,
+    DiskAnnotationServer, SourceBlock,
 };
+pub use tinymist_annos::ANCHOR_PREFIX;
 
-pub use crate::tool::render::html::doc_file;
 
 pub use http::{make_http_server, HttpServer};
 
@@ -193,7 +194,7 @@ fn annotation_count(doc: &Path) -> usize {
     let Ok(text) = std::fs::read_to_string(sidecar) else {
         return 0;
     };
-    let entry = format!("<{}", annotations::ANCHOR_PREFIX);
+    let entry = format!("<{}", tinymist_annos::ANCHOR_PREFIX);
     text.match_indices(&entry)
         // The prelude shows what an entry looks like; the example in it is not
         // an annotation.
@@ -289,7 +290,7 @@ pub fn anyone_working(sidecars: &[PathBuf]) -> bool {
 /// edited without a rebuild — as the annotator's own script and stylesheet are.
 /// The page holds no documents: it asks for them.
 pub fn listing_html() -> String {
-    annotations::dev_asset_in(
+    crate::tool::asset::dev_asset_in(
         "serve",
         "listing.html",
         include_str!("../static/serve/listing.html"),

@@ -7,10 +7,11 @@
 // its title inside an `#align` therefore has no title at all in HTML, which
 // reads as a bug in the preview rather than as a gap in the exporter.
 //
-// These rules recover the content and approximate the appearance in CSS. They
-// are installed by the server in front of the document being served, so the
-// document itself needs no changes. This file is read from disk on every
-// compile: edit it and the preview picks it up, no rebuild.
+// These rules recover the content and approximate the appearance in CSS. The
+// server evaluates this file as a module and installs the rules it exports as
+// default show rules, so the document itself needs no changes. The file is read
+// from disk when a server starts, so an edit needs no rebuild — but it does need
+// the server restarted.
 //
 // Everything here assumes the HTML target — `html.elem` is an error under
 // paged export — and the server only installs it when serving HTML.
@@ -302,7 +303,7 @@
   } else { none }
 }
 
-#show align: it => context {
+#let _rule-align = it => context {
   if not _html-here() { return it }
   // The frame goes around the drawing, not around the container: a container
   // is often `width: 100%`, and a frame has no width for that to be a
@@ -386,7 +387,7 @@
     + _prop("width", _len(it.width)),
 )
 
-#show block: it => context {
+#let _rule-block = it => context {
   // A block is a place where the surrounding text size is settled, so it is
   // also a place to record it: a title inside one is sized against the block,
   // not against whatever paragraph came before.
@@ -420,7 +421,7 @@
   out
 }
 
-#show box: it => context {
+#let _rule-box = it => context {
   if not _html-here() { return it }
   if _wants-frame(it, 5) { return _frame-drawing(it) }
   // Inline, deliberately: `inline-block` would make the chip's own padding
@@ -465,12 +466,12 @@
 // document would fight the page's own typography and shrink every styled run
 // to boot. The block's size is the only thing a run can be compared against,
 // and only the block knows it, so it leaves it here on the way past.
-#show par: it => context {
+#let _rule-par = it => context {
   _base-size.update(text.size)
   it
 }
 
-#show heading: it => context {
+#let _rule-heading = it => context {
   _base-size.update(text.size)
   it
 }
@@ -499,7 +500,7 @@
     + (if text.style != "normal" { ("font-style: " + text.style,) } else { () }),
 )
 
-#show text: it => context {
+#let _rule-text = it => context {
   if not _html-here() { return it }
   let style = _text-style()
   if style == "" { it } else { html.elem("span", attrs: (style: style), it) }
@@ -512,13 +513,13 @@
 // say, so nothing is wrapped. The browser's own math font takes it from there
 // (see the stylesheet), which is the right answer anyway — the document's math
 // font is a file on this machine, not something a page can assume.
-#show math.equation: it => {
+#let _rule-math-equation = it => {
   set text(fill: black, weight: 400, style: "normal")
   it
 }
 
 // Vertical space is dropped; a div of that height says the same thing.
-#show v: it => context {
+#let _rule-v = it => context {
   if not _html-here() { return it }
   let amount = _len(it.amount)
   if amount == none { none } else {
@@ -530,7 +531,7 @@
 // rules above fall back to `currentColor` rather than dropping the border.
 
 // A rule across the page.
-#show line: it => context {
+#let _rule-line = it => context {
   if not _html-here() { return it }
   html.elem("hr", attrs: (style: _style(_prop("border-top", _one-stroke(it.stroke)))), [])
 }
@@ -538,7 +539,7 @@
 // `pad`, `place` and `stack` lose their children. Padding becomes CSS;
 // placement cannot be honoured in flow, so the content is kept in place;
 // a horizontal stack becomes a flex row, a vertical one plain flow.
-#show pad: it => context if not _html-here() { it } else {
+#let _rule-pad = it => context if not _html-here() { it } else {
   _wrap(
     "div",
     _style(
@@ -551,11 +552,11 @@
   )
 }
 
-#show place: it => context if not _html-here() { it } else {
+#let _rule-place = it => context if not _html-here() { it } else {
   _wrap("div", _style(_prop("text-align", _text-align(it.alignment))), it.body)
 }
 
-#show stack: it => context {
+#let _rule-stack = it => context {
   if not _html-here() { return it }
   let sideways = it.dir == ltr or it.dir == rtl
   let gap = _len(it.spacing)
@@ -574,7 +575,7 @@
 // the exporter exactly as `grid` is.
 #let _cell-body(cell) = if "body" in cell.fields() { cell.body } else { cell }
 
-#show grid: it => context {
+#let _rule-grid = it => context {
   if not _html-here() { return it }
   let cells = it.children.filter(c => c.func() == grid.cell)
   let columns = if type(it.columns) == array { it.columns.len() } else { 1 }
@@ -591,3 +592,29 @@
       .join(),
   )
 }
+
+// -- the rules, as data ------------------------------------------------------
+
+// Installed by the server as the document's own default show rules, rather than
+// applied by a file the document is compiled through. A wrapper meant the
+// compile's main file was not the document, which every part of the system then
+// had to know about: source ranges came from a file the reader has never seen,
+// and everything downstream needed telling where the document really went.
+//
+// In file order, which is the order they were written in when they were show
+// rules and the order they are applied in now.
+#let rules = (
+  (align, _rule-align),
+  (block, _rule-block),
+  (box, _rule-box),
+  (par, _rule-par),
+  (heading, _rule-heading),
+  (text, _rule-text),
+  (math.equation, _rule-math-equation),
+  (v, _rule-v),
+  (line, _rule-line),
+  (pad, _rule-pad),
+  (place, _rule-place),
+  (stack, _rule-stack),
+  (grid, _rule-grid),
+)

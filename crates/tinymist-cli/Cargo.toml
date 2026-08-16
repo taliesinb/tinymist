@@ -66,6 +66,7 @@ serde_yaml.workspace = true
 strum.workspace = true
 sync-ls = { workspace = true, features = ["lsp", "server", "system"] }
 tinymist = { workspace = true, default-features = false, features = ["system"] }
+tinymist-annos.workspace = true
 tinymist-assets = { workspace = true }
 tinymist-debug.workspace = true
 tinymist-l10n.workspace = true

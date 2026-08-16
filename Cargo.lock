@@ -6730,6 +6730,7 @@ dependencies = [
  "sync-ls",
  "temp-env",
  "tempfile",
+ "tinymist-annos",
  "tinymist-assets 0.15.4-rc1 (registry+https://github.com/rust-lang/crates.io-index)",
  "tinymist-dap",
  "tinymist-debug",
@@ -6748,6 +6749,7 @@ dependencies = [
  "typst",
  "typst-ansi-hl",
  "typst-bundle",
+ "typst-eval",
  "typst-html",
  "typst-pdf",
  "typst-render",
@@ -6793,6 +6795,15 @@ dependencies = [
  "typst-shim",
  "typst-timing 0.15.0",
  "unscanny",
+]
+
+[[package]]
+name = "tinymist-annos"
+version = "0.15.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "typst-syntax 0.15.0",
 ]
 
 [[package]]
@@ -6860,6 +6871,7 @@ dependencies = [
  "sync-ls",
  "temp-env",
  "tinymist",
+ "tinymist-annos",
  "tinymist-assets 0.15.4-rc1 (registry+https://github.com/rust-lang/crates.io-index)",
  "tinymist-debug",
  "tinymist-l10n",

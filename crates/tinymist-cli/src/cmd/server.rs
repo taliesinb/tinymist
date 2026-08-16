@@ -154,13 +154,9 @@ pub fn build_document(cfg: &DocConfig, input: &Path) -> Result<(Arc<DocServices>
     let mut verse = compile.resolve()?;
     // The same shims a single served document gets: what HTML export drops,
     // put back in front of the document rather than in it.
-    let shims = match html::install_shims(&mut verse) {
-        Ok(entry) => Some(entry),
-        Err(err) => {
-            log::warn!("serving without the HTML export shims: {err}");
-            None
-        }
-    };
+    if let Err(err) = html::install_shims(&mut verse) {
+        log::warn!("serving without the HTML export shims: {err}");
+    }
 
     let preview_state = ProjectPreviewState::default();
     let last_art = Arc::new(parking_lot::Mutex::default());
@@ -243,33 +239,6 @@ pub fn build_document(cfg: &DocConfig, input: &Path) -> Result<(Arc<DocServices>
                 }
                 last_mtime = mtime;
                 diag_tx.send_modify(|state| state.anno_version += 1);
-            }
-        });
-    }
-
-    // A shim edit is not a compile dependency either — the wrapper holds a copy
-    // of the text — so the wrapper is rewritten when the file changes, which is
-    // what the compiler notices.
-    if let Some(shims) = shims {
-        let handle = handle.clone();
-        tokio::spawn(async move {
-            use tinymist_preview::EditorServer;
-            let mut last = None;
-            loop {
-                let stamp = std::fs::metadata(html::shims_path())
-                    .and_then(|meta| meta.modified())
-                    .ok();
-                if last.is_some() && stamp != last {
-                    let files = tinymist_preview::MemoryFiles {
-                        files: HashMap::from([(
-                            shims.path.clone(),
-                            html::wrapper_source(&shims.main_name),
-                        )]),
-                    };
-                    let _ = handle.update_memory_files(files, false).await;
-                }
-                last = stamp;
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
         });
     }

@@ -658,13 +658,18 @@ pub async fn make_http_server(
                             (crate::tool::render::html::client_css(), "text/css")
                         }
                         "/dev/html/doc" => {
-                            let payload = match html.document() {
-                                Ok(doc) => {
+                            // The rendering and its map together, in one
+                            // answer: a page that fetched them separately could
+                            // pair a body with the map of a different compile.
+                            let payload = match html.rendering() {
+                                Ok((doc, map)) => {
                                     let frag = crate::tool::render::html::fragment(&doc);
                                     serde_json::json!({
                                         "ok": true,
+                                        "render": map.render,
                                         "title": frag.title,
                                         "body": frag.body,
+                                        "map": map,
                                     })
                                 }
                                 Err(err) => serde_json::json!({"ok": false, "error": err}),

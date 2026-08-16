@@ -166,8 +166,6 @@ impl ServerState {
         dedicate: &str,
         entry: Option<ImmutPath>,
     ) -> Result<ProjectInsId> {
-        use crate::tool::render::html;
-
         // Nothing focused yet, or nothing focused that can be previewed: the
         // project exists and compiles nothing, so the page has somewhere to
         // connect to while it waits for a document.
@@ -180,25 +178,14 @@ impl ServerState {
             );
         };
 
-        let (wrapper, name) = html::wrapper_path_for(&entry)
-            .ok_or_else(|| tinymist_std::error_once!("cannot place the HTML shim wrapper"))?;
-        let wrapper: ImmutPath = wrapper.as_path().into();
-        self.create_source(wrapper.clone(), html::wrapper_source(&name))?;
-
-        // Labelling happens against the document, not the wrapper it is
-        // compiled through: everything downstream — anchors, edits, the
-        // sidecar — addresses the file the user is editing.
-        let doc = self.config.entry_resolver.resolve(Some(entry));
-        let wrapper_entry = self.config.entry_resolver.resolve(Some(wrapper));
-        if let (Some(wrapper_main), Some(doc_main)) = (wrapper_entry.main(), doc.main()) {
-            html::set_doc_file(wrapper_main, doc_main);
-        }
-
-        self.project.restart_dedicate_as(
-            dedicate,
-            wrapper_entry,
-            tinymist_task::ExportTarget::Html,
-        )
+        let entry = self.config.entry_resolver.resolve(Some(entry));
+        let id = self
+            .project
+            .restart_dedicate_as(dedicate, entry, tinymist_task::ExportTarget::Html)?;
+        // The shims are show rules installed in front of the document, so they
+        // are set on the project that compiles it rather than written anywhere.
+        self.project.install_html_shims(&id);
+        Ok(id)
     }
 
     /// Re-points the HTML previews that follow the editor at the file it has
@@ -499,6 +486,20 @@ impl ProjectState {
         entry: EntryState,
     ) -> Result<ProjectInsId> {
         self.compiler.restart_dedicate(group, entry)
+    }
+
+    /// Installs the HTML export shims on a project, as the library it compiles
+    /// against.
+    #[cfg(feature = "preview")]
+    pub(crate) fn install_html_shims(&mut self, id: &ProjectInsId) {
+        let project = tinymist_project::ProjectCompiler::find_project(
+            &mut self.compiler.primary,
+            &mut self.compiler.dedicates,
+            id,
+        );
+        if let Err(err) = crate::tool::render::html::install_shims(&mut project.verse) {
+            log::warn!("previewing without the HTML export shims: {err}");
+        }
     }
 
     /// The same, rendered to something other than the primary's target.
@@ -984,7 +985,7 @@ impl CompileHandler<LspCompilerFeat, ProjectInsStateExt> for CompileHandlerImpl 
                 // compiled through a wrapper that installs the HTML shims, so
                 // the two differ there; a previewer compiles the file itself.
                 #[cfg(feature = "serve")]
-                let doc = crate::tool::serve::doc_file(world);
+                let doc = typst::World::main(world);
                 #[cfg(not(feature = "serve"))]
                 let doc = {
                     use typst::World as _;
@@ -1024,14 +1025,25 @@ impl CompileHandler<LspCompilerFeat, ProjectInsStateExt> for CompileHandlerImpl 
             #[cfg(feature = "serve")]
             let rendered = match (crate::tool::serve::site_cache(), &doc_path) {
                 (Some(cache), Some(path)) => {
-                    let body = crate::tool::render::html::html_document(art)
-                        .ok()
-                        .map(|html| crate::tool::render::html::fragment(&html).body);
+                    let rendering = crate::tool::render::html::html_document_with_map(art).ok();
+                    let body = rendering
+                        .as_ref()
+                        .map(|(html, _)| crate::tool::render::html::fragment(html).body);
                     // What the drawings look like now, kept for the annotations
                     // that point at them: an agent asked about a plot has no
                     // other way of seeing it.
                     if let Some(body) = &body {
                         crate::tool::serve::pins::record_captures(art, body);
+                    }
+                    // The map of this rendering, with the document as it was
+                    // compiled, so that a page referring to it can be understood
+                    // later.
+                    if let Some((_, map)) = rendering {
+                        let world = art.world();
+                        let text = typst::World::source(world, typst::World::main(world))
+                            .map(|source| source.text().to_owned())
+                            .unwrap_or_default();
+                        crate::tool::serve::renders::record(path, map, text);
                     }
                     body.and_then(|body| cache.write_body(path, &body))
                 }

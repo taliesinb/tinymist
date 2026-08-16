@@ -3,6 +3,7 @@
 mod conn;
 mod utils;
 mod cmd {
+    pub mod annos;
     #[cfg(feature = "export")]
     pub mod compile;
     pub mod completion;
@@ -108,6 +109,9 @@ enum Commands {
     /// List or stop the servers that are running
     #[clap(subcommand)]
     Procs(crate::procs::ProcsCommands),
+    /// Read a document's annotations
+    #[clap(subcommand)]
+    Annos(crate::annos::AnnosCommands),
     /// Serve a file or directory as HTML
     #[cfg(feature = "serve")]
     Serve(crate::serve::ServeArgs),
@@ -181,7 +185,9 @@ fn main() -> Result<()> {
     // Starts logging
     let verbose = match &cmd {
         // Short-running commands, usually run from the CLI.
-        Commands::Completion(..) | Commands::Probe | Commands::Procs(..) => false,
+        Commands::Completion(..) | Commands::Probe | Commands::Procs(..) | Commands::Annos(..) => {
+            false
+        }
         #[cfg(feature = "export")]
         Commands::Compile(..) => false,
         Commands::Lint(..) => false,
@@ -246,6 +252,7 @@ fn main() -> Result<()> {
 
         Commands::Query(cmds) => crate::query::query_main(cmds),
         Commands::Procs(cmds) => crate::procs::procs_main(cmds),
+        Commands::Annos(cmds) => crate::annos::annos_main(cmds),
         #[cfg(feature = "preview")]
         Commands::Render(args) => crate::render::render_main(args),
         #[cfg(feature = "preview")]

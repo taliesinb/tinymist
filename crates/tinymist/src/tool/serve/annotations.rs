@@ -1,259 +1,134 @@
-//! Preview annotations: comments anchored to document text via labels.
+//! Annotations, as a server keeps them.
 //!
-//! An annotation is a cursor label like `<-7C42->` inserted into the
-//! document source at the clicked word, plus a structured record in a
-//! sidecar file `<main>.annos.typ` next to the main file (schema documented
-//! in `annos_prelude.typ`, which is stamped at the top of every new
-//! sidecar). The rendered position of each annotation is resolved by
-//! querying the compiled document for the anchor label, so anchors survive
-//! arbitrary edits around them. Records carry an author, ISO 8601 time, a
-//! status, and a discussion thread that agents and the preview UI append to.
-//!
-//! The sidecar is *read* by actually evaluating it with the Typst compiler
-//! (in a minimal isolated world) and querying its metadata elements — the
-//! same data `typst query <sidecar> metadata` returns — so entries may be
-//! written with any valid Typst, not just the literal template shapes.
+//! The model and the file format are `tinymist-annos`; this is the part that
+//! needs a compiled document. It finds the block of source an annotation sits
+//! in, rewrites that block on request, converts locations between the rendering
+//! and the document, and writes both halves — the anchor in the `.typ`, the
+//! record in the `.annos.json` — to disk.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use lsp_types::Url;
-use reflexo::debug_loc::LspPosition;
 use serde::{Deserialize, Serialize};
+use tinymist_annos::location::HtmlLocation;
+use tinymist_annos::{anchor, Annotation, Sidecar};
 use tinymist_project::LspCompiledArtifact;
-use tinymist_query::{to_lsp_position, PositionEncoding};
-use typst::syntax::SyntaxKind;
 use typst::World;
+use typst::syntax::SyntaxKind;
 
-use crate::tool::render::html::doc_file;
+/// An annotation as this server holds it.
+pub type AnnotationRecord = Annotation;
+/// One reply in a discussion.
+pub type AnnotationReply = tinymist_annos::Reply;
+/// A picture of what an annotation pointed at.
+pub type AnnotationCapture = tinymist_annos::Capture;
 
-pub use crate::tool::asset::dev_asset_in;
-
-/// An annotator asset, from `src/static/annos`.
+/// The static assets the annotator needs, from `src/static/annos`.
 pub fn dev_asset(rel: &str, embedded: &'static str) -> String {
-    dev_asset_in("annos", rel, embedded)
+    crate::tool::asset::dev_asset_in("annos", rel, embedded)
 }
 
-/// The schema documentation stamped at the top of new sidecar files.
-pub fn annos_prelude() -> String {
-    dev_asset("prelude.typ", include_str!("../../static/annos/prelude.typ"))
+/// Where a document's annotations are kept.
+pub fn sidecar_path(art: &LspCompiledArtifact) -> Option<PathBuf> {
+    let world = art.world();
+    let main = world.main();
+    let path = world.path_for_id(main).ok()?.to_err().ok()?;
+    Some(tinymist_annos::sidecar_path(&path))
 }
 
-/// The sidecar entry template, with `${...}` placeholders.
-fn entry_template() -> String {
-    dev_asset("entry.tmpl", include_str!("../../static/annos/entry.tmpl"))
+/// The document's own path.
+pub fn document_path(art: &LspCompiledArtifact) -> Option<PathBuf> {
+    let world = art.world();
+    world.path_for_id(world.main()).ok()?.to_err().ok()
 }
 
-/// The discussion reply template, with `${...}` placeholders.
-fn reply_template() -> String {
-    dev_asset("reply.tmpl", include_str!("../../static/annos/reply.tmpl"))
+/// Reads a document's annotations.
+pub fn read_sidecar(path: &std::path::Path) -> Sidecar {
+    Sidecar::read(path).unwrap_or_default()
 }
 
-/// The capture entry template, with `${...}` placeholders.
-fn capture_template() -> String {
-    dev_asset("capture.tmpl", include_str!("../../static/annos/capture.tmpl"))
+/// Serialised so that two writes of the same annotations produce the same
+/// bytes, since these files are kept in a repository beside the documents.
+pub fn write_sidecar(path: &std::path::Path, sidecar: &Sidecar) -> Result<(), String> {
+    sidecar.write(path)
 }
 
-/// A reply in an annotation's discussion thread.
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AnnotationReply {
-    /// The reply author.
-    pub author: String,
-    /// The reply time, ISO 8601 UTC.
-    pub time: String,
-    /// The reply text.
-    pub content: String,
+/// Held while a sidecar is read, changed and written, so that two requests
+/// arriving together do not each write what the other did not see.
+static SIDECAR_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+/// Reads a document's annotations, changes them, and writes them back.
+pub fn revise<T>(
+    path: &std::path::Path,
+    change: impl FnOnce(&mut Sidecar) -> Result<T, String>,
+) -> Result<T, String> {
+    let _held = SIDECAR_LOCK.lock();
+    let mut sidecar = read_sidecar(path);
+    let out = change(&mut sidecar)?;
+    write_sidecar(path, &sidecar)?;
+    Ok(out)
 }
 
-/// One rendering of what a graphical annotation points at.
-///
-/// A picture only exists once the document has been laid out, so an annotation
-/// on one keeps the renderings it has seen: the drawing as SVG, stored under its
-/// hash in the server's private cache, and the time it first looked like that. A
-/// new capture is recorded only when the hash moves — a compile that changed
-/// nothing about the drawing is not a new picture of it.
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AnnotationCapture {
-    /// When this rendering first appeared, ISO 8601 UTC.
-    pub time: String,
-    /// What the stored capture is: `svg` for a drawing taken out of the
-    /// rendered page, and later `png` for a photograph or a raster image,
-    /// `html` for a piece of the page kept as itself. The file is stored under
-    /// `<hash>.<fmt>`, so the format is also how to read it back.
-    #[serde(default)]
-    pub fmt: String,
-    /// The hash the capture is stored under.
-    pub hash: String,
-    /// How wide the capture is on the page, in CSS pixels, so that a reader of
-    /// the sidecar knows the shape of the picture without fetching it.
-    #[serde(default)]
-    pub width: u32,
-    /// How tall it is, in CSS pixels.
-    #[serde(default)]
-    pub height: u32,
-    /// What the reader drew on top, as inline SVG in the capture's own
-    /// coordinates. Absent until somebody draws something.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub markup: Option<String>,
+/// Who to record as the author of something written through this server.
+pub fn local_author() -> String {
+    std::env::var("TALIMIST_AUTHOR")
+        .ok()
+        .filter(|name| !name.trim().is_empty())
+        .or_else(|| std::env::var("USER").ok())
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| "someone".to_owned())
 }
 
-/// A stored annotation record from the sidecar file.
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AnnotationRecord {
-    /// The annotation kind: "comment" | "question" | "request".
-    #[serde(rename = "type")]
-    pub rtype: String,
-    /// The unique id, e.g. "7C42"; the document anchor is `<anno.7C42.word>`.
-    pub uuid: String,
-    /// What the annotation refers to: the same word as the anchor's suffix,
-    /// written out so the sidecar reads on its own, without the document.
-    #[serde(default)]
-    pub scope: String,
-    /// The colour the client chose for it, as `#rrggbb`. Stored, not decided:
-    /// the palette lives in the client, and an annotation keeps the colour it
-    /// was given however the palette changes around it.
-    #[serde(default)]
-    pub color: String,
-    /// The display letter shown on the pin: "a".."z", then "aa", ...
-    pub letter: String,
-    /// The author of the annotation.
-    pub author: String,
-    /// The message.
-    pub content: String,
-    /// Creation time, ISO 8601 UTC.
-    pub time: String,
-    /// Whether somebody is working on it. Set when an agent claims it, unset
-    /// when it is given back.
-    #[serde(default)]
-    pub claimed: bool,
-    /// Whether it is done. A resolved annotation is still drawn, dimmed, until
-    /// somebody deletes it or reopens it.
-    #[serde(default)]
-    pub resolved: bool,
-    /// When it was last changed — a reply, a flag, a capture. Creation time is
-    /// `time`; this moves whenever anything about the entry does, which is what
-    /// a reader needs to show what is new.
-    #[serde(default)]
-    pub mtime: String,
-    /// What the thing it points at has looked like, oldest first. Only
-    /// graphical annotations have any.
-    #[serde(default)]
-    pub captures: Vec<AnnotationCapture>,
-    /// The discussion thread, in order.
-    pub discussion: Vec<AnnotationReply>,
+/// The author of a request: the one the server resolved, or this machine's.
+pub fn author_or_local(author: Option<&str>) -> String {
+    author
+        .map(str::to_owned)
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(local_author)
 }
 
-impl AnnotationRecord {
-    /// The one-word state, for the reader: a resolved annotation is resolved
-    /// whoever holds it, a claimed one is being worked on, and the rest are
-    /// waiting. Derived rather than stored — two flags say more than a word can
-    /// (an agent can hold something it has already answered), and the word is
-    /// only ever what a page paints.
-    pub fn status(&self) -> &'static str {
-        match (self.resolved, self.claimed) {
-            (true, _) => "resolved",
-            (false, true) => "ongoing",
-            (false, false) => "created",
-        }
+/// A uuid for a new annotation: sixty-four bits of hex, from the clock and the
+/// text, and never seen in the document.
+pub fn fresh_uuid(seed: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_nanos() as u64)
+        .unwrap_or(0);
+    for byte in seed.as_bytes().iter().chain(&now.to_le_bytes()) {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100_0000_01b3);
     }
-
-    /// When it last changed, falling back to when it was made: an entry written
-    /// before the field existed has only ever been created.
-    pub fn changed(&self) -> &str {
-        if self.mtime.is_empty() {
-            &self.time
-        } else {
-            &self.mtime
-        }
-    }
+    format!("{hash:016x}")
 }
 
-/// A request to create an annotation at a clicked position.
+/// What a page asks for when somebody writes an annotation.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct AnnotateRequest {
-    /// A client-suggested uuid, e.g. `7C42` (random 16-bit uppercase hex,
-    /// the browser). Used verbatim when valid and free; otherwise the server
-    /// generates one.
-    #[serde(default)]
-    pub uuid: Option<String>,
-    /// The 1-based page number of the click, when created by clicking.
-    #[serde(default)]
-    pub page: Option<usize>,
-    /// The x coordinate of the click, in pt.
-    #[serde(default)]
-    pub x: Option<f64>,
-    /// The y coordinate of the click, in pt.
-    #[serde(default)]
-    pub y: Option<f64>,
+    /// Where it points, as the page sees the document.
+    pub location: HtmlLocation,
+    /// The rendering the location was taken against.
+    pub render: String,
     /// The comment text.
     pub text: String,
-    /// The scope to create, when the client has already decided (a click
-    /// between words makes a point, not a word).
+    /// What kind of remark it is: a comment, a question, a request.
     #[serde(default)]
-    pub scope: Option<String>,
-    /// The colour the client drew it in, as `#rrggbb`, stored as given: the
-    /// palette is the client's business, and the annotation keeps the colour
-    /// it was made with.
+    pub kind: Option<String>,
+    /// The colour the page drew it in, as `#rrggbb`.
     #[serde(default)]
     pub color: Option<String>,
-    /// A source range, when the client already knows the span it wants.
+    /// What was there when the annotation was made, for saying what it was
+    /// about if the anchor is later deleted.
     #[serde(default)]
-    pub s: Option<usize>,
-    /// The end of that source range.
-    #[serde(default)]
-    pub e: Option<usize>,
-    /// The end point of a drag, when the annotation is a span.
-    #[serde(default)]
-    pub page2: Option<usize>,
-    /// The x coordinate of the drag end, in pt.
-    #[serde(default)]
-    pub x2: Option<f64>,
-    /// The y coordinate of the drag end, in pt.
-    #[serde(default)]
-    pub y2: Option<f64>,
+    pub snapshot: Option<String>,
     /// Who to record as the author. Resolved by the server from the request
-    /// itself, never deserialized from the body: a client that could name its
-    /// own author could sign a colleague's name to a comment.
+    /// itself, never read from the body: a client that could name its own
+    /// author could sign a colleague's name to a comment.
     #[serde(skip)]
     pub author: Option<String>,
 }
 
-/// The edits needed to create or delete an annotation. When the target file
-/// has no unsaved editor changes (its disk content matches the compiled
-/// source), `disk_content` carries the new file content to write directly on
-/// disk — so external watchers see the anchor immediately; otherwise the edit
-/// must go through the editor as a workspace edit. The sidecar is always
-/// written on disk.
-#[derive(Debug, Clone)]
-pub struct AnnotationEdit {
-    /// The annotation uuid.
-    pub uuid: String,
-    /// The uri of the source file to edit.
-    pub uri: Url,
-    /// The path of the source file to edit.
-    pub path: PathBuf,
-    /// The new full content of the source file, when it can be written on
-    /// disk directly.
-    pub disk_content: Option<String>,
-    /// Whether the edit must (also) go through the editor buffer. False only
-    /// when the file was clean and the disk write alone suffices (the editor
-    /// reloads clean buffers silently).
-    pub buffer_edit: bool,
-    /// The range to replace in the source file (empty range = insertion).
-    pub range: lsp_types::Range,
-    /// The replacement text.
-    pub new_text: String,
-    /// The sidecar file path.
-    pub sidecar: PathBuf,
-    /// The new full content of the sidecar file.
-    pub sidecar_content: String,
-}
 
-/// The server-side annotation API exposed to the preview http server.
 pub trait AnnotationServer: Send + Sync {
     /// Creates an annotation at a clicked position. Returns the new uuid.
     fn annotate(&self, req: AnnotateRequest) -> Result<String, String>;
@@ -308,652 +183,7 @@ pub trait AnnotationServer: Send + Sync {
     }
 }
 
-/// What an annotation refers to. The scope is carried by the anchor label
-/// itself (`<7C42.word>`), so it is always visible in the document and
-/// never has to be stored — or kept in sync — in the sidecar.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Scope {
-    /// A position between words: "insert something here". No decoration.
-    Point,
-    /// The word the anchor follows.
-    Word,
-    /// The sentence containing the anchor.
-    Sentence,
-    /// The text between a `.span.begin` and `.span.end` anchor pair.
-    Span,
-    /// A generated block: a figure, a `#lorem(..)` call, ...
-    Block,
-    /// A single list item: a bullet, a numbered entry, a term.
-    Item,
-    /// The paragraph containing the anchor; marked in the gutter.
-    Para,
-    /// An inline equation, annotated whole: `$x + y$`. Typst calls these
-    /// inline equations, as against block ones.
-    Math,
-    /// A block equation — `$ x + y $` on its own — which is a region of the
-    /// document rather than a phrase in one, and is marked like a block.
-    DisplayMath,
-    /// A link, annotated whole: its text is one destination, not a run of
-    /// words that happen to be underlined.
-    Link,
-    /// A fragment of raw text — `` `code` `` — annotated whole, for the same
-    /// reason: it is one name, not a phrase.
-    Raw,
-    /// Anything else inline that a label cannot go inside: text a call
-    /// produced from its arguments, where the annotation is about the call.
-    Inline,
-    /// A drawing — a cetz canvas, a fletcher diagram — which reaches HTML as
-    /// one picture and is annotated as one.
-    Svg,
-}
 
-impl Scope {
-    fn from_suffix(suffix: &str) -> Option<Self> {
-        Some(match suffix {
-            "point" => Scope::Point,
-            "word" => Scope::Word,
-            "sentence" => Scope::Sentence,
-            "span.begin" | "span.end" => Scope::Span,
-            "block" => Scope::Block,
-            "item" => Scope::Item,
-            "para" => Scope::Para,
-            "math" => Scope::Math,
-            "math.block" => Scope::DisplayMath,
-            "link" => Scope::Link,
-            "raw" => Scope::Raw,
-            "inline" => Scope::Inline,
-            "svg" => Scope::Svg,
-            _ => return None,
-        })
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Scope::Point => "point",
-            Scope::Word => "word",
-            Scope::Sentence => "sentence",
-            Scope::Span => "span",
-            Scope::Block => "block",
-            Scope::Item => "item",
-            Scope::Para => "para",
-            Scope::Math => "math",
-            Scope::DisplayMath => "math.block",
-            Scope::Link => "link",
-            Scope::Raw => "raw",
-            Scope::Inline => "inline",
-            Scope::Svg => "svg",
-        }
-    }
-}
-
-/// What every anchor and every sidecar entry is named after, so that one
-/// plain search — no regular expression — finds every annotation in a
-/// document: `<anno.`. A leading `.` would have been shorter, but Typst does
-/// not accept it in a label: `<.7C42.word>` is not an anchor, it is text, and
-/// it renders as text.
-pub const ANCHOR_PREFIX: &str = "anno.";
-
-/// The document anchor text for a uuid, e.g. `<anno.7C42.word>`.
-fn anchor_text(uuid: &str, scope: Scope) -> String {
-    match scope {
-        Scope::Span => format!("<{ANCHOR_PREFIX}{uuid}.span.begin>"),
-        scope => format!("<{ANCHOR_PREFIX}{uuid}.{}>", scope.as_str()),
-    }
-}
-
-/// Finds every anchor of an annotation in a source: their byte offsets and
-/// scopes, in document order.
-pub fn find_anchors(text: &str, uuid: &str) -> Vec<(usize, Scope, String)> {
-    // Both spellings are read; only the prefixed one is written. Documents
-    // annotated before the prefix existed keep working, and keep their marks.
-    let prefixes = [format!("<{ANCHOR_PREFIX}{uuid}."), format!("<{uuid}.")];
-    let mut out = vec![];
-    for prefix in prefixes {
-        let mut from = 0;
-        while let Some(rel) = text[from..].find(&prefix) {
-            let start = from + rel;
-            let Some(close) = text[start..].find('>') else {
-                break;
-            };
-            let suffix = &text[start + prefix.len()..start + close];
-            if let Some(scope) = Scope::from_suffix(suffix) {
-                out.push((start, scope, text[start..start + close + 1].to_owned()));
-            }
-            from = start + close + 1;
-        }
-        if !out.is_empty() {
-            break;
-        }
-    }
-    out.sort_by_key(|(at, _, _)| *at);
-    out
-}
-
-/// The sidecar path for the current main file, e.g. `typing.annos.typ`
-/// next to `typing.typ`.
-pub fn sidecar_path(art: &LspCompiledArtifact) -> Option<PathBuf> {
-    let world = art.world();
-    let main = doc_file(world);
-    let path = world.path_for_id(main).ok()?.to_err().ok()?;
-    let stem = path.file_stem()?.to_string_lossy().into_owned();
-    Some(path.with_file_name(format!("{stem}.annos.typ")))
-}
-
-fn escape(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
-}
-
-static SIDECAR_LIBRARY: std::sync::LazyLock<typst::utils::LazyHash<typst::Library>> =
-    std::sync::LazyLock::new(|| {
-        use typst::LibraryExt;
-        typst::utils::LazyHash::new(typst::Library::default())
-    });
-static SIDECAR_BOOK: std::sync::LazyLock<typst::utils::LazyHash<typst::text::FontBook>> =
-    std::sync::LazyLock::new(|| typst::utils::LazyHash::new(typst::text::FontBook::new()));
-
-/// A minimal world for evaluating a sidecar file in isolation: the default
-/// library, no fonts (a metadata-only document shapes no text), and no file
-/// access (sidecars must be self-contained).
-struct SidecarWorld {
-    main: typst::syntax::Source,
-}
-
-impl typst::World for SidecarWorld {
-    fn library(&self) -> &typst::utils::LazyHash<typst::Library> {
-        &SIDECAR_LIBRARY
-    }
-    fn book(&self) -> &typst::utils::LazyHash<typst::text::FontBook> {
-        &SIDECAR_BOOK
-    }
-    fn main(&self) -> typst::syntax::FileId {
-        self.main.id()
-    }
-    fn source(&self, id: typst::syntax::FileId) -> typst::diag::FileResult<typst::syntax::Source> {
-        if id == self.main.id() {
-            Ok(self.main.clone())
-        } else {
-            Err(typst::diag::FileError::AccessDenied)
-        }
-    }
-    fn file(&self, _id: typst::syntax::FileId) -> typst::diag::FileResult<typst::foundations::Bytes> {
-        Err(typst::diag::FileError::AccessDenied)
-    }
-    fn font(&self, _index: usize) -> Option<typst::text::Font> {
-        None
-    }
-    fn today(&self, _offset: Option<typst::foundations::Duration>) -> Option<typst::foundations::Datetime> {
-        None
-    }
-}
-
-fn string_of(dict: &typst::foundations::Dict, key: &str) -> Option<String> {
-    dict.get(key)
-        .ok()
-        .and_then(|value| value.clone().cast::<typst::foundations::Str>().ok())
-        .map(|s| s.to_string())
-}
-
-fn bool_of(dict: &typst::foundations::Dict, key: &str) -> bool {
-    dict.get(key)
-        .ok()
-        .and_then(|value| value.clone().cast::<bool>().ok())
-        .unwrap_or(false)
-}
-
-fn int_of(dict: &typst::foundations::Dict, key: &str) -> u32 {
-    dict.get(key)
-        .ok()
-        .and_then(|value| value.clone().cast::<i64>().ok())
-        .and_then(|n| u32::try_from(n).ok())
-        .unwrap_or(0)
-}
-
-fn record_from_value(value: &typst::foundations::Value) -> Option<AnnotationRecord> {
-    let dict = value.clone().cast::<typst::foundations::Dict>().ok()?;
-    let discussion = dict
-        .get("discussion")
-        .ok()
-        .and_then(|value| value.clone().cast::<typst::foundations::Array>().ok())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|value| {
-                    let reply = value.clone().cast::<typst::foundations::Dict>().ok()?;
-                    Some(AnnotationReply {
-                        author: string_of(&reply, "author")?,
-                        time: string_of(&reply, "time").unwrap_or_default(),
-                        content: string_of(&reply, "content")?,
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    let captures = dict
-        .get("captures")
-        .ok()
-        .and_then(|value| value.clone().cast::<typst::foundations::Array>().ok())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|value| {
-                    let capture = value.clone().cast::<typst::foundations::Dict>().ok()?;
-                    Some(AnnotationCapture {
-                        time: string_of(&capture, "time").unwrap_or_default(),
-                        // Sidecars written before the field held SVG and only
-                        // SVG, so that is what an unlabelled capture is.
-                        fmt: string_of(&capture, "fmt").unwrap_or_else(|| "svg".into()),
-                        hash: string_of(&capture, "hash")?,
-                        width: int_of(&capture, "width"),
-                        height: int_of(&capture, "height"),
-                        markup: string_of(&capture, "markup"),
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    let claimed = bool_of(&dict, "claimed");
-    let resolved = bool_of(&dict, "resolved");
-    Some(AnnotationRecord {
-        rtype: string_of(&dict, "type").unwrap_or_else(|| "comment".into()),
-        uuid: string_of(&dict, "uuid")?,
-        scope: string_of(&dict, "scope").unwrap_or_default(),
-        color: string_of(&dict, "color").unwrap_or_default(),
-        letter: string_of(&dict, "letter").unwrap_or_default(),
-        author: string_of(&dict, "author").unwrap_or_else(|| "unknown".into()),
-        content: string_of(&dict, "content")?,
-        time: string_of(&dict, "time").unwrap_or_default(),
-        claimed,
-        resolved,
-        mtime: string_of(&dict, "mtime").unwrap_or_default(),
-        captures,
-        discussion,
-    })
-}
-
-/// Parses the sidecar content by evaluating it with the Typst compiler and
-/// querying all metadata elements — the same data `typst query <sidecar>
-/// metadata` returns.
-pub fn parse_records(content: &str) -> Vec<AnnotationRecord> {
-    let main = typst::syntax::Source::detached(content);
-    let world = SidecarWorld { main };
-    let compiled = typst::compile::<reflexo_typst::TypstPagedDocument>(&world);
-    let doc = match compiled.output {
-        Ok(doc) => doc,
-        Err(errors) => {
-            log::warn!("sidecar failed to evaluate: {errors:?}");
-            return vec![];
-        }
-    };
-    use typst::foundations::NativeElement;
-    use typst::introspection::Introspector as _;
-    let selector = typst::introspection::MetadataElem::ELEM.select();
-    doc.introspector()
-        .query(&selector)
-        .iter()
-        .filter_map(|elem: &typst::foundations::Content| {
-            let meta = elem.to_packed::<typst::introspection::MetadataElem>()?;
-            record_from_value(&meta.value)
-        })
-        .collect()
-}
-
-/// Locates the byte span of an entry in the sidecar source by its trailing
-/// `<note-LABEL>` uuid, for surgical replacement. Format changes only need
-/// to keep that uuid after the entry's closing `))`.
-fn entry_span(content: &str, uuid: &str) -> Option<std::ops::Range<usize>> {
-    // The entry carries the same name as the anchors it belongs to, so one
-    // search for `<anno.7C42` finds the annotation and everything it is
-    // attached to. Sidecars written before that keep their `<note-7C42>`.
-    let note = format!("<{ANCHOR_PREFIX}{uuid}>");
-    let (note, note_at) = match find_in_code(content, &note, 0) {
-        Some(at) => (note, at),
-        None => {
-            let legacy = format!("<note-{uuid}>");
-            let at = find_in_code(content, &legacy, 0)?;
-            (legacy, at)
-        }
-    };
-    let start = rfind_in_code(content, "#metadata((", note_at)?;
-    let mut end = note_at + note.len();
-    if content[end..].starts_with('\n') {
-        end += 1;
-    }
-    Some(start..end)
-}
-
-/// Whether an offset is inside a line comment. The prelude at the top of every
-/// sidecar shows what an entry looks like — a whole `#metadata` block, uuid and
-/// all — and an entry that happened to be named after the one in the example
-/// would otherwise be "found" there, and the explanation rewritten in its
-/// place. Only line comments matter: the prelude is written in them, and a
-/// sidecar is a list of entries rather than a program with block comments in
-/// it.
-fn commented(content: &str, at: usize) -> bool {
-    let line_start = content[..at].rfind('\n').map(|i| i + 1).unwrap_or(0);
-    content[line_start..at].contains("//")
-}
-
-/// The first occurrence of `needle` at or after `from` that is not commented
-/// out.
-fn find_in_code(content: &str, needle: &str, from: usize) -> Option<usize> {
-    let mut at = from;
-    while let Some(rel) = content[at..].find(needle) {
-        let hit = at + rel;
-        if !commented(content, hit) {
-            return Some(hit);
-        }
-        at = hit + needle.len();
-    }
-    None
-}
-
-/// The last occurrence of `needle` before `before` that is not commented out.
-fn rfind_in_code(content: &str, needle: &str, before: usize) -> Option<usize> {
-    let mut end = before;
-    while let Some(hit) = content[..end].rfind(needle) {
-        if !commented(content, hit) {
-            return Some(hit);
-        }
-        end = hit;
-    }
-    None
-}
-
-/// Formats one annotation record as a sidecar entry, using the editable
-/// `annos_entry.tmpl` / `annos_reply.tmpl` templates. Templates must keep
-/// the `key: "value"` field shapes the parser recognizes.
-pub fn format_record(rec: &AnnotationRecord) -> String {
-    let discussion = if rec.discussion.is_empty() {
-        "()".to_owned()
-    } else {
-        let reply_tmpl = reply_template();
-        let replies: String = rec
-            .discussion
-            .iter()
-            .map(|reply| {
-                reply_tmpl
-                    .replace("${author}", &escape(&reply.author))
-                    .replace("${time}", &escape(&reply.time))
-                    .replace("${content}", &escape(&reply.content))
-            })
-            .collect();
-        format!("(\n{replies}  )")
-    };
-    let captures = if rec.captures.is_empty() {
-        "()".to_owned()
-    } else {
-        let capture_tmpl = capture_template();
-        let entries: String = rec
-            .captures
-            .iter()
-            .map(|capture| {
-                // A capture with nothing drawn on it says nothing about markup,
-                // rather than saying it is empty.
-                let markup = match &capture.markup {
-                    Some(markup) => format!("\n      markup: \"{}\",", escape(markup)),
-                    None => String::new(),
-                };
-                capture_tmpl
-                    .replace("${time}", &escape(&capture.time))
-                    .replace("${fmt}", &escape(&capture.fmt))
-                    .replace("${hash}", &escape(&capture.hash))
-                    .replace("${width}", &capture.width.to_string())
-                    .replace("${height}", &capture.height.to_string())
-                    .replace("${markup}", &markup)
-            })
-            .collect();
-        format!("(\n{entries}  )")
-    };
-    entry_template()
-        .replace("${captures}", &captures)
-        .replace("${type}", &escape(&rec.rtype))
-        .replace("${uuid}", &escape(&rec.uuid))
-        .replace("${scope}", &escape(&rec.scope))
-        .replace("${color}", &escape(&rec.color))
-        .replace("${letter}", &escape(&rec.letter))
-        .replace("${author}", &escape(&rec.author))
-        .replace("${content}", &escape(&rec.content))
-        .replace("${time}", &escape(&rec.time))
-        .replace("${claimed}", if rec.claimed { "true" } else { "false" })
-        .replace("${resolved}", if rec.resolved { "true" } else { "false" })
-        .replace("${mtime}", &escape(rec.changed()))
-        .replace("${discussion}", &discussion)
-}
-
-/// Serializes sidecar mutations in-process; external writers (agents
-/// editing the file directly) are detected via the mtime check below.
-static SIDECAR_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
-
-fn sidecar_mtime(path: &std::path::Path) -> Option<std::time::SystemTime> {
-    std::fs::metadata(path).and_then(|m| m.modified()).ok()
-}
-
-/// Commits a sidecar mutation with optimistic concurrency: runs `prepare`
-/// (which reads the sidecar), and writes its content only if the file's
-/// mtime is unchanged since just before the read — retrying the whole
-/// prepare a few times when an external writer (e.g. an agent editing the
-/// file) got in between. In-process callers are serialized by a lock.
-pub fn commit_sidecar<E>(
-    art: &LspCompiledArtifact,
-    mut prepare: impl FnMut() -> Result<(PathBuf, String, E), String>,
-) -> Result<E, String> {
-    let _guard = SIDECAR_LOCK.lock();
-    for _ in 0..3 {
-        let seen = sidecar_path(art).and_then(|p| sidecar_mtime(&p));
-        let (path, content, extra) = prepare()?;
-        if sidecar_path(art).and_then(|p| sidecar_mtime(&p)) != seen {
-            // The file changed while we were preparing; re-read and retry.
-            continue;
-        }
-        std::fs::write(&path, &content)
-            .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
-        return Ok(extra);
-    }
-    Err("the sidecar kept changing concurrently; giving up".into())
-}
-
-pub fn read_sidecar(path: &std::path::Path) -> (Vec<AnnotationRecord>, String) {
-    match std::fs::read_to_string(path) {
-        Ok(content) => {
-            let records = parse_records(&content);
-            (records, content)
-        }
-        Err(_) => (vec![], annos_prelude()),
-    }
-}
-
-fn valid_label(uuid: &str) -> bool {
-    !uuid.is_empty()
-        && uuid.len() <= 32
-        && uuid
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_')
-}
-
-/// Picks the uuid for a new annotation: the client-suggested one when valid
-/// and free, else a fresh random 16-bit uppercase hex uuid like `7C42`.
-fn fresh_label(records: &[AnnotationRecord], requested: Option<&str>) -> String {
-    let taken = |uuid: &str| records.iter().any(|rec| rec.uuid == uuid);
-    if let Some(uuid) = requested {
-        if valid_label(uuid) && !taken(uuid) {
-            return uuid.to_owned();
-        }
-    }
-    let mut seed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    loop {
-        // splitmix-ish scramble; entropy needs are tiny and collisions are
-        // checked against the existing records anyway.
-        seed = seed
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        let uuid = format!("{:04X}", (seed >> 33) as u16);
-        if !taken(&uuid) {
-            return uuid;
-        }
-    }
-}
-
-/// Parses a display letter as a 1-based index in the sequence
-/// a..z, aa, ab, ... (bijective base 26).
-fn letter_index(s: &str) -> Option<u64> {
-    if s.is_empty() {
-        return None;
-    }
-    s.chars().try_fold(0u64, |acc, c| {
-        c.is_ascii_lowercase()
-            .then(|| acc * 26 + (c as u64 - 'a' as u64 + 1))
-    })
-}
-
-/// Formats a 1-based index as a display letter: 1 = "a", 26 = "z",
-/// 27 = "aa", ...
-fn index_letter(mut n: u64) -> String {
-    let mut out = vec![];
-    while n > 0 {
-        n -= 1;
-        out.push(b'a' + (n % 26) as u8);
-        n /= 26;
-    }
-    out.reverse();
-    String::from_utf8(out).unwrap_or_default()
-}
-
-/// The next free display letter: one past the maximum in use.
-fn next_letter(records: &[AnnotationRecord]) -> String {
-    let max = records
-        .iter()
-        .filter_map(|rec| letter_index(&rec.letter))
-        .max()
-        .unwrap_or(0);
-    index_letter(max + 1)
-}
-
-pub use tinymist_project::iso_now;
-
-/// The author name recorded for annotations created via the preview.
-pub fn local_author() -> String {
-    std::env::var("USER")
-        .or_else(|_| std::env::var("USERNAME"))
-        .unwrap_or_else(|_| "user".into())
-}
-
-/// The author to record for one write.
-///
-/// A server reached over a network resolves this per request, from an identity
-/// the request carries. Falling back to the local user is right rather than
-/// merely convenient: a loopback visitor has no other identity, and is the
-/// person running the server.
-pub fn author_or_local(author: Option<&str>) -> String {
-    author
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .map(str::to_owned)
-        .unwrap_or_else(local_author)
-}
-
-/// Computes the new on-disk content carrying the edit, and whether the edit
-/// must additionally go through the editor buffer.
-///
-/// A clean file (disk identical to the compiled source) is spliced exactly
-/// and needs no buffer edit — the editor reloads clean buffers silently. A
-/// dirty file still gets a best-effort patch, anchored on the text around
-/// the edit site, so external watchers of the disk see the anchor
-/// immediately; the buffer edit remains the authoritative copy and its next
-/// save overwrites the patch.
-fn disk_edit(
-    path: &std::path::Path,
-    source_text: &str,
-    range: std::ops::Range<usize>,
-    insert: &str,
-) -> (Option<String>, bool) {
-    let Ok(disk) = std::fs::read_to_string(path) else {
-        return (None, true);
-    };
-    if disk == source_text {
-        let mut content = disk;
-        content.replace_range(range, insert);
-        return (Some(content), false);
-    }
-    (best_effort_patch(&disk, source_text, range, insert), true)
-}
-
-/// Applies the edit to a diverged disk content by re-locating the edit site.
-/// Deletions locate the removed text itself (the anchor label, unique by
-/// construction); insertions anchor on up to 48 bytes of context around the
-/// insertion point, retrying with shorter context when the exact window was
-/// disturbed by unsaved edits. Gives up (returns `None`) rather than
-/// patching an ambiguous location.
-fn best_effort_patch(
-    disk: &str,
-    source_text: &str,
-    range: std::ops::Range<usize>,
-    insert: &str,
-) -> Option<String> {
-    if insert.is_empty() {
-        let needle = source_text.get(range)?;
-        let mut hits = disk.match_indices(needle);
-        let (at, _) = hits.next()?;
-        if hits.next().is_some() {
-            return None;
-        }
-        let mut content = disk.to_owned();
-        content.replace_range(at..at + needle.len(), "");
-        return Some(content);
-    }
-    // Anchor on context before the insertion point, then on context after
-    // it (for when the unsaved edits sit just before the click site).
-    // Shorter windows are retried when a longer one was disturbed by the
-    // unsaved edits; an ambiguous match is never patched.
-    for ctx_len in [48usize, 24, 12] {
-        let mut start = range.start.saturating_sub(ctx_len);
-        while !source_text.is_char_boundary(start) {
-            start += 1;
-        }
-        let Some(ctx) = source_text.get(start..range.start) else {
-            continue;
-        };
-        if ctx.len() < 4 {
-            continue;
-        }
-        let mut hits = disk.match_indices(ctx);
-        let Some((at, _)) = hits.next() else {
-            continue;
-        };
-        if hits.next().is_some() {
-            break;
-        }
-        let mut content = disk.to_owned();
-        content.insert_str(at + ctx.len(), insert);
-        return Some(content);
-    }
-    for ctx_len in [48usize, 24, 12] {
-        let mut end = (range.end + ctx_len).min(source_text.len());
-        while !source_text.is_char_boundary(end) {
-            end -= 1;
-        }
-        let Some(ctx) = source_text.get(range.end..end) else {
-            continue;
-        };
-        if ctx.len() < 4 {
-            continue;
-        }
-        let mut hits = disk.match_indices(ctx);
-        let Some((at, _)) = hits.next() else {
-            continue;
-        };
-        if hits.next().is_some() {
-            break;
-        }
-        let mut content = disk.to_owned();
-        content.insert_str(at, insert);
-        return Some(content);
-    }
-    None
-}
-
-/// The source range of the paragraph containing a position: markup between
-/// blank lines.
 fn paragraph_range(text: &str, at: usize) -> std::ops::Range<usize> {
     let start = text[..at].rfind("\n\n").map(|i| i + 2).unwrap_or(0);
     let end = text[at..]
@@ -1001,407 +231,14 @@ pub fn sentence_range(text: &str, at: usize) -> std::ops::Range<usize> {
 /// Where the anchor goes is the client's decision — it knows what the reader
 /// pointed at — so it arrives as a source range or an offset rather than as a
 /// place on a page.
-pub fn prepare_annotate(
-    art: &LspCompiledArtifact,
-    req: &AnnotateRequest,
-    encoding: PositionEncoding,
-) -> Result<AnnotationEdit, String> {
-    // A client-side drag sends the source range it highlighted.
-    if let (Some(s), Some(e)) = (req.s, req.e) {
-        return prepare_span_range(art, req, s..e, encoding);
-    }
-    // A bare offset anchors at a point the client picked (between words).
-    if let Some(at) = req.s {
-        let scope = req
-            .scope
-            .as_deref()
-            .and_then(Scope::from_suffix)
-            .unwrap_or(Scope::Point);
-        return prepare_at(art, req, at, scope, encoding);
-    }
-    Err("a source range is required".into())
-}
 
-/// A label placed where content has not started yet — at the head of a line,
-/// or before a list marker — attaches to whatever came *before* it: the
-/// previous item, or nothing at all, and a marker pushed off the line start
-/// stops being a marker. Region scopes (which anchor at the start of the
-/// region they cover) therefore snap forward past the marker to the end of
-/// the region's first word, where the label binds to the text it belongs to.
-fn snap_past_marker(text: &str, at: usize) -> usize {
-    let bytes = text.as_bytes();
-    let line_start = text[..at].rfind('\n').map(|i| i + 1).unwrap_or(0);
-    // Already inside the text? Leave the anchor where the caller put it.
-    if text[line_start..at].chars().any(|c| !c.is_whitespace()) {
-        return at;
-    }
-    let mut i = at;
-    let space = |b: u8| b == b' ' || b == b'\t';
-    while i < bytes.len() && space(bytes[i]) {
-        i += 1;
-    }
-    // A list marker: "-", "+", "/", a heading's run of "=", or an enumerator
-    // like "12." / "12)".
-    let before_marker = i;
-    let mut heading = false;
-    if i < bytes.len() {
-        match bytes[i] {
-            b'-' | b'+' | b'/' => i += 1,
-            b'=' => {
-                while i < bytes.len() && bytes[i] == b'=' {
-                    i += 1;
-                }
-                heading = true;
-            }
-            b'0'..=b'9' => {
-                let mut j = i;
-                while j < bytes.len() && bytes[j].is_ascii_digit() {
-                    j += 1;
-                }
-                if j < bytes.len() && (bytes[j] == b'.' || bytes[j] == b')') {
-                    i = j + 1;
-                }
-            }
-            _ => {}
-        }
-    }
-    // Only a marker if a space follows it; otherwise it was ordinary text.
-    if i > before_marker && !(i < bytes.len() && space(bytes[i])) {
-        i = before_marker;
-        heading = false;
-    }
-    // A heading holds a label only at its end — one written into the middle
-    // closes the heading there and leaves the rest as a paragraph — so its
-    // anchor goes after the last word of the line.
-    if heading {
-        let mut end = text[i..].find('\n').map(|at| i + at).unwrap_or(text.len());
-        while end > i && space(bytes[end - 1]) {
-            end -= 1;
-        }
-        return end;
-    }
-    while i < bytes.len() && space(bytes[i]) {
-        i += 1;
-    }
-    // Past the first word of the body, so the label has content to bind to.
-    while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
-        i += 1;
-    }
-    while i < text.len() && !text.is_char_boundary(i) {
-        i += 1;
-    }
-    if i >= text.len() {
-        at
-    } else {
-        i
-    }
-}
 
 /// Creates an annotation whose anchor goes at a known source offset.
-fn prepare_at(
-    art: &LspCompiledArtifact,
-    req: &AnnotateRequest,
-    at: usize,
-    scope: Scope,
-    encoding: PositionEncoding,
-) -> Result<AnnotationEdit, String> {
-    let world = art.world();
-    let id = doc_file(world);
-    let source = world.source(id).map_err(|e| e.to_string())?;
-    let path = world.path_for_id(id).map_err(|e| e.to_string())?;
-    let path = path.to_err().map_err(|e| e.to_string())?;
-    let uri = Url::from_file_path(&path).map_err(|_| "bad file path".to_string())?;
-    // Region scopes anchor at the region's start, which may sit before a list
-    // marker or at a line head; move into the text so the label binds there.
-    let at = match scope {
-        // Every region scope anchors at the head of the region it covers,
-        // which is where its marker lives — a bullet, an enumerator, the
-        // "=" of a heading. A label written there stops the marker being one.
-        Scope::Item | Scope::Para | Scope::Block => snap_past_marker(source.text(), at),
-        _ => at,
-    };
-    let pos = to_lsp_position(at, encoding, &source);
 
-    let sidecar = sidecar_path(art).ok_or("cannot determine the sidecar path")?;
-    let (records, content) = read_sidecar(&sidecar);
-    let rec = AnnotationRecord {
-        rtype: "comment".into(),
-        uuid: fresh_label(&records, req.uuid.as_deref()),
-        scope: scope.as_str().into(),
-        color: req.color.clone().unwrap_or_default(),
-        letter: next_letter(&records),
-        author: author_or_local(req.author.as_deref()),
-        content: req.text.clone(),
-        time: iso_now(),
-        mtime: String::new(),
-        claimed: false,
-        resolved: false,
-        captures: vec![],
-        discussion: vec![],
-    };
-    let sidecar_content = format!("{content}{}", format_record(&rec));
-
-    let new_text = anchor_text(&rec.uuid, scope);
-    let (disk_content, buffer_edit) = disk_edit(&path, source.text(), at..at, &new_text);
-    Ok(AnnotationEdit {
-        uri,
-        disk_content,
-        buffer_edit,
-        path: path.to_path_buf(),
-        range: lsp_types::Range::new(as_lsp(pos), as_lsp(pos)),
-        new_text,
-        uuid: rec.uuid,
-        sidecar,
-        sidecar_content,
-    })
-}
-
-/// Creates a span annotation over a known source range.
-fn prepare_span_range(
-    art: &LspCompiledArtifact,
-    req: &AnnotateRequest,
-    range: std::ops::Range<usize>,
-    encoding: PositionEncoding,
-) -> Result<AnnotationEdit, String> {
-    let world = art.world();
-    let id = doc_file(world);
-    let source = world.source(id).map_err(|e| e.to_string())?;
-    if range.is_empty() {
-        return Err("empty span".into());
-    }
-    let path = world.path_for_id(id).map_err(|e| e.to_string())?;
-    let path = path.to_err().map_err(|e| e.to_string())?;
-    let uri = Url::from_file_path(&path).map_err(|_| "bad file path".to_string())?;
-
-    let sidecar = sidecar_path(art).ok_or("cannot determine the sidecar path")?;
-    let (records, content) = read_sidecar(&sidecar);
-    let rec = AnnotationRecord {
-        rtype: "comment".into(),
-        uuid: fresh_label(&records, req.uuid.as_deref()),
-        scope: Scope::Span.as_str().into(),
-        color: req.color.clone().unwrap_or_default(),
-        letter: next_letter(&records),
-        author: author_or_local(req.author.as_deref()),
-        content: req.text.clone(),
-        time: iso_now(),
-        mtime: String::new(),
-        claimed: false,
-        resolved: false,
-        captures: vec![],
-        discussion: vec![],
-    };
-    let sidecar_content = format!("{content}{}", format_record(&rec));
-
-    // Insert the end anchor first: inserting the begin anchor would shift
-    // every later offset.
-    let begin = format!("<{ANCHOR_PREFIX}{}.span.begin>", rec.uuid);
-    let end = format!("<{ANCHOR_PREFIX}{}.span.end>", rec.uuid);
-    let mut new_source = source.text().to_owned();
-    new_source.insert_str(range.end, &end);
-    new_source.insert_str(range.start, &begin);
-    let disk_content = match std::fs::read_to_string(&path) {
-        Ok(disk) if disk == source.text() => Some(new_source.clone()),
-        _ => None,
-    };
-    let pos = to_lsp_position(range.start, encoding, &source);
-    Ok(AnnotationEdit {
-        uuid: rec.uuid,
-        uri,
-        disk_content,
-        // The whole file is rewritten on disk; the editor gets the begin
-        // anchor as an insertion and the end anchor follows on the next
-        // compile from disk.
-        buffer_edit: false,
-        path: path.to_path_buf(),
-        range: lsp_types::Range::new(as_lsp(pos), as_lsp(pos)),
-        new_text: begin,
-        sidecar,
-        sidecar_content,
-    })
-}
-
-/// Prepares the edits deleting an annotation: removal of the anchor label
-/// from whichever dependency file contains it, and of the sidecar entry.
-pub fn prepare_delete(
-    art: &LspCompiledArtifact,
-    uuid: &str,
-    encoding: PositionEncoding,
-) -> Result<AnnotationEdit, String> {
-    if !valid_label(uuid) {
-        return Err("bad annotation uuid".into());
-    }
-    let world = art.world();
-    let sidecar = sidecar_path(art).ok_or("cannot determine the sidecar path")?;
-    let content = std::fs::read_to_string(&sidecar).unwrap_or_default();
-    let span = entry_span(&content, uuid)
-        .ok_or_else(|| format!("unknown annotation: {uuid}"))?;
-    let mut sidecar_content = content.clone();
-    sidecar_content.replace_range(span, "");
-
-    // Find the anchor label in the compiled project's files.
-    let needle_prefix = format!("<{uuid}.");
-    let hit = art.depended_files().iter().find_map(|&file| {
-        let source = world.source(file).ok()?;
-        let anchors = find_anchors(source.text(), uuid);
-        (!anchors.is_empty()).then(|| (file, anchors))
-    });
-    let (file, anchors) = hit.ok_or_else(|| {
-        format!("no anchor {needle_prefix}..> found in any source file")
-    })?;
-    let (at, _, needle) = anchors.first().cloned().unwrap();
-    let source = world.source(file).map_err(|e| e.to_string())?;
-    let path = world.path_for_id(file).map_err(|e| e.to_string())?;
-    let path = path.to_err().map_err(|e| e.to_string())?;
-    let uri = Url::from_file_path(&path).map_err(|_| "bad file path".to_string())?;
-    let start = to_lsp_position(at, encoding, &source);
-    let end = to_lsp_position(at + needle.len(), encoding, &source);
-
-    // Remove every anchor of this annotation (a span has two), last first
-    // so earlier offsets stay valid.
-    let mut stripped = source.text().to_owned();
-    for (off, _, label) in anchors.iter().rev() {
-        stripped.replace_range(*off..*off + label.len(), "");
-    }
-    let (mut disk_content, buffer_edit) =
-        disk_edit(&path, source.text(), at..at + needle.len(), "");
-    if anchors.len() > 1 {
-        // The single-range disk patch cannot express two removals.
-        disk_content = match std::fs::read_to_string(&path) {
-            Ok(disk) if disk == source.text() => Some(stripped),
-            _ => None,
-        };
-    }
-    Ok(AnnotationEdit {
-        uuid: uuid.to_owned(),
-        uri,
-        disk_content,
-        buffer_edit,
-        path: path.to_path_buf(),
-        range: lsp_types::Range::new(as_lsp(start), as_lsp(end)),
-        new_text: String::new(),
-        sidecar,
-        sidecar_content,
-    })
-}
-
-/// Removes one entry from the sidecar, returning (path, new content).
-///
-/// The document half is not touched: this is for a rewrite that already took
-/// the anchor out with the text it replaced.
-pub fn remove_record(
-    art: &LspCompiledArtifact,
-    uuid: &str,
-) -> Result<(PathBuf, String), String> {
-    if !valid_label(uuid) {
-        return Err("bad annotation uuid".into());
-    }
-    let sidecar = sidecar_path(art).ok_or("cannot determine the sidecar path")?;
-    let content = std::fs::read_to_string(&sidecar).unwrap_or_default();
-    let span = entry_span(&content, uuid).ok_or_else(|| format!("unknown annotation: {uuid}"))?;
-    let mut out = content;
-    out.replace_range(span, "");
-    Ok((sidecar, out))
-}
-
-/// Rewrites one entry of the sidecar in place via a modification of its
-/// parsed record, returning (sidecar path, new content).
-pub fn modify_record(
-    art: &LspCompiledArtifact,
-    uuid: &str,
-    modify: impl FnOnce(&mut AnnotationRecord),
-) -> Result<(PathBuf, String), String> {
-    if !valid_label(uuid) {
-        return Err("bad annotation uuid".into());
-    }
-    let sidecar = sidecar_path(art).ok_or("cannot determine the sidecar path")?;
-    let content = std::fs::read_to_string(&sidecar)
-        .map_err(|e| format!("failed to read {}: {e}", sidecar.display()))?;
-    let records = parse_records(&content);
-    let mut record = records
-        .into_iter()
-        .find(|record| record.uuid == uuid)
-        .ok_or_else(|| format!("unknown annotation: {uuid}"))?;
-    let span = entry_span(&content, uuid)
-        .ok_or_else(|| format!("cannot locate the entry of {uuid} in the sidecar"))?;
-    modify(&mut record);
-    // Every write is a change, and the entry says when it last changed: the
-    // callers each have their own reason to write, and none of them should have
-    // to remember this one.
-    record.mtime = iso_now();
-    let mut new_content = content.clone();
-    new_content.replace_range(span, &format_record(&record));
-    Ok((sidecar, new_content))
-}
-
-/// Appends a discussion reply to an annotation.
-pub fn prepare_reply(
-    art: &LspCompiledArtifact,
-    uuid: &str,
-    text: &str,
-    author: Option<&str>,
-) -> Result<(PathBuf, String), String> {
-    modify_record(art, uuid, |record| {
-        record.discussion.push(AnnotationReply {
-            author: author_or_local(author),
-            time: iso_now(),
-            content: text.to_owned(),
-        });
-    })
-}
-
-/// The hash of the last capture an annotation recorded, if it has any.
-///
-/// Read before storing a new one: a compile that changed nothing about a
-/// drawing should leave the sidecar alone, and comparing hashes is how that is
-/// known without writing anything.
-pub fn last_capture(art: &LspCompiledArtifact, uuid: &str) -> Option<String> {
-    let sidecar = sidecar_path(art)?;
-    let (records, _) = read_sidecar(&sidecar);
-    let record = records.into_iter().find(|record| record.uuid == uuid)?;
-    record.captures.last().map(|capture| capture.hash.clone())
-}
-
-/// Appends a capture to an annotation, written to the sidecar.
-pub fn add_capture(
-    art: &LspCompiledArtifact,
-    uuid: &str,
-    capture: &AnnotationCapture,
-) -> Result<(), String> {
-    commit_sidecar(art, || {
-        let (path, content) = modify_record(art, uuid, |record| {
-            record.captures.push(capture.clone());
-        })?;
-        Ok((path, content, ()))
-    })
-}
-
-/// Sets an annotation's flags. Either can be left alone.
-pub fn prepare_flags(
-    art: &LspCompiledArtifact,
-    uuid: &str,
-    claimed: Option<bool>,
-    resolved: Option<bool>,
-) -> Result<(PathBuf, String), String> {
-    if claimed.is_none() && resolved.is_none() {
-        return Err("nothing to set: pass claimed, resolved, or both".into());
-    }
-    modify_record(art, uuid, |record| {
-        if let Some(claimed) = claimed {
-            record.claimed = claimed;
-        }
-        if let Some(resolved) = resolved {
-            record.resolved = resolved;
-        }
-    })
-}
-
-fn as_lsp(pos: LspPosition) -> lsp_types::Position {
-    lsp_types::Position::new(pos.line, pos.character)
-}
 
 #[cfg(test)]
 mod anchor_tests {
-    use super::{block_range, snap_past_marker};
+    use super::block_range;
 
     /// The source of the block an anchor names, which is what an agent is
     /// handed and what it rewrites.
@@ -1540,7 +377,7 @@ pub struct SourceBlock {
     pub heading_path: Vec<String>,
     /// Every annotation anchored inside this block, with the offset of its
     /// anchor *within the block* — what a rewrite has to carry across.
-    pub anchors: Vec<BlockAnchor>,
+    pub anchors: Vec<Anchor>,
     /// The blocks either side, when asked for.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub before: Option<String>,
@@ -1549,18 +386,20 @@ pub struct SourceBlock {
     pub after: Option<String>,
 }
 
-/// One annotation's anchor, as it sits inside a block.
+/// An anchor as it sits inside a block.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct BlockAnchor {
-    /// The annotation this anchor belongs to.
-    pub uuid: String,
-    /// The anchor's scope, as its label spells it.
-    pub scope: String,
+pub struct Anchor {
+    /// The label, as an annotation's location refers to it: `anno.A100`.
+    #[serde(rename = "ref")]
+    pub reference: String,
     /// Where the label starts, relative to the block.
     pub at: usize,
     /// The label itself, so a rewrite can put it back verbatim.
     pub label: String,
+    /// The annotations that point at this anchor. Several may: an element
+    /// carries one label, and two remarks about the same word share it.
+    pub annotations: Vec<String>,
 }
 
 /// A digest of a block: the file it is in, where it starts, and what it says.
@@ -1610,7 +449,7 @@ fn block_range(source: &typst::syntax::Source, at: usize) -> std::ops::Range<usi
 /// anchors in it, and the rule that refuses a rewrite for dropping one has
 /// nothing to look at.
 fn with_trailing_anchors(text: &str, mut range: std::ops::Range<usize>) -> std::ops::Range<usize> {
-    let open = format!("<{ANCHOR_PREFIX}");
+    let open = format!("<{}", tinymist_annos::ANCHOR_PREFIX);
     while text[range.end..].starts_with(&open) {
         match text[range.end..].find('>') {
             Some(close) => range.end += close + 1,
@@ -1702,20 +541,31 @@ pub fn block_of(
     uuid: &str,
     context: bool,
 ) -> Result<SourceBlock, String> {
-    if !valid_label(uuid) {
-        return Err("bad annotation uuid".into());
-    }
     let world = art.world();
+    // Which anchor the annotation points at. A span has two; the block is the
+    // one the first end sits in.
+    let sidecar = sidecar_path(art).ok_or("cannot determine the sidecar path")?;
+    let record = read_sidecar(&sidecar)
+        .find(uuid)
+        .cloned()
+        .ok_or_else(|| format!("no annotation {uuid}"))?;
+    let label = record
+        .labels()
+        .first()
+        .map(|label| label.to_string())
+        .ok_or_else(|| format!("annotation {uuid} names no anchor"))?;
+    let id = tinymist_annos::anchor_id(&label).unwrap_or(&label).to_owned();
+
     // The document first, then whatever else the compile read: an anchor in an
     // included file belongs to that file, and is edited there.
-    let files = std::iter::once(doc_file(world)).chain(art.depended_files().iter().copied());
+    let files = std::iter::once(world.main()).chain(art.depended_files().iter().copied());
     let hit = files.into_iter().find_map(|file| {
         let source = world.source(file).ok()?;
-        let anchors = find_anchors(source.text(), uuid);
-        let (at, _, _) = anchors.first().cloned()?;
+        let found = anchor::find(&source, &id)?;
+        let at = found.at();
         Some((file, source, at))
     });
-    let (file, source, at) = hit.ok_or_else(|| format!("no anchor for {uuid}"))?;
+    let (file, source, at) = hit.ok_or_else(|| format!("no anchor {label} in the document"))?;
     let path = world
         .path_for_id(file)
         .map_err(|err| err.to_string())?
@@ -1727,27 +577,29 @@ pub fn block_of(
 
     // Every annotation anchored in this block, not only the one asked about: a
     // rewrite has to carry all of them, so it has to be told all of them.
-    let mut anchors = vec![];
-    let mut scan = range.start;
-    while let Some(rel) = source.text()[scan..range.end].find("<anno.") {
-        let start = scan + rel;
-        let Some(close) = source.text()[start..range.end].find('>') else {
-            break;
-        };
-        let label = source.text()[start..start + close + 1].to_owned();
-        let inner = &label["<anno.".len()..label.len() - 1];
-        if let Some((uuid, scope)) = inner.split_once('.') {
-            if Scope::from_suffix(scope).is_some() {
-                anchors.push(BlockAnchor {
-                    uuid: uuid.to_owned(),
-                    scope: scope.to_owned(),
-                    at: start - range.start,
-                    label,
-                });
+    // The labels inside the block, so that a rewrite can be checked against
+    // them. Which annotations each one belongs to is read from the sidecar: an
+    // anchor no longer says.
+    let records = sidecar_path(art)
+        .map(|path| read_sidecar(&path).annotations)
+        .unwrap_or_default();
+    let anchors: Vec<Anchor> = anchor::anchors_in(&source)
+        .into_iter()
+        .filter(|found| range.start <= found.at() && found.label.end <= range.end)
+        .map(|found| {
+            let reference = found.name();
+            Anchor {
+                at: found.at() - range.start,
+                label: source.text()[found.label.clone()].to_owned(),
+                annotations: records
+                    .iter()
+                    .filter(|rec| rec.labels().iter().any(|label| *label == reference))
+                    .map(|rec| rec.uuid.clone())
+                    .collect(),
+                reference,
             }
-        }
-        scan = start + close + 1;
-    }
+        })
+        .collect();
 
     let line_of = |offset: usize| source.text()[..offset].lines().count().max(1);
     let (before, after) = if context {
@@ -1853,10 +705,13 @@ pub fn prepare_block_replace(
         let at = scan + rel;
         let Some(close) = new_text[at..].find('>') else { break };
         let label = &new_text[at..at + close + 1];
-        let inner = &label["<anno.".len()..label.len() - 1];
-        let named = inner.split_once('.').map(|(uuid, _)| uuid).unwrap_or(inner);
-        if !block.anchors.iter().any(|anchor| anchor.uuid == named) {
-            return Err(format!("{label} is not an anchor this block had"));
+        // Labels of the rewriter's own are fine; anchors it invented are not,
+        // since nothing would point at them.
+        if !block.anchors.iter().any(|anchor| anchor.label == label) {
+            return Err(format!(
+                "{label} is not an anchor this block had. Labels of your own are fine; \
+                 anchors must be the ones you were given."
+            ));
         }
         scan = at + close + 1;
     }
@@ -1886,7 +741,12 @@ pub fn prepare_block_replace(
             }
         }
         AnchorPolicy::Drop => {
-            dropped = missing.iter().map(|anchor| anchor.uuid.clone()).collect();
+            // The labels the rewrite left out, so that whatever pointed at
+            // them can be removed with them.
+            dropped = missing
+                .iter()
+                .map(|anchor| anchor.reference.clone())
+                .collect();
         }
         AnchorPolicy::Keep => {}
     }
@@ -1936,18 +796,6 @@ impl DiskAnnotationServer {
         }
     }
 
-    /// Applies the document half of an annotation edit (the sidecar half
-    /// goes through [`commit_sidecar`]).
-    fn apply_doc(&self, edit: &AnnotationEdit) -> Result<(), String> {
-        let content = edit
-            .disk_content
-            .as_ref()
-            .ok_or("cannot apply the edit: the file has diverged on disk")?;
-        std::fs::write(&edit.path, content)
-            .map_err(|e| format!("failed to write {}: {e}", edit.path.display()))?;
-        self.push_pins();
-        Ok(())
-    }
 
     /// One event, as one line of JSON on stdout — where a driving agent reads
     /// them, unlike the server's own narration, which goes to stderr.
@@ -1971,57 +819,146 @@ impl DiskAnnotationServer {
     }
 }
 
+impl DiskAnnotationServer {
+    /// The document, its sidecar, and the rendering a request refers to.
+    fn context(&self, render: &str) -> Result<(PathBuf, PathBuf, tinymist_annos::StoredRender), String> {
+        let art = self.art()?;
+        let document = document_path(&art).ok_or("cannot determine the document path")?;
+        let sidecar = tinymist_annos::sidecar_path(&document);
+        let stored = super::renders::get(&document, render)
+            .ok_or("that rendering is no longer held; reload the page and try again")?;
+        Ok((document, sidecar, stored))
+    }
+}
+
 impl crate::tool::serve::AnnotationServer for DiskAnnotationServer {
     fn annotate(&self, req: AnnotateRequest) -> Result<String, String> {
-        let art = self.art()?;
-        let edit = commit_sidecar(&art, || {
-            let edit = prepare_annotate(
-                &art,
-                &req,
-                tinymist_query::PositionEncoding::Utf16,
-            )?;
-            Ok((edit.sidecar.clone(), edit.sidecar_content.clone(), edit))
-        })?;
-        self.apply_doc(&edit)?;
-        let record = parse_records(&edit.sidecar_content)
-            .into_iter()
-            .find(|rec| rec.uuid == edit.uuid);
-        if let Some(record) = record {
-            self.emit(
-                "annotation_added",
-                &[("value", serde_json::to_value(&record).unwrap_or_default())],
-            );
+        let (document, sidecar_path, stored) = self.context(&req.render)?;
+        let text = std::fs::read_to_string(&document)
+            .map_err(|err| format!("cannot read {}: {err}", document.display()))?;
+        let source = typst::syntax::Source::detached(text.clone());
+
+        // Where it points, in the document as it stands: the rendering the page
+        // was looking at may be older than the file.
+        let ctx = tinymist_annos::resolve::Context {
+            map: &stored.map,
+            was: &stored.text,
+            source: &source,
+            seed: self.compile_revision(),
+        };
+        let resolution = tinymist_annos::resolve::resolve(&ctx, &req.location)
+            .map_err(|err| describe(&err))?;
+
+        // The anchor goes into the document, if the place did not have one.
+        let written = anchor::apply(&text, &resolution.edits);
+        if !resolution.edits.is_empty() {
+            std::fs::write(&document, &written)
+                .map_err(|err| format!("cannot write {}: {err}", document.display()))?;
         }
-        Ok(edit.uuid)
+
+        let now = tinymist_project::iso_now();
+        let uuid = fresh_uuid(&req.text);
+        let record = Annotation {
+            uuid: uuid.clone(),
+            letter: String::new(),
+            location: resolution.location,
+            snapshot: req.snapshot.clone(),
+            kind: req.kind.clone().unwrap_or_else(|| "comment".to_owned()),
+            color: req.color.clone().unwrap_or_default(),
+            author: author_or_local(req.author.as_deref()),
+            time: now.clone(),
+            mtime: now,
+            claimed: false,
+            resolved: false,
+            content: req.text.clone(),
+            discussion: vec![],
+            captures: vec![],
+        };
+        let record = revise(&sidecar_path, |sidecar| {
+            // The letter is the server's to give: two pages composing at once
+            // would otherwise both think they are `c`.
+            let mut record = record;
+            record.letter = sidecar.next_letter();
+            sidecar.put(record.clone());
+            Ok(record)
+        })?;
+
+        self.push_pins();
+        self.emit(
+            "annotation_added",
+            &[("value", serde_json::to_value(&record).unwrap_or_default())],
+        );
+        Ok(uuid)
     }
 
     fn remove(&self, uuid: &str) -> Result<(), String> {
         let art = self.art()?;
-        let edit = commit_sidecar(&art, || {
-            let edit = prepare_delete(
-                &art,
-                uuid,
-                tinymist_query::PositionEncoding::Utf16,
-            )?;
-            Ok((edit.sidecar.clone(), edit.sidecar_content.clone(), edit))
+        let document = document_path(&art).ok_or("cannot determine the document path")?;
+        let sidecar_path = tinymist_annos::sidecar_path(&document);
+
+        let orphaned = revise(&sidecar_path, |sidecar| {
+            let record = sidecar
+                .find(uuid)
+                .cloned()
+                .ok_or_else(|| format!("no annotation {uuid}"))?;
+            sidecar.remove(uuid);
+            // Anchors this annotation was the last user of.
+            let still_used = sidecar.labels_in_use();
+            Ok(record
+                .labels()
+                .into_iter()
+                .filter(|label| !still_used.iter().any(|used| used == label))
+                .map(str::to_owned)
+                .collect::<Vec<_>>())
         })?;
-        self.apply_doc(&edit)?;
+
+        // An anchor nothing points at is removed from the document.
+        if !orphaned.is_empty() {
+            let text = std::fs::read_to_string(&document)
+                .map_err(|err| format!("cannot read {}: {err}", document.display()))?;
+            let source = typst::syntax::Source::detached(text.clone());
+            let mut cuts: Vec<std::ops::Range<usize>> = anchor::anchors_in(&source)
+                .into_iter()
+                .filter(|found| orphaned.iter().any(|label| *label == found.name()))
+                .map(|found| found.label)
+                .collect();
+            cuts.sort_by_key(|range| std::cmp::Reverse(range.start));
+            let mut written = text;
+            for range in cuts {
+                written.replace_range(range, "");
+            }
+            std::fs::write(&document, &written)
+                .map_err(|err| format!("cannot write {}: {err}", document.display()))?;
+        }
+
+        self.push_pins();
         self.emit("annotation_deleted", &[("uuid", uuid.into())]);
         Ok(())
     }
 
     fn reply(&self, uuid: &str, text: &str, author: Option<&str>) -> Result<(), String> {
         let art = self.art()?;
-        commit_sidecar(&art, || {
-            let (path, content) = prepare_reply(&art, uuid, text, author)?;
-            Ok((path, content, ()))
+        let sidecar_path = sidecar_path(&art).ok_or("cannot determine the sidecar path")?;
+        let author = author_or_local(author);
+        let now = tinymist_project::iso_now();
+        revise(&sidecar_path, |sidecar| {
+            let record = sidecar
+                .find_mut(uuid)
+                .ok_or_else(|| format!("no annotation {uuid}"))?;
+            record.discussion.push(AnnotationReply {
+                author: author.clone(),
+                time: now.clone(),
+                content: text.to_owned(),
+            });
+            record.mtime = now.clone();
+            Ok(())
         })?;
         self.push_pins();
         self.emit(
             "discussion_extended",
             &[
                 ("uuid", uuid.into()),
-                ("author", local_author().into()),
+                ("author", author.into()),
                 ("text", text.into()),
             ],
         );
@@ -2035,19 +972,24 @@ impl crate::tool::serve::AnnotationServer for DiskAnnotationServer {
         resolved: Option<bool>,
     ) -> Result<(), String> {
         let art = self.art()?;
-        commit_sidecar(&art, || {
-            let (path, content) = prepare_flags(&art, uuid, claimed, resolved)?;
-            Ok((path, content, ()))
+        let sidecar_path = sidecar_path(&art).ok_or("cannot determine the sidecar path")?;
+        let now = tinymist_project::iso_now();
+        let (claimed, resolved) = revise(&sidecar_path, |sidecar| {
+            let record = sidecar
+                .find_mut(uuid)
+                .ok_or_else(|| format!("no annotation {uuid}"))?;
+            if let Some(claimed) = claimed {
+                record.claimed = claimed;
+            }
+            if let Some(resolved) = resolved {
+                record.resolved = resolved;
+            }
+            record.mtime = now.clone();
+            Ok((record.claimed, record.resolved))
         })?;
         self.push_pins();
         // Both flags, whichever moved: an agent reading the line wants the
-        // state of the annotation, not the diff that got it there.
-        let now = self
-            .records()
-            .ok()
-            .and_then(|records| records.into_iter().find(|record| record.uuid == uuid));
-        let claimed = now.as_ref().map(|rec| rec.claimed).unwrap_or(false);
-        let resolved = now.as_ref().map(|rec| rec.resolved).unwrap_or(false);
+        // state of the annotation, not the change that got it there.
         self.emit(
             "annotation_status_changed",
             &[
@@ -2058,7 +1000,6 @@ impl crate::tool::serve::AnnotationServer for DiskAnnotationServer {
         );
         Ok(())
     }
-
 
     fn block(&self, uuid: &str, context: bool) -> Result<SourceBlock, String> {
         block_of(&self.art()?, uuid, context)
@@ -2075,13 +1016,27 @@ impl crate::tool::serve::AnnotationServer for DiskAnnotationServer {
         let edit = prepare_block_replace(&art, uuid, block_id, new_text, policy)?;
         std::fs::write(&edit.path, &edit.content)
             .map_err(|err| format!("cannot write {}: {err}", edit.path.display()))?;
-        // The anchors the rewrite dropped were dropped on purpose, so their
-        // annotations go too — an entry with nothing to point at is litter.
-        for uuid in &edit.dropped {
-            // The anchor is already gone with the text; only the entry is left.
-            if let Ok((path, content)) = remove_record(&art, uuid) {
-                let _ = std::fs::write(path, content);
-            }
+        // The anchors the rewrite dropped were dropped on purpose, so every
+        // annotation that pointed at one goes too: a record with nothing to
+        // point at cannot be drawn or acted on.
+        if let Some(sidecar_path) = sidecar_path(&art) {
+            let _ = revise(&sidecar_path, |sidecar| {
+                let gone: Vec<String> = sidecar
+                    .annotations
+                    .iter()
+                    .filter(|record| {
+                        record
+                            .labels()
+                            .iter()
+                            .any(|label| edit.dropped.iter().any(|lost| lost == label))
+                    })
+                    .map(|record| record.uuid.clone())
+                    .collect();
+                for uuid in &gone {
+                    sidecar.remove(uuid);
+                }
+                Ok(())
+            });
         }
         self.emit(
             "block_replaced",
@@ -2115,9 +1070,8 @@ impl crate::tool::serve::AnnotationServer for DiskAnnotationServer {
 
     fn records(&self) -> Result<Vec<AnnotationRecord>, String> {
         let art = self.art()?;
-        let sidecar =
-            sidecar_path(&art).ok_or("cannot determine the sidecar path")?;
-        Ok(read_sidecar(&sidecar).0)
+        let sidecar = sidecar_path(&art).ok_or("cannot determine the sidecar path")?;
+        Ok(read_sidecar(&sidecar).annotations)
     }
 
     fn pins(&self) -> Vec<super::pins::HtmlPin> {
@@ -2129,4 +1083,24 @@ impl crate::tool::serve::AnnotationServer for DiskAnnotationServer {
 
 
 
+}
+
+/// A conversion failure, in words for whoever asked.
+fn describe(failure: &tinymist_annos::resolve::Failure) -> String {
+    use tinymist_annos::resolve::Failure;
+    match failure {
+        Failure::NoSuchNode(uid) => format!("the rendering has nothing called {uid}"),
+        Failure::WrongKind(uid) => format!("{uid} is not the kind of thing that can take that"),
+        Failure::NoSource(uid) => format!(
+            "{uid} is not part of this document: it was generated, or it came from a file that \
+             is not being annotated"
+        ),
+        Failure::Lost => {
+            "the text this pointed at has changed since the page was drawn".to_owned()
+        }
+        Failure::Unwritable => {
+            "an anchor cannot be written there: it is inside a string, a comment or raw text"
+                .to_owned()
+        }
+    }
 }

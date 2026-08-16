@@ -74,6 +74,13 @@ pub struct CompilerUniverse<F: CompilerFeat> {
     /// The virtual file system for the compiler.
     vfs: Vfs<F::AccessModel>,
 
+    /// A library to compile against instead of the standard one.
+    ///
+    /// Set when something has to be true of every compile in this universe that
+    /// the document does not say itself — the HTML shims, which are show rules
+    /// installed in front of a document rather than written into it.
+    library: Option<Arc<LazyHash<Library>>>,
+
     /// The current revision of the universe.
     ///
     /// The revision is incremented when the universe is mutated.
@@ -103,6 +110,7 @@ impl<F: CompilerFeat> CompilerUniverse<F> {
         Self {
             entry,
             inputs: inputs.unwrap_or_default(),
+            library: None,
             features,
 
             revision: NonZeroUsize::new(1).expect("initial revision is 1"),
@@ -179,13 +187,34 @@ impl<F: CompilerFeat> CompilerUniverse<F> {
         WorldComputeGraph::new(snap)
     }
 
+    /// Compiles everything in this universe against a library of the caller's
+    /// making, rather than the standard one.
+    ///
+    /// For rules that belong to how a document is being *shown* rather than to
+    /// what it says: the HTML shims are show rules in front of every document a
+    /// server renders, and writing them into the document — or into a wrapper
+    /// around it — would make them part of the thing being edited.
+    pub fn set_library(&mut self, library: Option<Arc<LazyHash<Library>>>) {
+        self.library = library;
+        self.increment_revision(|_| {});
+    }
+
+    /// The library this universe compiles against, if it is not the standard
+    /// one.
+    pub fn library(&self) -> Option<&Arc<LazyHash<Library>>> {
+        self.library.as_ref()
+    }
+
     /// Creates a new world from the universe with a given mutant.
     pub fn snapshot_with(&self, mutant: Option<TaskInputs>) -> CompilerWorld<F> {
         let w = CompilerWorld {
             entry: self.entry.clone(),
             features: self.features.clone(),
             inputs: self.inputs.clone(),
-            library: create_library(self.inputs.clone(), self.features.clone()),
+            library: self
+                .library
+                .clone()
+                .unwrap_or_else(|| create_library(self.inputs.clone(), self.features.clone())),
             font_resolver: self.font_resolver.clone(),
             registry: self.registry.clone(),
             vfs: self.vfs.snapshot(),

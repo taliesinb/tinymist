@@ -52,6 +52,7 @@ serde_json.workspace = true
 serde_yaml.workspace = true
 strum.workspace = true
 sync-ls = { workspace = true, features = ["lsp", "server"] }
+tinymist-annos.workspace = true
 tinymist-assets = { workspace = true }
 tinymist-debug = { workspace = true, optional = true }
 tinymist-l10n.workspace = true
@@ -74,6 +75,7 @@ typst-pdf.workspace = true
 typst-render.workspace = true
 typst-timing.workspace = true
 typst-html.workspace = true
+typst-eval.workspace = true
 typst-shim.workspace = true
 typst-ansi-hl.workspace = true
 typstfmt.workspace = true

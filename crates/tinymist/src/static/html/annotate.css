@@ -264,6 +264,24 @@ math {
   animation: tm-crawl-stroke 0.6s linear infinite;
 }
 
+/* A mark that has been sent and is waiting for the server travels at twice the
+   speed, so that "being written" and "being saved" are told apart without
+   another colour or shape. */
+/* Offline: the marks that travel stop where they are, and start again when the
+   server answers. Nothing else changes — what is on the page is still true, it
+   is just no longer being kept up to date. */
+html.tm-offline #tinymist-marks * {
+  animation-play-state: paused !important;
+}
+
+#tinymist-marks .tm-hurry,
+#tinymist-marks .tm-hurry.tm-crawl-h,
+#tinymist-marks .tm-hurry.tm-crawl-v,
+#tinymist-marks .tm-hurry.tm-crawl-stroke,
+#tinymist-marks .tm-hurry.tm-crawl-box {
+  animation-duration: 0.3s;
+}
+
 #tinymist-marks .tm-crawl-box {
   border: none;
   /* No halo while it travels: the dots leave gaps, and a halo shows through
@@ -352,7 +370,9 @@ math {
 #tinymist-annot-box {
   position: fixed;
   left: 12px;
-  bottom: 44px;
+  /* Just above whatever the status panel is saying, which grows from the
+     bottom of the window. */
+  bottom: calc(12px + var(--tm-status-height, 0px));
   width: 280px;
   border-radius: 8px;
   overflow: hidden;
@@ -372,7 +392,6 @@ math {
 #tinymist-annot-box .ta-acts {
   display: none;
   gap: 5px;
-  color: rgba(255, 255, 255, 0.92);
 }
 
 #tinymist-annot-box .ta-title:hover .ta-acts {
@@ -408,6 +427,22 @@ math {
 
 /* Compile errors and connection trouble, stated plainly rather than left to a
    blank page. */
+#tinymist-banner {
+  position: fixed;
+  bottom: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 2147483647;
+  padding: 5px 12px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in oklab, var(--tm-fg) 18%, transparent);
+  background: color-mix(in oklab, var(--tm-bg) 72%, transparent);
+  backdrop-filter: blur(6px);
+  color: color-mix(in oklab, var(--tm-fg) 78%, transparent);
+  font: 11px/1.4 system-ui, sans-serif;
+  pointer-events: none;
+}
+
 .tm-status {
   cursor: copy;
   position: fixed;
@@ -417,10 +452,10 @@ math {
   max-height: 40vh;
   overflow: auto;
   margin: 0;
-  padding: 10px 14px;
+  padding: 8px 14px;
   background: #2a1416;
-  color: #ffd7d7;
-  font: 12px/1.5 ui-monospace, monospace;
+  color: #e0b6b6;
+  font: 11px/1.45 ui-monospace, monospace;
   white-space: pre-wrap;
   z-index: 2147483646;
 }
@@ -443,38 +478,43 @@ math {
 
 /* The switch between the two, kept out of the way in the corner the annotation
    window opens above. */
-#tinymist-annotate-toggle {
+/* The page's own switches, in the corner: what is being shown, and whether the
+   page is pretending to be offline. Unframed, on the page's own background, so
+   they are there without being furniture. */
+#tinymist-toggles {
   position: fixed;
   left: 12px;
-  /* Above whatever the status panel is currently saying: it is anchored to the
-     bottom of the window and grows upwards, and a toggle sitting under it is a
-     toggle nobody can read or press. */
-  bottom: calc(12px + var(--tm-status-height, 0px));
+  top: 12px;
+  z-index: 2147483647;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  align-items: flex-start;
+}
+
+#tinymist-toggles .tm-toggle {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  z-index: 2147483647;
-  padding: 3px 9px;
-  border: 1px solid var(--tm-rule);
-  border-radius: 999px;
-  background: color-mix(in oklab, var(--tm-bg) 82%, var(--tm-fg));
+  padding: 2px 6px;
+  border: 0;
+  border-radius: 4px;
+  background: var(--tm-bg);
   color: var(--tm-fg);
   opacity: 0.55;
   font: 11px/1.4 system-ui, sans-serif;
   cursor: pointer;
 }
 
-#tinymist-annotate-toggle:hover {
+#tinymist-toggles .tm-toggle:hover {
   opacity: 1;
 }
 
-#tinymist-annotate-toggle[data-on] {
+#tinymist-toggles .tm-toggle[data-on] {
   opacity: 0.85;
 }
 
-/* A checkbox rather than a dot: this switches something on, and a box that
-   fills and takes a tick says so without a legend. */
-#tinymist-annotate-toggle .tm-check {
+#tinymist-toggles .tm-check {
   position: relative;
   width: 11px;
   height: 11px;
@@ -483,7 +523,7 @@ math {
   opacity: 0.7;
 }
 
-#tinymist-annotate-toggle[data-on] .tm-check {
+#tinymist-toggles [data-on] .tm-check {
   background: var(--tm-accent);
   border-color: var(--tm-accent);
   opacity: 1;
@@ -491,7 +531,7 @@ math {
 
 /* The tick: two sides of a box, turned. Drawn rather than typed, so it is the
    same mark in every browser and sits where it is put. */
-#tinymist-annotate-toggle[data-on] .tm-check::after {
+#tinymist-toggles [data-on] .tm-check::after {
   content: "";
   position: absolute;
   left: 3px;

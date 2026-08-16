@@ -8,4 +8,7 @@
 //! Paged rendering is `tinymist-preview`'s, driven over a websocket; this
 //! crate's part of it is the compile view in `tool/preview`. HTML is here.
 
+pub mod drawing;
 pub mod html;
+pub mod map;
+pub mod shims;

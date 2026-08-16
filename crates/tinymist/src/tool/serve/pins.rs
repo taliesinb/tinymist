@@ -12,20 +12,21 @@ use typst::World;
 
 use serde::Serialize;
 
-use crate::tool::render::html::{doc_file, framed_drawings, FramedDrawing};
+use crate::tool::render::html::{framed_drawings, FramedDrawing};
 
-use super::annotations::{
-    read_sidecar, sidecar_path, AnnotationRecord, Scope, find_anchors,
-};
-/// One annotation, as the HTML client needs it: everything the sidecar holds,
-/// plus where its anchors sit in the source. The client finds the element that
-/// covers that offset; the server does not need to know how it is drawn.
+use super::annotations::{read_sidecar, sidecar_path, AnnotationRecord};
+use tinymist_annos::location::HtmlLocation;
+
+/// One annotation, as the page needs it: what it says, and where to draw it.
+///
+/// The location is expressed against the rendering the page is showing, so the
+/// client never sees a byte offset into a `.typ` file.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HtmlPin {
-    /// The annotation kind.
+    /// The annotation kind: a comment, a question, a request.
     #[serde(rename = "type")]
-    pub rtype: String,
+    pub kind: String,
     /// The unique id.
     pub uuid: String,
     /// The display letter.
@@ -44,78 +45,47 @@ pub struct HtmlPin {
     pub mtime: String,
     /// The discussion thread.
     pub discussion: Vec<super::annotations::AnnotationReply>,
-    /// What the annotation refers to.
-    pub scope: String,
-    /// The colour it was made in, as `#rrggbb`, or empty when it predates the
-    /// field: the client falls back to its palette then.
+    /// The colour it was made in, as `#rrggbb`.
     pub color: String,
-    /// The byte offset of the anchor in the source.
-    pub start: usize,
-    /// The byte offset the annotation reaches to: the end anchor of a span, or
-    /// the start again for everything else.
-    pub end: usize,
+    /// Where to draw it, or nothing when its anchor is no longer in the
+    /// document.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub location: Option<HtmlLocation>,
+    /// What was there when the annotation was made, for saying what a lost
+    /// annotation was about.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<String>,
 }
 
-
-
-
-
-
-
-
-
-/// Every annotation with the source offsets of its anchors.
+/// Every annotation of a document, placed on the rendering a page is showing.
 pub fn html_pins(art: &LspCompiledArtifact) -> Vec<HtmlPin> {
     let Some(sidecar) = sidecar_path(art) else {
         return vec![];
     };
-    let (records, _) = read_sidecar(&sidecar);
+    let records = read_sidecar(&sidecar).annotations;
     if records.is_empty() {
         return vec![];
     }
     let world = art.world();
-    let Ok(source) = world.source(doc_file(world)) else {
+    let Ok(source) = world.source(world.main()) else {
         return vec![];
     };
-    let text = source.text();
-
-    records
-        .iter()
-        .filter_map(|rec| pin_for(rec, text))
-        .collect()
+    let Some(map) = super::renders::latest() else {
+        return vec![];
+    };
+    let text = source.text().to_owned();
+    let ctx = tinymist_annos::resolve::Context {
+        map: &map,
+        was: &text,
+        source: &source,
+        seed: 0,
+    };
+    records.iter().map(|rec| pin_for(rec, &ctx)).collect()
 }
 
-fn pin_for(rec: &AnnotationRecord, text: &str) -> Option<HtmlPin> {
-    let anchors = find_anchors(text, &rec.uuid);
-    let (at, scope, label) = anchors.first().cloned()?;
-    // A span's text lies *between* its two labels, so it starts past the first
-    // one: the label itself is not part of what was annotated, and a range that
-    // includes it reaches back into whatever came before.
-    let (start, end) = match scope {
-        Scope::Span => (
-            at + label.len(),
-            anchors
-                .iter()
-                .rev()
-                .find(|(off, _, l)| *off > at && l.ends_with(".end>"))
-                .map(|(off, _, _)| *off)
-                .unwrap_or(at + label.len()),
-        ),
-        // Inline content is found by the offset *past* it, which is where the
-        // text after it begins — and the label sits in between, so the anchor
-        // is past the label as well. Everything else is anchored at the label.
-        Scope::Inline => (at + label.len(), at + label.len()),
-        // A sentence is a range too, and only the source knows where it starts
-        // and ends: the browser sees a paragraph of text with no sentences in
-        // it. Sent as a range, and drawn like a span.
-        Scope::Sentence => {
-            let range = super::annotations::sentence_range(text, at);
-            (range.start, range.end)
-        }
-        _ => (at, at),
-    };
-    Some(HtmlPin {
-        rtype: rec.rtype.clone(),
+fn pin_for(rec: &AnnotationRecord, ctx: &tinymist_annos::resolve::Context) -> HtmlPin {
+    HtmlPin {
+        kind: rec.kind.clone(),
         uuid: rec.uuid.clone(),
         letter: rec.letter.clone(),
         author: rec.author.clone(),
@@ -123,24 +93,18 @@ fn pin_for(rec: &AnnotationRecord, text: &str) -> Option<HtmlPin> {
         time: rec.time.clone(),
         claimed: rec.claimed,
         resolved: rec.resolved,
-        mtime: rec.changed().to_owned(),
+        mtime: rec.mtime.clone(),
         discussion: rec.discussion.clone(),
-        scope: scope.as_str().into(),
         color: rec.color.clone(),
-        start,
-        end,
-    })
+        location: tinymist_annos::resolve::project(ctx, &rec.location).ok(),
+        snapshot: rec.snapshot.clone(),
+    }
 }
 
-
-
-
-
-
-/// The scopes that name a picture rather than text. Only these are captured:
+/// The locations that name a picture rather than text. Only these are captured:
 /// everything else is in the source already, where an agent can read it.
-fn graphical(scope: &str) -> bool {
-    matches!(scope, "svg" | "math.block")
+fn graphical(location: &tinymist_annos::TypstLocation) -> bool {
+    matches!(location.kind(), "svg" | "math.block")
 }
 
 /// The drawing an anchor names, if one of them is.
@@ -164,50 +128,71 @@ fn drawing_at(drawings: &[FramedDrawing], at: usize) -> Option<&FramedDrawing> {
 /// history of how the picture changed, not of how often the document was built.
 pub fn record_captures(art: &LspCompiledArtifact, body: &str) {
     use crate::tool::serve::capture;
-    let pins: Vec<_> = html_pins(art)
+    let Some(sidecar_path) = sidecar_path(art) else {
+        return;
+    };
+    let records: Vec<AnnotationRecord> = read_sidecar(&sidecar_path)
+        .annotations
         .into_iter()
-        .filter(|pin| graphical(&pin.scope))
+        .filter(|rec| graphical(&rec.location))
         .collect();
-    if pins.is_empty() {
+    if records.is_empty() {
         return;
     }
     let drawings = framed_drawings(body);
     if drawings.is_empty() {
         return;
     }
-    for pin in pins {
-        let Some(drawing) = drawing_at(&drawings, pin.start) else {
+    let world = art.world();
+    let Ok(source) = world.source(world.main()) else {
+        return;
+    };
+
+    for rec in records {
+        // Where the annotation's anchor sits, which is just after the drawing.
+        let Some(label) = rec.labels().first().map(|label| label.to_string()) else {
+            continue;
+        };
+        let id = tinymist_annos::anchor_id(&label).unwrap_or(&label);
+        let Some(anchor) = tinymist_annos::anchor::find(&source, id) else {
+            continue;
+        };
+        let Some(drawing) = drawing_at(&drawings, anchor.at()) else {
             continue;
         };
         // Stored first, and every time: the sidecar outlives the cache, so a
         // server that has just started is holding hashes for files it does not
         // have. Writing an unchanged drawing back under the hash it already has
-        // is what makes those readable again — and costs nothing when the file
+        // is what makes those readable again, and costs nothing when the file
         // is there.
         let Some(hash) = capture::store(drawing.svg.as_bytes(), "svg") else {
             continue;
         };
-        let seen = super::annotations::last_capture(art, &pin.uuid);
-        if seen.as_deref() == Some(hash.as_str()) {
+        if rec.captures.last().map(|last| last.hash.as_str()) == Some(hash.as_str()) {
             continue;
         }
         let (width, height) = capture::pixel_size(&drawing.svg).unwrap_or((0, 0));
         let entry = super::annotations::AnnotationCapture {
-            time: super::annotations::iso_now(),
+            time: tinymist_project::iso_now(),
             fmt: "svg".into(),
             hash,
             width,
             height,
             markup: None,
         };
-        if let Err(err) = super::annotations::add_capture(art, &pin.uuid, &entry) {
-            log::warn!("cannot record a capture of {}: {err}", pin.uuid);
+        let uuid = rec.uuid.clone();
+        let written = super::annotations::revise(&sidecar_path, |sidecar| {
+            let record = sidecar
+                .find_mut(&uuid)
+                .ok_or_else(|| format!("no annotation {uuid}"))?;
+            record.captures.push(entry.clone());
+            Ok(())
+        });
+        if let Err(err) = written {
+            log::warn!("cannot record a capture of {}: {err}", rec.uuid);
         }
     }
 }
-
-
-
 
 #[cfg(test)]
 mod capture_tests {

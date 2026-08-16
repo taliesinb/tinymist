@@ -1,0 +1,21 @@
+[package]
+name = "tinymist-annos"
+description = "Annotations on Typst documents: what they say, and where they point."
+categories = ["compilers"]
+keywords = ["language", "typst"]
+# group: annotations
+version = "0.15.0"
+authors.workspace = true
+license.workspace = true
+edition.workspace = true
+homepage.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+typst-syntax.workspace = true
+
+[lints]
+workspace = true

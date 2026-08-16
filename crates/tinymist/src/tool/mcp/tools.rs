@@ -365,7 +365,14 @@ async fn call_tool(site: &Arc<dyn DocumentSite>, name: &str, args: &Value) -> Re
             let records = annot.records()?;
             let annotations: Vec<Value> = records
                 .iter()
-                .filter(|rec| status.as_ref().is_none_or(|want| rec.status() == want))
+                .filter(|rec| {
+                    status.as_ref().is_none_or(|want| match want.as_str() {
+                        "resolved" => rec.resolved,
+                        "claimed" => rec.claimed && !rec.resolved,
+                        "open" => !rec.claimed && !rec.resolved,
+                        _ => true,
+                    })
+                })
                 .filter(|rec| author.as_ref().is_none_or(|want| &rec.author == want))
                 .map(|rec| record_json(rec, excerpt_of(&annot, &rec.uuid)))
                 .collect();

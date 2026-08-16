@@ -227,6 +227,7 @@ insta-cmd = "0.6.0"
 # Our Own Crates
 tinymist-assets = { version = "=0.15.4-rc1" }
 
+tinymist-annos = { path = "./crates/tinymist-annos/", version = "0.15.0" }
 tinymist-derive = { path = "./crates/tinymist-derive/", version = "0.15.0" }
 tinymist-l10n = { path = "./crates/tinymist-l10n/", version = "0.15.0" }
 tinymist-package = { path = "./crates/tinymist-package/", version = "0.15.0" }

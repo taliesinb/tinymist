@@ -47,6 +47,9 @@ pub enum RenderFormat {
     Html,
     /// The document alone, as the page fetches it, labelled with source ranges.
     Body,
+    /// The map that says what the rendering was made of: which stretch of
+    /// which file each part of it came from.
+    Map,
 }
 
 /// Renders a document and prints it.
@@ -74,7 +77,8 @@ pub fn render_main(args: RenderArgs) -> Result<()> {
     )
     .context_ut("cannot print diagnostics")?;
 
-    let document = html::html_document(&art).map_err(|err| error_once!("cannot render", err: err))?;
+    let (document, map) = html::html_document_with_map(&art)
+        .map_err(|err| error_once!("cannot render", err: err))?;
     let fragment = html::fragment(&document);
 
     if let Some(dir) = &args.captures {
@@ -127,6 +131,7 @@ pub fn render_main(args: RenderArgs) -> Result<()> {
                 )
         }
         RenderFormat::Body => fragment.body,
+        RenderFormat::Map => map.to_json(),
     };
 
     match &args.output {

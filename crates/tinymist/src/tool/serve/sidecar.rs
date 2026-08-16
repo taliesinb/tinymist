@@ -12,7 +12,8 @@
 
 use std::sync::Arc;
 
-use super::annotations::{dev_asset_in, AnnotationRecord, AnnotationServer};
+use super::annotations::{AnnotationRecord, AnnotationServer};
+use crate::tool::asset::dev_asset_in;
 
 /// The page shell, with `${...}` placeholders. Read from the source tree when
 /// there is one, so it can be edited without rebuilding.
@@ -150,8 +151,8 @@ fn card(rec: &AnnotationRecord, annot: &Arc<dyn AnnotationServer>) -> String {
         color = escape(&color),
         letter = escape(&rec.letter),
         uuid = escape(&rec.uuid),
-        rtype = escape(&rec.rtype),
-        scope = escape(&rec.scope),
+        rtype = escape(&rec.kind),
+        scope = escape(rec.location.kind()),
         author = escape(&rec.author),
         time = escape(&rec.time),
         changed = changed,
@@ -192,8 +193,8 @@ fn block_fields(block: &crate::tool::serve::SourceBlock) -> String {
                 row(
                     &format!("anchors[{index}]"),
                     escape(&format!(
-                        "{{uuid: {:?}, scope: {:?}, at: {}, label: {:?}}}",
-                        anchor.uuid, anchor.scope, anchor.at, anchor.label
+                        "{{ref: {:?}, at: {}, label: {:?}, annotations: {:?}}}",
+                        anchor.reference, anchor.at, anchor.label, anchor.annotations
                     )),
                 )
             })
