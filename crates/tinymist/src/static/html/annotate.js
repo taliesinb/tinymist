@@ -518,22 +518,67 @@
   // pointer is in the space between them and level with the column, so that
   // the margins stay empty.
   const GAP_REACH = 60;
-  // Where the caret for a position at one of a block's edges is drawn.
+  // The block on the other side of one of a block's edges, if there is one.
+  // Blocks are neighbours by how far apart they are vertically and nothing
+  // else: a narrow equation and a short heading do not overlap horizontally,
+  // and are still one after the other. Only blocks that are not inside another
+  // count: the space below the last paragraph of a callout is inside the
+  // callout, not between two blocks.
+  const neighbourBlock = (box, side) => {
+    let best = null;
+    for (const block of blocks) {
+      if (block.enclosed) continue;
+      const other = blockBox(block.el);
+      const away =
+        side === "bottom" ? other.top - box.bottom : box.top - other.bottom;
+      if (away < 0) continue;
+      if (!best || away < best.away) best = { box: other, away };
+    }
+    return best && best.box;
+  };
+
+  // Where the caret for a position at one of a block's edges is drawn: a stub
+  // of fixed length lying midway into the space beside the block, starting a
+  // little to the left of it. It pokes out into the margin the way the caret
+  // between two words pokes out above and below the line, so that it is read as
+  // a position rather than as a rule under whatever is above it. Its length has
+  // nothing to do with the blocks it lies between, which keeps it — and its
+  // hit box — cheap to work out.
+  const EDGE_OUT = 20;
+  const EDGE_RUN = 100;
   const edgeCaretBox = (box, side) => {
-    const at =
-      side === "bottom" ? box.bottom + EDGE_GAP : box.top - EDGE_GAP - EDGE_H;
-    const width = Math.min(EDGE_W, box.width);
+    const other = neighbourBlock(box, side);
+    const edge = side === "bottom" ? box.bottom : box.top;
+    const far = other
+      ? side === "bottom"
+        ? other.top
+        : other.bottom
+      : docEdge(side);
+    const middle = (edge + far) / 2;
+    const left = box.left - EDGE_OUT;
     return {
-      left: box.left,
-      right: box.left + width,
-      top: at,
-      bottom: at + EDGE_H,
-      width,
+      left,
+      right: left + EDGE_RUN,
+      top: middle - EDGE_H / 2,
+      bottom: middle + EDGE_H / 2,
+      width: EDGE_RUN,
       height: EDGE_H,
     };
   };
 
+  // Where the page's content ends, for a caret with no block on one side.
+  const docEdge = (side) => {
+    const doc = document.querySelector(".tm-doc");
+    const box = doc ? doc.getBoundingClientRect() : { top: 0, bottom: 0 };
+    return side === "bottom" ? box.bottom : box.top;
+  };
+
   const verticalGapAt = (x, y) => {
+    // Anywhere across the column counts, so that the gap under a heading is a
+    // gap for its whole width. Outside the column is margin, and empty.
+    const doc = document.getElementById(DOC_ID);
+    const column = doc && doc.getBoundingClientRect();
+    if (!column || x < column.left || x > column.right) return null;
     let above = null;
     let below = null;
     for (const block of blocks) {
@@ -541,7 +586,6 @@
       // space below the last paragraph of a callout is inside the callout.
       if (block.enclosed) continue;
       const box = blockBox(block.el);
-      if (x < box.left - 20 || x > box.right + 20) continue;
       if (box.bottom <= y && (!above || box.bottom > above.box.bottom)) {
         above = { block, box };
       }
@@ -1013,7 +1057,7 @@
       place(glyph, box.right + 4, box.top - 6);
       if (!dim) {
         const hit = mark(host, key + ":hit", "tm-hit");
-        place(hit, box.left, box.top - 5, box.width, 12);
+        place(hit, box.left - 20, box.top - 6, box.width + 40, 14);
         openFor(hit, pin);
       }
       return;
@@ -2032,7 +2076,7 @@
       const edge = verticalGapAt(ev.clientX, ev.clientY);
       return edge ? previewEdge(edge) : clearHover();
     }
-    const word = wordAround(caret.run, caret.at);
+    const word = wordUnder(caret, ev.clientX);
     if (word) {
       previewUnderline(charRects(word.run.uid, word.start, word.end), false);
       return;
@@ -2055,11 +2099,41 @@
   // The insertion point the pointer sits at: where a chevron would go, and the
   // source offset a point anchor would use (the end of the word to its left).
   const gapAt = (caret) => {
-    const text = caret.run.text;
-    let at = Math.min(caret.at, text.length);
-    while (at > 0 && /\s/.test(text[at - 1])) at -= 1;
-    if (at === 0) return null;
-    return { run: caret.run, at, box: gapBox(caret.run.node, at) };
+    let run = caret.run;
+    let at = Math.min(caret.at, run.text.length);
+    while (at > 0 && /\s/.test(run.text[at - 1])) at -= 1;
+    if (at === 0) {
+      // The space after an inline element belongs to the run that follows it,
+      // which has nothing to its left to anchor to. The word on the left is the
+      // end of the previous run.
+      const before = runBefore(run);
+      if (!before) return null;
+      run = before;
+      at = run.text.length;
+      while (at > 0 && /\s/.test(run.text[at - 1])) at -= 1;
+      if (at === 0) return null;
+    }
+    return { run, at, box: gapBox(run.node, at) };
+  };
+
+  /// The run before this one that has something in it.
+  const runBefore = (run) => {
+    const at = runs.indexOf(run);
+    for (let i = at - 1; i >= 0; i -= 1) {
+      if (runs[i].text && runs[i].text.trim()) return runs[i];
+    }
+    return null;
+  };
+
+  // The word under the pointer, which is not the same as the word the caret
+  // position falls in: a position in the space between two words resolves to
+  // whichever side is nearer, and the space itself is a place of its own.
+  const wordUnder = (caret, x) => {
+    const word = wordAround(caret.run, caret.at);
+    if (!word) return null;
+    const rects = charRects(word.run.uid, word.start, word.end);
+    const on = rects.some((r) => x >= r.left && x <= r.right);
+    return on ? word : null;
   };
 
   // The space a point annotation marks: between the word that ends here and
@@ -2209,7 +2283,7 @@
     }
     ev.preventDefault();
     ev.stopImmediatePropagation();
-    const word = wordAround(caret.run, caret.at);
+    const word = wordUnder(caret, ev.clientX);
     if (word) {
       compose("comment", wordLocation("word", word));
       return;

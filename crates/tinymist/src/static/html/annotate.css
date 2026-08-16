@@ -188,10 +188,10 @@ math {
 .tm-annotate .tm-doc,
 .tm-annotate .tm-doc * {
   /* A dot rather than the platform's crosshair, which is thick enough to hide
-     the text it is being aimed at: three bright pixels each way, ringed in a
-     darker red so that it stays visible on any background. Drawn as a 5x5 PNG
-     so the pixels are the pixels. */
-  cursor: url("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAUAAAAFCAYAAACNbyblAAAAGklEQVR42mPIY2D4j44ZQMR/DQ04JkMQHQMA4egrj3F9GDkAAAAASUVORK5CYII=") 2 2, crosshair;
+     the text it is being aimed at: a five-pixel cross in bright red, dilated by
+     one pixel of darker red so that it stays visible on any background. Drawn
+     as a 5x5 PNG so the pixels are the pixels. */
+  cursor: url("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAUAAAAFCAYAAACNbyblAAAAI0lEQVR42mNgAIIKBob/MMyALPBfQwMhAROAYbgghkpsZgIAH50i97zicgIAAAAASUVORK5CYII=") 2 2, crosshair;
 }
 
 /* A link is something to annotate, not to follow — but it still has to be
