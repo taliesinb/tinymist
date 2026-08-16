@@ -188,8 +188,15 @@ impl RenderMap {
     /// The reverse of [`NodeEntry::source_of`], used to draw an annotation: the
     /// sidecar says where in the document it points, and the page needs to know
     /// where that is in what it is showing.
+    ///
+    /// A position at the end of one run is also the position at the start of
+    /// the next, and an anchor is written after what it names, so the run that
+    /// ends there is the one meant. A label between a word and the space after
+    /// it would otherwise name the space.
     pub fn text_at(&self, file: FileIndex, offset: usize) -> Option<(&str, usize)> {
-        let mut best: Option<(&str, usize)> = None;
+        let mut ends: Option<(&str, usize)> = None;
+        let mut inside: Option<(&str, usize)> = None;
+        let mut begins: Option<(&str, usize)> = None;
         for (uid, node) in &self.nodes {
             for segment in &node.segments {
                 if segment.file != file {
@@ -198,18 +205,20 @@ impl RenderMap {
                 let Some(within) = offset.checked_sub(segment.offset) else {
                     continue;
                 };
-                if within <= segment.len {
-                    let candidate = (uid.as_str(), segment.at + within);
-                    // A position at the end of one run is also the start of the
-                    // next; the shorter reach wins, which keeps a position with
-                    // the run it is inside rather than the one it abuts.
-                    if within < segment.len || best.is_none() {
-                        best = Some(candidate);
-                    }
+                if within > segment.len {
+                    continue;
+                }
+                let candidate = (uid.as_str(), segment.at + within);
+                if within == segment.len && segment.len > 0 {
+                    ends = ends.or(Some(candidate));
+                } else if within == 0 {
+                    begins = begins.or(Some(candidate));
+                } else {
+                    inside = inside.or(Some(candidate));
                 }
             }
         }
-        best
+        inside.or(ends).or(begins)
     }
 
     /// The innermost node of the given kinds whose source range contains a

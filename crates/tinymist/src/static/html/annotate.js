@@ -400,6 +400,44 @@
     return end > beg ? { beg, end: Math.min(end, text.length) } : null;
   };
 
+  // The sentence around a position, across the runs it is spread over.
+  //
+  // An anchor written in the middle of a sentence ends the run it is in, so the
+  // sentence carries on in the runs after it. The block the run belongs to is
+  // the whole of what a sentence can cover.
+  const sentenceRects = (run, at) => {
+    const host = blockAround(run.el);
+    const parts = host ? runs.filter((other) => host.contains(other.el)) : [run];
+    let text = "";
+    const spans = [];
+    for (const other of parts) {
+      spans.push({ run: other, at: text.length });
+      text += other.text;
+    }
+    const base = spans.find((span) => span.run === run);
+    if (!base) return [];
+    const range = sentenceAround(text, base.at + at);
+    if (!range) return [];
+    const boxes = [];
+    for (const span of spans) {
+      const beg = Math.max(range.beg - span.at, 0);
+      const end = Math.min(range.end - span.at, span.run.text.length);
+      if (end > beg) boxes.push(...charRects(span.run.uid, beg, end));
+    }
+    return boxes;
+  };
+
+  // The block an element is in, if any.
+  const blockAround = (el) => {
+    let node = el;
+    while (node && node.id !== DOC_ID) {
+      const entry = byUid.get(uidOf(node));
+      if (entry && BLOCK_KINDS.includes(entry.kind)) return node;
+      node = node.parentElement;
+    }
+    return null;
+  };
+
   // The line a position is on, as the browser laid it out: the characters
   // whose boxes share its top edge.
   const lineAround = (run, at) => {
@@ -478,7 +516,9 @@
       range.setEnd(node, at);
       return range.getBoundingClientRect();
     };
-    const onLine = (box) => y >= box.top - 3 && y <= box.bottom + 3;
+    // A collapsed range at the very start or end of a node can measure as
+    // nothing at all, which says nothing about which line it is on.
+    const onLine = (box) => box.height === 0 || (y >= box.top - 3 && y <= box.bottom + 3);
     if (!onLine(lineAt(offset))) {
       if (offset > 0 && onLine(lineAt(offset - 1))) offset -= 1;
       else return null;
@@ -537,8 +577,9 @@
   const GAP_REACH = 60;
   // How far a position may be from the pointer and still be the one meant.
   const SNAP_REACH = 400;
-  // How far, though: a space three words away is not the space that was meant,
-  // and a gap two blocks down is not the gap that was meant.
+  // How far a gap between blocks may be from the pointer and still be the one
+  // meant. There is no such limit on a place in a line: inside a run of text
+  // every position is one of the spaces in it, and the nearest is the one.
   const SNAP_NEAR = 15;
   // Where the caret for a position at one of a block's edges is drawn: a stub
   // of fixed length lying half a margin beyond the edge and starting a little
@@ -828,7 +869,11 @@
         const ref = loc.ref;
         const run = runOf(ref.ref);
         if (!run) return null;
-        const range = kind === "sentence" ? sentenceAround(run.text, ref.end) : lineAround(run, ref.end);
+        if (kind === "sentence") {
+          const boxes = sentenceRects(run, ref.end);
+          return boxes.length ? { scope: kind, boxes } : null;
+        }
+        const range = lineAround(run, ref.end);
         if (!range) return null;
         const boxes = charRects(ref.ref, range.beg, range.end);
         return boxes.length ? { scope: kind, boxes } : null;
@@ -2192,8 +2237,7 @@
   };
 
   // The space between two words nearest the pointer on the line it is over:
-  // either side of the word it is nearest, whichever is nearer, and only if it
-  // is near enough to have been meant.
+  // either side of the word it is nearest, whichever is nearer.
   const snapPoint = (caret, x) => {
     const word = wordAround(caret.run, caret.at);
     const ends = word ? [word.start, word.end] : [caret.at];
@@ -2202,7 +2246,6 @@
       const spot = gapAt({ run: caret.run, at });
       if (!spot) continue;
       const away = Math.abs(x - (spot.box.left + spot.box.width / 2));
-      if (away > SNAP_NEAR) continue;
       if (!best || away < best.away) best = { spot, away };
     }
     return best && best.spot;
@@ -2247,11 +2290,22 @@
   };
 
   // Whether the pointer is inside the box of a run's text, line boxes and all.
+  //
+  // Strictly inside, vertically: two lines of a list item nearly touch, and the
+  // space between them has to be reachable or there would be no way to point
+  // between two items. Sideways it reaches a little past the text, so that the
+  // start of the first word and the end of the last are positions too.
+  const TEXT_INSET = 3;
+  const TEXT_SLACK = 20;
   const withinText = (node, x, y) => {
     const range = document.createRange();
     range.selectNodeContents(node);
     return Array.from(range.getClientRects()).some(
-      (r) => x >= r.left && x <= r.right && y >= r.top && y <= r.bottom,
+      (r) =>
+        x >= r.left - TEXT_SLACK &&
+        x <= r.right + TEXT_SLACK &&
+        y >= r.top + TEXT_INSET &&
+        y <= r.bottom - TEXT_INSET,
     );
   };
 

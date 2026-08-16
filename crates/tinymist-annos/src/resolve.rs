@@ -330,7 +330,7 @@ pub fn project(ctx: &Context, location: &TypstLocation) -> Result<HtmlLocation, 
         NodeKind::Image,
     ];
     let word_ref = |label: &str| -> Result<crate::location::HtmlWordRef, Failure> {
-        let (uid, at) = ctx.rendered_position(label)?;
+        let (uid, at) = ctx.rendered_word(label)?;
         // The label follows the word, so the word ends where the label begins.
         let (beg, w) = ctx.word_before(uid, at);
         Ok(crate::location::HtmlWordRef {
@@ -449,6 +449,26 @@ impl Context<'_> {
         let offset = self.anchor_offset(label)?;
         self.map
             .text_at(0, offset)
+            .ok_or_else(|| Failure::NoSource(label.to_owned()))
+    }
+
+    /// The run holding the word an anchor names.
+    ///
+    /// A label may be written with a space before it — `annotated <anno.X001>`
+    /// — and that space is a run of its own, one character long. The word is in
+    /// the run before it, so the whitespace is stepped back over before the run
+    /// is looked up.
+    fn rendered_word(&self, label: &str) -> Result<(&str, usize), Failure> {
+        let mut at = self.anchor_offset(label)?;
+        let text = self.source.text();
+        while let Some(prev) = text[..at].chars().next_back() {
+            if !prev.is_whitespace() {
+                break;
+            }
+            at -= prev.len_utf8();
+        }
+        self.map
+            .text_at(0, at)
             .ok_or_else(|| Failure::NoSource(label.to_owned()))
     }
 
