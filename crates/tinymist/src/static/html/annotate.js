@@ -537,6 +537,9 @@
   const GAP_REACH = 60;
   // How far a position may be from the pointer and still be the one meant.
   const SNAP_REACH = 400;
+  // How far, though: a space three words away is not the space that was meant,
+  // and a gap two blocks down is not the gap that was meant.
+  const SNAP_NEAR = 15;
   // Where the caret for a position at one of a block's edges is drawn: a stub
   // of fixed length lying half a margin beyond the edge and starting a little
   // to the left of the block. It pokes out into the margin the way the caret
@@ -547,7 +550,6 @@
   // block: two blocks with equal margins put their carets in the same place,
   // so the one gap between them shows one caret however it is referred to.
   const EDGE_OUT = 20;
-  const EDGE_RUN = 100;
   const edgeCaretBox = (box, side, el) => {
     // The element's own edge rather than the edge of its ink: two blocks with
     // equal margins are then the same distance from the caret between them,
@@ -556,15 +558,36 @@
     const edge = side === "bottom" ? own.bottom : own.top;
     const out = edgeMargin(el, side) / 2;
     const middle = side === "bottom" ? edge + out : edge - out;
-    const left = box.left - EDGE_OUT;
+    // As wide as the two blocks it lies between together, and a little wider
+    // than that at each end so that it sticks out into the margin.
+    const other = neighbourBlock(el, side);
+    const left = Math.min(box.left, other ? other.left : box.left) - EDGE_OUT;
+    const right = Math.max(box.right, other ? other.right : box.right) + EDGE_OUT;
     return {
       left,
-      right: left + EDGE_RUN,
+      right,
       top: middle - EDGE_H / 2,
       bottom: middle + EDGE_H / 2,
-      width: EDGE_RUN,
+      width: right - left,
       height: EDGE_H,
     };
+  };
+
+  // The block on the other side of one of a block's edges, if there is one.
+  // Blocks are neighbours by how far apart they are vertically and nothing
+  // else: a narrow equation and a short heading do not overlap horizontally and
+  // are still one after the other.
+  const neighbourBlock = (el, side) => {
+    const own = blockRect(el);
+    let best = null;
+    for (const block of blocks) {
+      if (block.enclosed || block.el === el) continue;
+      const rect = blockRect(block.el);
+      const away = side === "bottom" ? rect.top - own.bottom : own.top - rect.bottom;
+      if (away < 0) continue;
+      if (!best || away < best.away) best = { el: block.el, away };
+    }
+    return best && blockBox(best.el);
   };
 
   // The margin an element keeps on one side. The exporter puts a heading's
@@ -2154,17 +2177,24 @@
   // Text wins wherever there is text, so that a position on a line is never
   // taken to be a position between blocks that happens to be nearer in pixels.
   const positionAt = (x, y) => {
-    const gap = snapPoint(x, y);
-    if (gap) return { gap };
+    const caret = caretAt(x, y);
+    // Over the text, the pointer means a place on the line and nothing else:
+    // falling through to the space between blocks would put a caret there for
+    // a click that was aimed at a line.
+    if (caret && withinText(caret.run.node, x, y)) {
+      const gap = snapPoint(caret, x);
+      return gap ? { gap } : null;
+    }
     const edge = verticalGapAt(x, y, SNAP_REACH);
-    return edge ? { edge } : null;
+    if (!edge) return null;
+    const away = Math.abs(y - (edge.box.top + EDGE_H / 2));
+    return away <= SNAP_NEAR ? { edge } : null;
   };
 
   // The space between two words nearest the pointer on the line it is over:
-  // either side of the word it is nearest, whichever is nearer.
-  const snapPoint = (x, y) => {
-    const caret = caretAt(x, y);
-    if (!caret) return null;
+  // either side of the word it is nearest, whichever is nearer, and only if it
+  // is near enough to have been meant.
+  const snapPoint = (caret, x) => {
     const word = wordAround(caret.run, caret.at);
     const ends = word ? [word.start, word.end] : [caret.at];
     let best = null;
@@ -2172,6 +2202,7 @@
       const spot = gapAt({ run: caret.run, at });
       if (!spot) continue;
       const away = Math.abs(x - (spot.box.left + spot.box.width / 2));
+      if (away > SNAP_NEAR) continue;
       if (!best || away < best.away) best = { spot, away };
     }
     return best && best.spot;
@@ -2213,6 +2244,15 @@
       if (runs[i].text && runs[i].text.trim()) return runs[i];
     }
     return null;
+  };
+
+  // Whether the pointer is inside the box of a run's text, line boxes and all.
+  const withinText = (node, x, y) => {
+    const range = document.createRange();
+    range.selectNodeContents(node);
+    return Array.from(range.getClientRects()).some(
+      (r) => x >= r.left && x <= r.right && y >= r.top && y <= r.bottom,
+    );
   };
 
   // The space a point annotation marks: between the word that ends here and
