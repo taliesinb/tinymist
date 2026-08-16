@@ -187,11 +187,11 @@ math {
    opens the one that is already there". Nothing says "type". */
 .tm-annotate .tm-doc,
 .tm-annotate .tm-doc * {
-  cursor: crosshair;
-  /* Dragging means "annotate this span" here, and the browser's own selection
-     highlight fighting the mark underneath it helps nobody. */
-  user-select: none;
-  -webkit-user-select: none;
+  /* A dot rather than the platform's crosshair, which is thick enough to hide
+     the text it is being aimed at: three bright pixels each way, ringed in a
+     darker red so that it stays visible on any background. Drawn as a 5x5 PNG
+     so the pixels are the pixels. */
+  cursor: url("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAUAAAAFCAYAAACNbyblAAAAGklEQVR42mPIY2D4j44ZQMR/DQ04JkMQHQMA4egrj3F9GDkAAAAASUVORK5CYII=") 2 2, crosshair;
 }
 
 /* A link is something to annotate, not to follow — but it still has to be

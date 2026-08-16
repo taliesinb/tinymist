@@ -513,6 +513,54 @@
     return taken && taken.size ? null : entry;
   };
 
+  // The gap between two blocks, which is a place in its own right: something
+  // belongs here, this paragraph should follow that one. Offered only when the
+  // pointer is in the space between them and level with the column, so that
+  // the margins stay empty.
+  const GAP_REACH = 60;
+  // Where the caret for a position at one of a block's edges is drawn.
+  const edgeCaretBox = (box, side) => {
+    const at =
+      side === "bottom" ? box.bottom + EDGE_GAP : box.top - EDGE_GAP - EDGE_H;
+    const width = Math.min(EDGE_W, box.width);
+    return {
+      left: box.left,
+      right: box.left + width,
+      top: at,
+      bottom: at + EDGE_H,
+      width,
+      height: EDGE_H,
+    };
+  };
+
+  const verticalGapAt = (x, y) => {
+    let above = null;
+    let below = null;
+    for (const block of blocks) {
+      // A block inside another does not make a gap with its neighbours: the
+      // space below the last paragraph of a callout is inside the callout.
+      if (block.enclosed) continue;
+      const box = blockBox(block.el);
+      if (x < box.left - 20 || x > box.right + 20) continue;
+      if (box.bottom <= y && (!above || box.bottom > above.box.bottom)) {
+        above = { block, box };
+      }
+      if (box.top >= y && (!below || box.top < below.box.top)) {
+        below = { block, box };
+      }
+    }
+    if (!above && !below) return null;
+    // Whichever edge is nearer, since both name the same place.
+    const gapAbove = above ? y - above.box.bottom : Infinity;
+    const gapBelow = below ? below.box.top - y : Infinity;
+    if (Math.min(gapAbove, gapBelow) > GAP_REACH) return null;
+    const nearer = gapAbove <= gapBelow ? above : below;
+    const side = nearer === above ? "bottom" : "top";
+    const taken = takenBlocks.get(nearer.block.el);
+    if (taken && taken.has("pos.v")) return null;
+    return { block: nearer.block, side, box: edgeCaretBox(nearer.box, side) };
+  };
+
   // How much text is kept either side of a position, to recognise the place
   // again if the document has moved on by the time it is submitted.
   const CONTEXT = 8;
@@ -667,18 +715,12 @@
       case "span.v": {
         const el = elementOf(kind === "pos.v" ? loc.ref : loc.begin);
         if (!el) return null;
-        const box = el.getBoundingClientRect();
-        const side = (kind === "pos.v" ? loc.ref.side : loc.begin.side) === "top";
-        const at = side ? box.top : box.bottom;
-        const edge = {
-          left: box.left,
-          right: box.right,
-          top: at,
-          bottom: at + 1,
-          width: box.width,
-          height: 1,
-        };
-        return { scope: "point", boxes: [edge], caret: edge };
+        // The ink rather than the border box, as a region mark uses: a block is
+        // as wide as the column whatever is in it.
+        const box = blockBox(el);
+        const side = kind === "pos.v" ? loc.ref.side : loc.begin.side;
+        const edge = edgeCaretBox(box, side === "top" ? "top" : "bottom");
+        return { scope: "edge", boxes: [edge], caret: edge, el };
       }
       case "math":
       case "link":
@@ -958,6 +1000,24 @@
       }
       return;
     }
+    if (scope === "edge") {
+      const el = mark(host, key + ":edge-caret", "tm-mark tm-over");
+      el.style.opacity = opacity;
+      const box = boxes[0];
+      drawEdgeCaret(el, plain, box, dim);
+      if (state === "pending") el.classList.add("tm-hurry");
+      place(el, box.left, box.top, box.width, EDGE_H);
+      const glyph = mark(host, key + ":letter", "tm-glyph tm-over");
+      glyph.style.opacity = opacity;
+      drawLetter(glyph, pin);
+      place(glyph, box.right + 4, box.top - 6);
+      if (!dim) {
+        const hit = mark(host, key + ":hit", "tm-hit");
+        place(hit, box.left, box.top - 5, box.width, 12);
+        openFor(hit, pin);
+      }
+      return;
+    }
     if (scope === "point") {
       const el = mark(host, key + ":point", "tm-mark tm-over");
       el.style.opacity = opacity;
@@ -1112,6 +1172,27 @@
   // mark on a word. One that has not been made yet travels, like every other
   // provisional mark.
   const CARET_W = 2;
+  const EDGE_H = 2;
+  // As long as the vertical caret is tall, and set off from the block's edge so
+  // that it is read as lying between two blocks rather than underlining one.
+  const EDGE_W = 34;
+  const EDGE_GAP = 3;
+
+  // The same caret, lying down: a line along a block's edge for a position
+  // between blocks.
+  const drawEdgeCaret = (el, color, box, crawling) => {
+    el.__w = box.width;
+    el.__h = EDGE_H;
+    el.innerHTML = "";
+    el.style.borderRadius = "1px";
+    el.classList.remove("tm-crawl-h");
+    if (crawling) {
+      crawlLine(el, color, false);
+    } else {
+      el.style.background = color;
+      el.style.boxShadow = `0 0 0 1.5px ${darkTint(color)}`;
+    }
+  };
   const caretHeight = (box) => Math.max(Math.round((box.height || 16) * 1.8), 20);
   const drawCaret = (el, color, box, crawling) => {
     const h = caretHeight(box);
@@ -1771,7 +1852,7 @@
       }
       closeBox(true);
     };
-    const parts = shell(letter, `draft ${kind}`, [
+    const parts = shell(letter, `draft ${existing && existing.kind ? existing.kind : "comment"}`, [
       ["save", () => submit(document.querySelector(`#${BOX_ID} textarea`))],
       ["cancel", () => closeBox()],
     ]);
@@ -1945,7 +2026,12 @@
       return previewUnderline(mergeLines(Array.from(atom.el.getClientRects())), false);
     }
     const caret = caretAt(ev.clientX, ev.clientY);
-    if (!caret) return clearHover();
+    if (!caret) {
+      // Nothing under the pointer: the space between two blocks is still a
+      // place, and it is what is left.
+      const edge = verticalGapAt(ev.clientX, ev.clientY);
+      return edge ? previewEdge(edge) : clearHover();
+    }
     const word = wordAround(caret.run, caret.at);
     if (word) {
       previewUnderline(charRects(word.run.uid, word.start, word.end), false);
@@ -1955,6 +2041,15 @@
     const gap = gapAt(caret);
     if (!gap) return clearHover();
     previewPoint(gap.box);
+  };
+
+  // A caret lying along a block's edge, for the space between two blocks.
+  const previewEdge = (gap) => {
+    clearHover();
+    const host = marksHost();
+    const el = hoverMark(host, "tm-mark");
+    drawEdgeCaret(el, nextColor(), gap.box, true);
+    place(el, gap.box.left, gap.box.top, gap.box.width, EDGE_H);
   };
 
   // The insertion point the pointer sits at: where a chevron would go, and the
@@ -2101,7 +2196,17 @@
       return;
     }
     const caret = caretAt(ev.clientX, ev.clientY);
-    if (!caret) return;
+    if (!caret) {
+      const edge = verticalGapAt(ev.clientX, ev.clientY);
+      if (!edge) return;
+      ev.preventDefault();
+      ev.stopImmediatePropagation();
+      compose("position", {
+        type: "pos.v",
+        ref: { type: "node_cursor", ref: edge.block.uid, side: edge.side },
+      });
+      return;
+    }
     ev.preventDefault();
     ev.stopImmediatePropagation();
     const word = wordAround(caret.run, caret.at);
