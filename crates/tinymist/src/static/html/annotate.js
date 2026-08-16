@@ -231,6 +231,7 @@
   };
 
   const indexDocument = () => {
+    forget();
     runs = [];
     atoms = [];
     blocks = [];
@@ -466,6 +467,22 @@
       }
     }
     if (!node || node.nodeType !== Node.TEXT_NODE) return null;
+    // A position at the end of a wrapped line is also the position at the start
+    // of the next one, and that is the one reported. The pointer is on the line
+    // it is on, so a position on another line steps back to the end of this
+    // one; the word it names is then the last word of this line and not the
+    // first word of the next.
+    const lineAt = (at) => {
+      const range = document.createRange();
+      range.setStart(node, at);
+      range.setEnd(node, at);
+      return range.getBoundingClientRect();
+    };
+    const onLine = (box) => y >= box.top - 3 && y <= box.bottom + 3;
+    if (!onLine(lineAt(offset))) {
+      if (offset > 0 && onLine(lineAt(offset - 1))) offset -= 1;
+      else return null;
+    }
     // Nearest is still not under: a point in a callout's padding resolves to a
     // character somewhere else. The character's own box has to be near the
     // pointer, with slack sideways so the gaps between words still count.
@@ -518,43 +535,27 @@
   // pointer is in the space between them and level with the column, so that
   // the margins stay empty.
   const GAP_REACH = 60;
-  // The block on the other side of one of a block's edges, if there is one.
-  // Blocks are neighbours by how far apart they are vertically and nothing
-  // else: a narrow equation and a short heading do not overlap horizontally,
-  // and are still one after the other. Only blocks that are not inside another
-  // count: the space below the last paragraph of a callout is inside the
-  // callout, not between two blocks.
-  const neighbourBlock = (box, side) => {
-    let best = null;
-    for (const block of blocks) {
-      if (block.enclosed) continue;
-      const other = blockBox(block.el);
-      const away =
-        side === "bottom" ? other.top - box.bottom : box.top - other.bottom;
-      if (away < 0) continue;
-      if (!best || away < best.away) best = { box: other, away };
-    }
-    return best && best.box;
-  };
-
+  // How far a position may be from the pointer and still be the one meant.
+  const SNAP_REACH = 400;
   // Where the caret for a position at one of a block's edges is drawn: a stub
-  // of fixed length lying midway into the space beside the block, starting a
-  // little to the left of it. It pokes out into the margin the way the caret
-  // between two words pokes out above and below the line, so that it is read as
-  // a position rather than as a rule under whatever is above it. Its length has
-  // nothing to do with the blocks it lies between, which keeps it — and its
-  // hit box — cheap to work out.
+  // of fixed length lying half a margin beyond the edge and starting a little
+  // to the left of the block. It pokes out into the margin the way the caret
+  // between two words pokes out above and below the line, so that it is read
+  // as a position rather than as a rule under whatever is above it.
+  //
+  // Half the block's own margin, rather than half the distance to the next
+  // block: two blocks with equal margins put their carets in the same place,
+  // so the one gap between them shows one caret however it is referred to.
   const EDGE_OUT = 20;
   const EDGE_RUN = 100;
-  const edgeCaretBox = (box, side) => {
-    const other = neighbourBlock(box, side);
-    const edge = side === "bottom" ? box.bottom : box.top;
-    const far = other
-      ? side === "bottom"
-        ? other.top
-        : other.bottom
-      : docEdge(side);
-    const middle = (edge + far) / 2;
+  const edgeCaretBox = (box, side, el) => {
+    // The element's own edge rather than the edge of its ink: two blocks with
+    // equal margins are then the same distance from the caret between them,
+    // whichever of the two it is attached to.
+    const own = blockRect(el);
+    const edge = side === "bottom" ? own.bottom : own.top;
+    const out = edgeMargin(el, side) / 2;
+    const middle = side === "bottom" ? edge + out : edge - out;
     const left = box.left - EDGE_OUT;
     return {
       left,
@@ -566,14 +567,26 @@
     };
   };
 
-  // Where the page's content ends, for a caret with no block on one side.
-  const docEdge = (side) => {
-    const doc = document.querySelector(".tm-doc");
-    const box = doc ? doc.getBoundingClientRect() : { top: 0, bottom: 0 };
-    return side === "bottom" ? box.bottom : box.top;
+  // The margin an element keeps on one side. The exporter puts a heading's
+  // spacing on the wrapper it builds around it rather than on the heading, so
+  // the margin is read from the outermost element that holds nothing else.
+  const EDGE_LEAST = 8;
+  const edgeMargin = (el, side) => measured(el).margin[side];
+  const marginOf = (el, side) => {
+    let outer = el;
+    while (
+      outer.parentElement &&
+      outer.parentElement.childNodes.length === 1 &&
+      outer.parentElement.id !== DOC_ID
+    ) {
+      outer = outer.parentElement;
+    }
+    const style = getComputedStyle(outer);
+    const margin = parseFloat(side === "bottom" ? style.marginBottom : style.marginTop);
+    return Math.max(margin || 0, EDGE_LEAST);
   };
 
-  const verticalGapAt = (x, y) => {
+  const verticalGapAt = (x, y, reach = GAP_REACH) => {
     // Anywhere across the column counts, so that the gap under a heading is a
     // gap for its whole width. Outside the column is margin, and empty.
     const doc = document.getElementById(DOC_ID);
@@ -594,15 +607,27 @@
       }
     }
     if (!above && !below) return null;
-    // Whichever edge is nearer, since both name the same place.
     const gapAbove = above ? y - above.box.bottom : Infinity;
     const gapBelow = below ? below.box.top - y : Infinity;
-    if (Math.min(gapAbove, gapBelow) > GAP_REACH) return null;
-    const nearer = gapAbove <= gapBelow ? above : below;
-    const side = nearer === above ? "bottom" : "top";
-    const taken = takenBlocks.get(nearer.block.el);
-    if (taken && taken.has("pos.v")) return null;
-    return { block: nearer.block, side, box: edgeCaretBox(nearer.box, side) };
+    if (Math.min(gapAbove, gapBelow) > reach) return null;
+    // A gap belongs to the block above it, which makes one gap one place. The
+    // first block of the document is the exception: the space above it belongs
+    // to nothing else, and is named as that block's top.
+    const first = gapAbove <= reach ? { at: above, side: "bottom" } : null;
+    const then = gapBelow <= reach ? { at: below, side: "top" } : null;
+    for (const choice of [first, then]) {
+      if (!choice) continue;
+      const taken = takenBlocks.get(choice.at.block.el);
+      // An edge that already carries a position is not offered again, but the
+      // other side of the same gap still is: it is a place of its own.
+      if (taken && taken.has("pos.v")) continue;
+      return {
+        block: choice.at.block,
+        side: choice.side,
+        box: edgeCaretBox(choice.at.box, choice.side, choice.at.block.el),
+      };
+    }
+    return null;
   };
 
   // How much text is kept either side of a position, to recognise the place
@@ -711,12 +736,50 @@
   // border box. A block is as wide as the column whatever is in it, so a
   // figure holding a centred drawing would otherwise be marked — and offered —
   // with a rectangle reaching far past the picture on both sides.
-  const blockBox = (el) => {
-    const boxes = inkOf(el);
-    const top = Math.min(...boxes.map((b) => b.top));
-    const bottom = Math.max(...boxes.map((b) => b.bottom));
-    const left = Math.min(...boxes.map((b) => b.left));
-    const right = Math.max(...boxes.map((b) => b.right));
+  const blockBox = (el) => viewport(measured(el).ink);
+
+  /// The element's own box, margins excluded, which is what the space between
+  /// two blocks is measured from.
+  const blockRect = (el) => viewport(measured(el).rect);
+
+  // Measuring an element means laying the page out, and the hover path asks
+  // about every block on the page. The answers are kept until something moves
+  // them, in page coordinates so that scrolling is not something that moves
+  // them.
+  const measures = new Map();
+  const measured = (el) => {
+    let known = measures.get(el);
+    if (!known) {
+      const boxes = inkOf(el);
+      known = {
+        ink: page({
+          top: Math.min(...boxes.map((b) => b.top)),
+          bottom: Math.max(...boxes.map((b) => b.bottom)),
+          left: Math.min(...boxes.map((b) => b.left)),
+          right: Math.max(...boxes.map((b) => b.right)),
+        }),
+        rect: page(el.getBoundingClientRect()),
+        margin: {
+          top: marginOf(el, "top"),
+          bottom: marginOf(el, "bottom"),
+        },
+      };
+      measures.set(el, known);
+    }
+    return known;
+  };
+  const forget = () => measures.clear();
+  const page = (b) => ({
+    top: b.top + window.scrollY,
+    bottom: b.bottom + window.scrollY,
+    left: b.left + window.scrollX,
+    right: b.right + window.scrollX,
+  });
+  const viewport = (b) => {
+    const top = b.top - window.scrollY;
+    const bottom = b.bottom - window.scrollY;
+    const left = b.left - window.scrollX;
+    const right = b.right - window.scrollX;
     return { top, bottom, left, right, width: right - left, height: bottom - top };
   };
 
@@ -763,7 +826,7 @@
         // as wide as the column whatever is in it.
         const box = blockBox(el);
         const side = kind === "pos.v" ? loc.ref.side : loc.begin.side;
-        const edge = edgeCaretBox(box, side === "top" ? "top" : "bottom");
+        const edge = edgeCaretBox(box, side === "top" ? "top" : "bottom", el);
         return { scope: "edge", boxes: [edge], caret: edge, el };
       }
       case "math":
@@ -2055,7 +2118,17 @@
 
   const previewAt = (ev) => {
     if (scrolling) return;
-    pointer = { x: ev.clientX, y: ev.clientY, alt: ev.altKey };
+    pointer = { x: ev.clientX, y: ev.clientY, alt: ev.altKey, ctrl: ev.ctrlKey };
+    // Held down, the modifier means a position — between two words, or between
+    // two blocks — and nothing else. Positions are not offered otherwise: they
+    // are places a pointer lands on only by being exact about it, and holding a
+    // key is easier than that. It is also what makes snapping to the nearest
+    // one safe, since nothing else is competing for the same pixels.
+    if (ev.ctrlKey) {
+      const spot = positionAt(ev.clientX, ev.clientY);
+      if (!spot) return clearHover();
+      return spot.edge ? previewEdge(spot.edge) : previewPoint(spot.gap.box);
+    }
     if (ev.altKey) {
       const region = regionUnder(ev.clientX, ev.clientY);
       return region ? previewRegion(region) : clearHover();
@@ -2070,21 +2143,38 @@
       return previewUnderline(mergeLines(Array.from(atom.el.getClientRects())), false);
     }
     const caret = caretAt(ev.clientX, ev.clientY);
-    if (!caret) {
-      // Nothing under the pointer: the space between two blocks is still a
-      // place, and it is what is left.
-      const edge = verticalGapAt(ev.clientX, ev.clientY);
-      return edge ? previewEdge(edge) : clearHover();
+    if (!caret) return clearHover();
+    const word = wordAround(caret.run, caret.at);
+    if (!word) return clearHover();
+    previewUnderline(charRects(word.run.uid, word.start, word.end), false);
+  };
+
+  // The position the pointer means: over a line of text, the space between two
+  // words on it; anywhere else, the space between the blocks it is between.
+  // Text wins wherever there is text, so that a position on a line is never
+  // taken to be a position between blocks that happens to be nearer in pixels.
+  const positionAt = (x, y) => {
+    const gap = snapPoint(x, y);
+    if (gap) return { gap };
+    const edge = verticalGapAt(x, y, SNAP_REACH);
+    return edge ? { edge } : null;
+  };
+
+  // The space between two words nearest the pointer on the line it is over:
+  // either side of the word it is nearest, whichever is nearer.
+  const snapPoint = (x, y) => {
+    const caret = caretAt(x, y);
+    if (!caret) return null;
+    const word = wordAround(caret.run, caret.at);
+    const ends = word ? [word.start, word.end] : [caret.at];
+    let best = null;
+    for (const at of ends) {
+      const spot = gapAt({ run: caret.run, at });
+      if (!spot) continue;
+      const away = Math.abs(x - (spot.box.left + spot.box.width / 2));
+      if (!best || away < best.away) best = { spot, away };
     }
-    const word = wordUnder(caret, ev.clientX);
-    if (word) {
-      previewUnderline(charRects(word.run.uid, word.start, word.end), false);
-      return;
-    }
-    // Between words: a click makes a point, anchored to the word on the left.
-    const gap = gapAt(caret);
-    if (!gap) return clearHover();
-    previewPoint(gap.box);
+    return best && best.spot;
   };
 
   // A caret lying along a block's edge, for the space between two blocks.
@@ -2125,17 +2215,6 @@
     return null;
   };
 
-  // The word under the pointer, which is not the same as the word the caret
-  // position falls in: a position in the space between two words resolves to
-  // whichever side is nearer, and the space itself is a place of its own.
-  const wordUnder = (caret, x) => {
-    const word = wordAround(caret.run, caret.at);
-    if (!word) return null;
-    const rects = charRects(word.run.uid, word.start, word.end);
-    const on = rects.some((r) => x >= r.left && x <= r.right);
-    return on ? word : null;
-  };
-
   // The space a point annotation marks: between the word that ends here and
   // the one that starts next, so the caret is centred in the gap rather than
   // pressed against the word on its left.
@@ -2166,11 +2245,32 @@
     if (!caret) return;
     drag = { from: { x: ev.clientX, y: ev.clientY }, start: caret, moved: false };
   };
+  // A mouse reports its position far more often than the page is drawn, and
+  // every report would otherwise measure the page again. The last one before
+  // the next frame is the only one that matters.
+  let hovering = null;
+  let hoverFrame = 0;
+  const hoverSoon = (ev) => {
+    hovering = {
+      clientX: ev.clientX,
+      clientY: ev.clientY,
+      altKey: ev.altKey,
+      ctrlKey: ev.ctrlKey,
+    };
+    if (hoverFrame) return;
+    hoverFrame = requestAnimationFrame(() => {
+      hoverFrame = 0;
+      if (hovering) previewAt(hovering);
+    });
+  };
   const onMouseMove = (ev) => {
     if (!annotating) return;
     if (!drag) {
-      if (openUuid !== null || composeActive || onOverlay(ev)) return clearHover();
-      previewAt(ev);
+      if (openUuid !== null || composeActive || onOverlay(ev)) {
+        hovering = null;
+        return clearHover();
+      }
+      hoverSoon(ev);
       return;
     }
     if (!drag.moved && Math.hypot(ev.clientX - drag.from.x, ev.clientY - drag.from.y) < 4) {
@@ -2221,6 +2321,12 @@
     });
   };
 
+  const composeEdge = (edge) =>
+    compose("position", {
+      type: "pos.v",
+      ref: { type: "node_cursor", ref: edge.block.uid, side: edge.side },
+    });
+
   const onClick = (ev) => {
     if (!annotating) return;
     if (swallowClick) {
@@ -2243,6 +2349,15 @@
       return;
     }
     clearHover();
+    if (ev.ctrlKey) {
+      const spot = positionAt(ev.clientX, ev.clientY);
+      if (!spot) return;
+      ev.preventDefault();
+      ev.stopImmediatePropagation();
+      if (spot.edge) composeEdge(spot.edge);
+      else compose("point", { type: "pos.h", ref: cursorRef(spot.gap.run, spot.gap.at) });
+      return;
+    }
     // Held down, the modifier means the region rather than what is in it.
     const region = ev.altKey
       ? regionUnder(ev.clientX, ev.clientY)
@@ -2270,28 +2385,12 @@
       return;
     }
     const caret = caretAt(ev.clientX, ev.clientY);
-    if (!caret) {
-      const edge = verticalGapAt(ev.clientX, ev.clientY);
-      if (!edge) return;
-      ev.preventDefault();
-      ev.stopImmediatePropagation();
-      compose("position", {
-        type: "pos.v",
-        ref: { type: "node_cursor", ref: edge.block.uid, side: edge.side },
-      });
-      return;
-    }
+    if (!caret) return;
+    const word = wordAround(caret.run, caret.at);
+    if (!word) return;
     ev.preventDefault();
     ev.stopImmediatePropagation();
-    const word = wordUnder(caret, ev.clientX);
-    if (word) {
-      compose("comment", wordLocation("word", word));
-      return;
-    }
-    const gap = gapAt(caret);
-    if (gap) {
-      compose("point", { type: "pos.h", ref: cursorRef(gap.run, gap.at) });
-    }
+    compose("comment", wordLocation("word", word));
   };
 
   // Up/down arrows walk the annotations in document order — selecting,
@@ -2657,9 +2756,15 @@
     document.addEventListener("click", onClick, true);
     document.addEventListener("keydown", onArrow, true);
     const modifier = (e) => {
-      if (e.key !== "Alt" || !pointer) return;
+      if ((e.key !== "Alt" && e.key !== "Control") || !pointer) return;
       if (openUuid !== null || composeActive) return;
-      previewAt({ clientX: pointer.x, clientY: pointer.y, altKey: e.type === "keydown" });
+      const down = e.type === "keydown";
+      previewAt({
+        clientX: pointer.x,
+        clientY: pointer.y,
+        altKey: e.key === "Alt" ? down : !!pointer.alt,
+        ctrlKey: e.key === "Control" ? down : !!pointer.ctrl,
+      });
     };
     document.addEventListener("keydown", modifier, true);
     document.addEventListener("keyup", modifier, true);
@@ -2684,6 +2789,8 @@
     render();
   };
   document.addEventListener("scroll", onScroll, { capture: true, passive: true });
+  // A new width lays the page out again, so nothing that was measured holds.
+  window.addEventListener("resize", forget);
   window.addEventListener("resize", render);
   // The panel wraps differently at a different width, so its height is not a
   // thing to measure once.
