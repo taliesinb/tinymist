@@ -42,9 +42,10 @@ pub fn procs_main(cmd: ProcsCommands) -> Result<()> {
 /// One note, on one line.
 fn describe(note: &ServerNote, live: bool) -> String {
     format!(
-        "{state}  {server:<20} {role:<9} pid {pid:<7} parent {ppid:<7} {url}           {path}{mcp}{hosted}  since {started}",
+        "{state}  {server:<20} {role:<9} pid {pid:<7} parent {ppid:<7} {url}           {path}{mcp}{hosted}{fork}  since {started}",
         state = if live { "live " } else { "stale" },
         hosted = if note.hosted { "  hosted" } else { "" },
+        fork = if note.fork { "  fork" } else { "" },
         server = note.server,
         role = note.role,
         pid = note.pid,

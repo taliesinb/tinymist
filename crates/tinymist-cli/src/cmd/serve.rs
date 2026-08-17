@@ -86,6 +86,16 @@ pub struct ServeArgs {
     #[clap(long = "annotate-latency", value_name = "MS")]
     pub annotate_latency: Option<u64>,
 
+    /// Serve a copy of the document instead of the document: `foo.typ` is
+    /// copied to `foo.fork-<pid>.typ`, its sidecar to
+    /// `foo.fork-<pid>.annos.json`, and
+    /// that pair is what is served and written to. The copy is this server's
+    /// alone — its own port, nothing to share, nothing already running — so
+    /// annotations can be tried out without touching the document they are
+    /// about. The copies are left behind when it stops.
+    #[clap(long = "annotate-fork")]
+    pub annotate_fork: bool,
+
     /// Take the address even if something is already serving there: the server
     /// holding it is asked to stop, and this one waits for it to let go. A
     /// server started with different arguments — a latency, another theme —
@@ -191,6 +201,46 @@ fn probe(host: &str, port: u16) -> Option<String> {
         return Some(body.trim().to_owned());
     }
     None
+}
+
+/// Copies a document, and its sidecar if it has one, to names of this
+/// process's own: `foo.typ` becomes `foo.fork-1234.typ`, and its sidecar
+/// `foo.fork-1234.annos.json`. Named so that a repository can ignore the lot
+/// with one rule.
+///
+/// Everything downstream then works on the copy without knowing it is one — the
+/// port is derived from its path, the sidecar is found beside it, annotations
+/// are written into it — so a fork is one step at the start and nothing after.
+fn fork_document(path: &Path) -> Result<PathBuf> {
+    if path.is_dir() {
+        return Err(error_once!(
+            "--annotate-fork serves a file, and this is a directory",
+            path: path.display()
+        ));
+    }
+    let pid = std::process::id();
+    let stem = path
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "document".into());
+    let extension = path
+        .extension()
+        .map(|ext| format!(".{}", ext.to_string_lossy()))
+        .unwrap_or_default();
+    let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
+    let forked = dir.join(format!("{stem}.fork-{pid}{extension}"));
+    std::fs::copy(path, &forked)
+        .with_context("cannot copy the document to fork it", || None)?;
+    let sidecar = tinymist_annos::sidecar_path(path);
+    if sidecar.exists() {
+        let forked_sidecar = tinymist_annos::sidecar_path(&forked);
+        std::fs::copy(&sidecar, &forked_sidecar)
+            .with_context("cannot copy the sidecar to fork it", || None)?;
+        eprintln!("forked {} and {}", forked.display(), forked_sidecar.display());
+    } else {
+        eprintln!("forked {}", forked.display());
+    }
+    Ok(forked)
 }
 
 /// Asks whatever is serving on an address to stop.
@@ -352,14 +402,32 @@ pub fn serve_main(args: ServeArgs) -> Result<()> {
 
     let canonical = std::fs::canonicalize(&args.path)
         .with_context("cannot resolve the path to serve", || None)?;
+    // The one step a fork takes: from here on this is an ordinary server for an
+    // ordinary document, which happens to be a copy nobody else knows about.
+    let canonical = if args.annotate_fork {
+        fork_document(&canonical)?
+    } else {
+        canonical
+    };
     let role = if args.anno {
         IconRole::Annotate
     } else {
         IconRole::Serve
     };
+    // A fork answers where nothing else does: its salt is its own process, so
+    // the address is its own and no server is ever found already holding it.
+    let salt = if args.annotate_fork {
+        Some(format!(
+            "{}fork{}",
+            args.port_salt.clone().unwrap_or_default(),
+            std::process::id()
+        ))
+    } else {
+        args.port_salt.clone()
+    };
     let port = args
         .port
-        .unwrap_or_else(|| derive_port(&canonical, role, args.port_salt.as_deref()));
+        .unwrap_or_else(|| derive_port(&canonical, role, salt.as_deref()));
 
     let path = tinymist::tool::webapp::role_prefix(role);
     let url = format!("http://{}:{port}{path}", args.host);
@@ -459,6 +527,7 @@ pub fn serve_main(args: ServeArgs) -> Result<()> {
         ppid: tinymist::tool::registry::parent_pid(),
         // This process serves this and nothing else.
         hosted: false,
+        fork: args.annotate_fork,
         started: tinymist_project::iso_now(),
     };
     if let Err(err) = tinymist::tool::serve::announce_server(&note) {

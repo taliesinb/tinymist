@@ -52,6 +52,11 @@ pub struct ServerNote {
     /// typing: the note points at a process that is not ours to kill.
     #[serde(default)]
     pub hosted: bool,
+    /// Whether what it serves is a copy made for this server alone, named after
+    /// its process. The copy is nobody else's: it has its own port, its own
+    /// sidecar, and no other server will ever be asked to share it.
+    #[serde(default)]
+    pub fork: bool,
     /// When it started, ISO 8601 UTC.
     pub started: String,
 }
