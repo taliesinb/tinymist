@@ -519,12 +519,24 @@
 }
 
 // Vertical space is dropped; a div of that height says the same thing.
+//
+// Weak space is different: in a paged layout it is space that gives way to the
+// space already there — the gap a heading leaves under itself does not add to
+// the paragraph's own gap, it merges with it. A margin does exactly that in
+// CSS, since the margins of an empty block collapse with each other and with
+// its neighbours', so weak space is written as a margin and strong space as a
+// height. Written as a height, the two gaps added up and every heading sat
+// twice as far from its text in HTML as on paper.
 #let _rule-v = it => context {
   if not _html-here() { return it }
   let amount = _len(it.amount)
-  if amount == none { none } else {
-    html.elem("div", attrs: (style: "height: " + amount), [])
-  }
+  if amount == none { return none }
+  let weak = it.fields().at("weak", default: false)
+  html.elem(
+    "div",
+    attrs: (style: if weak { "margin-top: " + amount } else { "height: " + amount }),
+    [],
+  )
 }
 
 // A stroke's paint may be a gradient or a tiling, which `_color` declines; the
