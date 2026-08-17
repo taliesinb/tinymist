@@ -1836,6 +1836,8 @@
       document.removeEventListener("keydown", escHandler, true);
       escHandler = null;
     }
+    // The draft is being thrown away, so there is nothing to take up again.
+    if (composeActive) forgetComposing();
     composeActive = false;
     dropLocal(DRAFT_ID);
     openUuid = null;
@@ -2111,6 +2113,7 @@
         });
         send(held);
       }
+      forgetComposing();
       closeBox(true);
     };
     const parts = shell(letter, `draft ${existing && existing.kind ? existing.kind : "comment"}`, [
@@ -2121,11 +2124,33 @@
     composeActive = true;
     const { wrap, ta } = replyField(letterColor(letter), "Type comment", "⏎ save", 3, true, submit);
     parts.content.append(wrap);
+    // From the moment a place is picked, not from the first word: choosing
+    // where a comment goes is most of the work of writing one.
+    const remember = () =>
+      keepComposing({
+        kind,
+        location,
+        letter,
+        color,
+        render: renderId,
+        text: ta.value,
+        at_: [ta.selectionStart, ta.selectionEnd],
+      });
+    for (const event of ["input", "keyup", "click", "select"]) {
+      ta.addEventListener(event, remember);
+    }
     if (existing && existing.content) {
       ta.value = existing.content;
       ta.dispatchEvent(new Event("input"));
     }
+    remember();
     ta.focus();
+    if (existing && existing.at_) {
+      const [from, to] = existing.at_;
+      try {
+        ta.setSelectionRange(from, to);
+      } catch (err) {}
+    }
     dropLocal(DRAFT_ID);
     local.push({
       uuid: DRAFT_ID,
@@ -2211,6 +2236,38 @@
     }
     const entry = byUid.get(ref.ref);
     return entry ? (entry.el.textContent || "").trim().slice(0, 60) : undefined;
+  };
+
+  // What is being written right now: the place it is about, the words so far,
+  // and where the cursor is in them. The page reloads itself when the server's
+  // assets change, and a comment half written when that happens would otherwise
+  // be gone — as would the work of having chosen where it goes.
+  const COMPOSING = `tinymist-html-composing:${BASE}`;
+  const COMPOSING_KEEP = 3600 * 1000;
+  const keepComposing = (state) => {
+    try {
+      sessionStorage.setItem(COMPOSING, JSON.stringify({ ...state, at: Date.now() }));
+    } catch (err) {}
+  };
+  const forgetComposing = () => {
+    try {
+      sessionStorage.removeItem(COMPOSING);
+    } catch (err) {}
+  };
+  const takeComposing = () => {
+    try {
+      const held = JSON.parse(sessionStorage.getItem(COMPOSING) || "null");
+      if (!held || !held.location) return null;
+      // Something written an hour ago and never finished is not what the page
+      // is for; it is not restored, and the words are still in the drafts.
+      if (!held.at || Date.now() - held.at > COMPOSING_KEEP) {
+        forgetComposing();
+        return null;
+      }
+      return held;
+    } catch (err) {
+      return null;
+    }
   };
 
   // Drafts the server has not taken. Kept in the browser so that a comment
@@ -2708,24 +2765,35 @@
   // itself says nothing except that the page was early.
   const LOAD_GRACE = 3000;
   let loadWait = null;
+  const CANNOT_LOAD = "Cannot load the document";
   const cannotLoad = (res) => {
     // The server has nothing yet and knows it: it is compiling, which is worth
     // saying, since a page that shows nothing otherwise looks broken. The
     // status panel already carries a compile's own errors.
     if (compileErrors) return void holdWork(null);
     if (res && res.waiting) return void holdWork("Compiling…");
-    if (shownBody) return void showBanner("Cannot load the document");
+    if (shownBody) return void showBanner(CANNOT_LOAD);
     if (loadWait) return;
     loadWait = setTimeout(() => {
       loadWait = null;
-      if (!shownBody && !compileErrors) showBanner("Cannot load the document");
+      if (!shownBody && !compileErrors) showBanner(CANNOT_LOAD);
     }, LOAD_GRACE);
   };
   const loaded = () => {
     clearTimeout(loadWait);
     loadWait = null;
     holdWork(null);
-    showBanner(null);
+    // Only what a failed load put there: a document loads twice in quick
+    // succession — once when the page opens, once when the compile reports —
+    // and the second must not take down what the first said.
+    if (passing === CANNOT_LOAD) showBanner(null);
+  };
+
+  // What to call the document: the file it was rendered from, by name.
+  const documentName = (res) => {
+    const path = res.map && res.map.files && res.map.files[0] && res.map.files[0].path;
+    if (path) return path.replace(/^.*[\\/]/, "");
+    return res.title || "the document";
   };
 
   const loadDocument = () =>
@@ -2736,6 +2804,15 @@
           return;
         }
         loaded();
+        // A compile that produced a different rendering is worth saying: the
+        // page changed under whoever is reading it, and which version it is
+        // now showing is the one thing they cannot see.
+        if (res.render && res.render !== renderId) {
+          showBanner(
+            `Loaded ${documentName(res)}, version ${res.render.slice(0, 8)}`,
+            "note",
+          );
+        }
         const doc = document.getElementById(DOC_ID);
         if (!doc) return;
         // The rendering and its map arrive together, so the ids in one always
@@ -2837,7 +2914,10 @@
   let standing = null;
   let working = null;
   let passing = null;
+  let passingKind = "warn";
   let passingTimer = null;
+  // How long something that has just happened stays on the page.
+  const PASSING = 3000;
   const paintBanner = () => {
     const text = standing || working || passing;
     let el = document.getElementById(BANNER_ID);
@@ -2850,9 +2930,9 @@
       el.id = BANNER_ID;
       document.body.appendChild(el);
     }
-    // Waiting for something is not the same as something being wrong, and the
-    // two do not look alike.
-    el.dataset.kind = !standing && working === text ? "note" : "warn";
+    // Waiting for something, or being told what was loaded, is not the same as
+    // something being wrong, and the two do not look alike.
+    el.dataset.kind = standing ? "warn" : working === text ? "note" : passingKind;
     el.textContent = text;
   };
   const holdBanner = (text) => {
@@ -2863,10 +2943,11 @@
     working = text || null;
     paintBanner();
   };
-  const showBanner = (text) => {
+  const showBanner = (text, kind) => {
     passing = text || null;
+    passingKind = kind || "warn";
     clearTimeout(passingTimer);
-    if (passing) passingTimer = setTimeout(() => showBanner(null), 5000);
+    if (passing) passingTimer = setTimeout(() => showBanner(null), PASSING);
     paintBanner();
   };
 
@@ -3071,10 +3152,25 @@
   // The panel wraps differently at a different width, so its height is not a
   // thing to measure once.
   window.addEventListener("resize", measureStatus);
+  // A comment that was being written when the page reloaded is opened again,
+  // where it was, with the words and the cursor where they were left.
+  const resumeComposing = () => {
+    if (!ANNOTATE || composeActive || openUuid !== null) return;
+    const held = takeComposing();
+    if (!held) return;
+    compose(held.kind || "comment", held.location, {
+      letter: held.letter,
+      color: held.color,
+      content: held.text || "",
+      at_: held.at_,
+    });
+  };
+
   watchConnection();
   setInterval(beat, BEAT);
   refresh()
     .then(() => sendStored())
+    .then(resumeComposing)
     .then(listen);
   // Fonts and images settle after the first paint and move everything below
   // them; a slow tick keeps the marks on their text without watching for it.
