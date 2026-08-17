@@ -20,6 +20,7 @@
 pub mod annotations;
 mod cache;
 pub mod capture;
+pub mod clients;
 pub mod pins;
 pub mod renders;
 pub mod http;

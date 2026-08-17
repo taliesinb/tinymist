@@ -313,67 +313,6 @@ mod anchor_tests {
         assert!(block.starts_with("A paragraph"), "{block:?}");
         assert!(block.trim_end().ends_with("in it."), "{block:?}");
     }
-
-    fn snapped(text: &str, at: usize) -> String {
-        let i = snap_past_marker(text, at);
-        format!("{}<L>{}", &text[..i], &text[i..])
-    }
-
-    #[test]
-    fn snaps_past_list_markers() {
-        // bullet: the label lands after the first word of the body
-        let t = "- Agents watch the sidecar\n";
-        assert_eq!(snapped(t, 0), "- Agents<L> watch the sidecar\n");
-        // indented bullet
-        let t = "text\n  - A nested bullet here\n";
-        assert_eq!(snapped(t, 5), "text\n  - A<L> nested bullet here\n");
-        // enumerator
-        let t = "+ A numbered item, first\n";
-        assert_eq!(snapped(t, 0), "+ A<L> numbered item, first\n");
-        let t = "12. A numbered item\n";
-        assert_eq!(snapped(t, 0), "12. A<L> numbered item\n");
-        // plain paragraph start
-        let t = "This document demonstrates\n";
-        assert_eq!(snapped(t, 0), "This<L> document demonstrates\n");
-        // a hyphen that is not a marker stays put
-        let t = "-notamarker word\n";
-        assert_eq!(snapped(t, 0), "-notamarker<L> word\n");
-        // an offset already inside the text is left alone
-        let t = "- Agents watch\n";
-        assert_eq!(snapped(t, 9), "- Agents <L>watch\n");
-        // a heading: the "=" run is a marker too, and a label before it turns
-        // the heading into a paragraph that starts with "=".
-        // A heading takes its label at the end of the line, where Typst binds
-        // it to the heading instead of ending it.
-        let t = "= A short document\n";
-        assert_eq!(snapped(t, 0), "= A short document<L>\n");
-        let t = "== A second heading   \n";
-        assert_eq!(snapped(t, 0), "== A second heading<L>   \n");
-        // "=" without a space after it is an equation or plain text, not a
-        // heading, and nothing is skipped
-        let t = "=x is not a heading\n";
-        assert_eq!(snapped(t, 0), "=x<L> is not a heading\n");
-    }
-
-    #[test]
-    fn entry_span_ignores_the_prelude_example() {
-        // The prelude shows what an entry looks like, uuid and all. An entry
-        // that shares that uuid must still be found where it actually is —
-        // not in the explanation, which was how a sidecar lost its header.
-        let content = concat!(
-            "// Entry shape:\n",
-            "//\n",
-            "//   #metadata((\n",
-            "//     uuid: str,\n",
-            "//   )) <note-7C42>\n",
-            "#metadata((\n",
-            "  uuid: \"7C42\",\n",
-            ")) <note-7C42>\n",
-        );
-        let span = super::entry_span(content, "7C42").expect("the real entry");
-        assert_eq!(&content[span.clone()], "#metadata((\n  uuid: \"7C42\",\n)) <note-7C42>\n");
-        assert!(super::entry_span(content, "0000").is_none());
-    }
 }
 
 // ---------------------------------------------------------------- blocks

@@ -51,6 +51,8 @@ pub async fn make_http_server(
     /// it tears down the event stream immediately.
     struct ClientGuard(
         std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        /// The caller, so that a page closing and the page opening it are
+        /// plainly the same reader.
         usize,
         /// The page the stream belongs to, so that the line saying a client has
         /// gone names what it was reading.
@@ -64,9 +66,9 @@ pub async fn make_http_server(
                 .fetch_sub(1, std::sync::atomic::Ordering::SeqCst)
                 .saturating_sub(1);
             tinymist_project::announce(
-                "client_disconnected",
+                "client_closed",
                 &[
-                    ("id", self.1.into()),
+                    ("client_id", self.1.into()),
                     ("url", self.2.clone().into()),
                     ("connected", left.into()),
                 ],
@@ -92,9 +94,6 @@ pub async fn make_http_server(
     let served_anyone = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let identity = std::sync::Arc::new(identity);
     let allowed_origins = std::sync::Arc::new(allowed_origins);
-    // Clients are numbered from zero as they arrive, so the line that says one
-    // has gone can name which one it was.
-    let next_client = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     // When an agent last called. A page says it is there by holding its event
     // stream open, which is what "is anyone there" counts; an agent asks a
     // question and goes away to think about the answer, so it says it is there
@@ -112,7 +111,6 @@ pub async fn make_http_server(
         let served_anyone = served_anyone.clone();
         let identity = identity.clone();
         let allowed_origins = allowed_origins.clone();
-        let next_client = next_client.clone();
         let last_listing = last_listing.clone();
         move |peer: std::net::SocketAddr| {
         let last_call = last_call.clone();
@@ -124,7 +122,6 @@ pub async fn make_http_server(
         let served_anyone = served_anyone.clone();
         let identity = identity.clone();
         let allowed_origins = allowed_origins.clone();
-        let next_client = next_client.clone();
         let last_listing = last_listing.clone();
         service_fn(move |mut req: hyper::Request<Incoming>| {
             let identity = identity.clone();
@@ -134,7 +131,6 @@ pub async fn make_http_server(
             let websocket_tx = websocket_tx.clone();
             let static_file_addr = static_file_addr.clone();
             let site = site.clone();
-            let next_client = next_client.clone();
             let last_listing = last_listing.clone();
             let live = live.clone();
             let served_anyone = served_anyone.clone();
@@ -290,22 +286,15 @@ pub async fn make_http_server(
                     Ok(res)
                 } else if let (Some(role), true) = (page_role, path.is_empty() || path == "/") {
                     if tinymist_project::announcing() {
-                        // A page was asked for. Nothing is connected yet and
-                        // may never be — a listing page opens no event stream —
-                        // so this carries no id: an id is for a client that can
-                        // be counted, and counting one that never arrives is
-                        // what keeps a server alive for nobody.
+                        // A page was asked for. Nothing is open yet and may
+                        // never be — a listing page opens no event stream — so
+                        // this says who asked and for what, and no more.
+                        let client = super::clients::identify(req.headers(), &peer);
                         tinymist_project::announce(
                             "client_requested",
                             &[
+                                ("client_id", client.id.into()),
                                 ("url", raw_path.clone().into()),
-                                ("ip", peer.ip().to_string().into()),
-                                (
-                                    "name",
-                                    request_author(req.headers())
-                                        .map(Into::into)
-                                        .unwrap_or(serde_json::Value::Null),
-                                ),
                             ],
                         );
                     }
@@ -582,7 +571,7 @@ pub async fn make_http_server(
                     let now = live.fetch_add(1, SeqCst) + 1;
                     LIVE_CLIENTS.fetch_add(1, SeqCst);
                     served_anyone.store(true, SeqCst);
-                    let id = next_client.fetch_add(1, SeqCst);
+                    let client = super::clients::identify(req.headers(), &peer);
                     // Which page is watching: the stream is asked for from the
                     // page it belongs to, so the page is its address without
                     // the endpoint on the end.
@@ -590,36 +579,15 @@ pub async fn make_http_server(
                         .strip_suffix("dev/diagnostics")
                         .unwrap_or(&raw_path)
                         .to_owned();
-                    let guard = ClientGuard(live.clone(), id, page.clone());
+                    let guard = ClientGuard(live.clone(), client.id, page.clone());
                     if tinymist_project::announcing() {
-                        // Who, from the same header the annotations take their
-                        // author from: behind `tailscale serve` that is the
-                        // tailnet login, and on loopback it is whoever is
-                        // running the server.
-                        let headers = req.headers();
-                        let name =
-                            crate::tool::serve::annotations::author_or_local(request_author(headers).as_deref());
-                        let agent = headers
-                            .get(hyper::header::USER_AGENT)
-                            .and_then(|value| value.to_str().ok())
-                            .unwrap_or("")
-                            .to_owned();
-                        // The address the request came from: a proxy's own, if
-                        // one forwarded it, else the connection's far end.
-                        let ip = headers
-                            .get("X-Forwarded-For")
-                            .and_then(|value| value.to_str().ok())
-                            .and_then(|value| value.split(',').next())
-                            .map(|value| value.trim().to_owned())
-                            .unwrap_or_else(|| peer.ip().to_string());
+                        // Who is already known: identifying the caller
+                        // announced everything about it that is worth saying.
                         tinymist_project::announce(
-                            "client_connected",
+                            "client_opened",
                             &[
-                                ("id", id.into()),
+                                ("client_id", client.id.into()),
                                 ("url", page.clone().into()),
-                                ("name", name.into()),
-                                ("useragent", agent.into()),
-                                ("ip", ip.into()),
                                 ("connected", now.into()),
                             ],
                         );
@@ -1238,7 +1206,7 @@ fn unescape(value: &str, plus_is_space: bool) -> String {
 ///
 /// Read from the headers and never from the body: the point of the header is
 /// that a proxy the client cannot forge sets it.
-fn request_author(headers: &hyper::HeaderMap) -> Option<String> {
+pub fn request_author(headers: &hyper::HeaderMap) -> Option<String> {
     headers
         .get("Tailscale-User-Login")
         .and_then(|value| value.to_str().ok())
