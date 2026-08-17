@@ -435,7 +435,14 @@ html.tm-offline #tinymist-marks * {
 /* Compile errors and connection trouble, stated plainly rather than left to a
    blank page. */
 /* At the top, where a warning is read before the page is worked on rather than
-   after, and tinted the colour of something being wrong. */
+   after, and tinted the colour of something being wrong. A line that is only
+   saying what the page is waiting for keeps the page's own colours. */
+#tinymist-banner[data-kind="note"] {
+  border-color: color-mix(in oklab, var(--tm-fg) 18%, transparent);
+  background: color-mix(in oklab, var(--tm-bg) 72%, transparent);
+  color: color-mix(in oklab, var(--tm-fg) 78%, transparent);
+}
+
 #tinymist-banner {
   position: fixed;
   top: 12px;

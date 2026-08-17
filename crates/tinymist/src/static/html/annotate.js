@@ -2709,9 +2709,11 @@
   const LOAD_GRACE = 3000;
   let loadWait = null;
   const cannotLoad = (res) => {
-    // The server has nothing yet and knows it; the compile will say when it
-    // does. The status panel already carries a compile's own errors.
-    if ((res && res.waiting) || compileErrors) return;
+    // The server has nothing yet and knows it: it is compiling, which is worth
+    // saying, since a page that shows nothing otherwise looks broken. The
+    // status panel already carries a compile's own errors.
+    if (compileErrors) return void holdWork(null);
+    if (res && res.waiting) return void holdWork("Compiling…");
     if (shownBody) return void showBanner("Cannot load the document");
     if (loadWait) return;
     loadWait = setTimeout(() => {
@@ -2722,6 +2724,7 @@
   const loaded = () => {
     clearTimeout(loadWait);
     loadWait = null;
+    holdWork(null);
     showBanner(null);
   };
 
@@ -2826,14 +2829,17 @@
   // A line floating over the page, for something true right now rather than
   // something that happened: no connection, and nothing else so far.
   const BANNER_ID = "tinymist-banner";
-  // Two kinds of line share it: one that is true until it is not — no
-  // connection — and one that has just happened. The standing one wins, since
-  // a notice about one comment matters less than the page being cut off.
+  // Three kinds of line share it: one that is true until it is not — no
+  // connection — one that is true while something is happening — the first
+  // compile — and one that has just happened. In that order, since the page
+  // being cut off matters more than what it is waiting for, and both matter
+  // more than a notice about one comment.
   let standing = null;
+  let working = null;
   let passing = null;
   let passingTimer = null;
   const paintBanner = () => {
-    const text = standing || passing;
+    const text = standing || working || passing;
     let el = document.getElementById(BANNER_ID);
     if (!text) {
       if (el) el.remove();
@@ -2844,10 +2850,17 @@
       el.id = BANNER_ID;
       document.body.appendChild(el);
     }
+    // Waiting for something is not the same as something being wrong, and the
+    // two do not look alike.
+    el.dataset.kind = !standing && working === text ? "note" : "warn";
     el.textContent = text;
   };
   const holdBanner = (text) => {
     standing = text || null;
+    paintBanner();
+  };
+  const holdWork = (text) => {
+    working = text || null;
     paintBanner();
   };
   const showBanner = (text) => {
