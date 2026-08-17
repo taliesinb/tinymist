@@ -380,11 +380,9 @@ pub fn exit_when_orphaned() {
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(2));
                 if std::os::unix::process::parent_id() != original {
-                    log::info!(
-                        target: crate::PREVIEW_COMPAT_LOG_TARGET,
-                        "the process that started this one is gone, shutting down"
+                    crate::tool::serve::shutdown(
+                        "the process that started this one is gone",
                     );
-                    std::process::exit(0);
                 }
             }
         });

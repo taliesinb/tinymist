@@ -145,8 +145,8 @@ pub struct ServeArgs {
     /// its file name rather than by its title, and nothing is opened. A
     /// directory of thousands of documents is listed at once this way; a
     /// directory of dozens is no faster and loses the titles.
-    #[clap(long = "no-file-preparsing")]
-    pub no_file_preparsing: bool,
+    #[clap(long = "no-file-introspection")]
+    pub no_file_introspection: bool,
 
     /// Keep running when the `talimist` binary is replaced. Normally a server
     /// stops, since it would otherwise go on serving a build that is no longer
@@ -445,8 +445,8 @@ pub fn serve_main(args: ServeArgs) -> Result<()> {
         output: None,
     });
     tinymist::tool::webapp::note_build_stamp();
-    if args.no_file_preparsing {
-        tinymist::tool::serve::set_preparse(false);
+    if args.no_file_introspection {
+        tinymist::tool::serve::set_introspect(false);
     }
     if let Some(ms) = args.annotate_latency {
         tinymist::tool::serve::set_annotate_latency(ms);
@@ -671,6 +671,9 @@ pub fn serve_main(args: ServeArgs) -> Result<()> {
     if let Err(err) = tinymist::tool::serve::announce_server(&note) {
         log::warn!("cannot leave a note in the register: {err}");
     }
+    // The first line of the stream: which server this is and what it is
+    // serving, so that everything after it has something to belong to.
+    tinymist::tool::registry::announce_init(&note, name.as_deref());
     let _registered = RegistryGuard(port);
     if args.mcp {
         // The address agents are told about is one, fixed, and not this: make

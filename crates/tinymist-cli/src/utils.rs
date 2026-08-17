@@ -65,14 +65,16 @@ pub fn tidy_up_on_signals() {
                 return;
             }
         };
-        tokio::select! {
-            _ = terminate.recv() => log::info!("asked to stop"),
-            _ = interrupt.recv() => log::info!("interrupted"),
-        }
+        let why = tokio::select! {
+            _ = terminate.recv() => "asked to stop (SIGTERM)",
+            _ = interrupt.recv() => "interrupted (SIGINT)",
+        };
         // A document server puts its things away — its note in the register,
         // what it rendered — on the way out; anything else just goes.
         #[cfg(feature = "serve")]
-        tinymist::tool::serve::shutdown();
+        tinymist::tool::serve::shutdown(why);
+        #[cfg(not(feature = "serve"))]
+        let _ = why;
         #[cfg(not(feature = "serve"))]
         std::process::exit(0);
     });
@@ -133,7 +135,7 @@ pub fn exit_when_binary_replaced() {
             // it leaves a stale note and an address that answers with a
             // gateway error.
             #[cfg(feature = "serve")]
-            tinymist::tool::serve::shutdown();
+            tinymist::tool::serve::shutdown("the binary was replaced");
             #[cfg(not(feature = "serve"))]
             std::process::exit(0);
         }

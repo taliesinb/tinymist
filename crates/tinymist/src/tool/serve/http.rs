@@ -416,7 +416,7 @@ pub async fn make_http_server(
                     tokio::spawn(async {
                         // After the answer has gone out.
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                        super::shutdown();
+                        super::shutdown("asked to stop");
                     });
                     Ok(res)
                 } else if path == "/dev/events" {
@@ -983,11 +983,7 @@ pub async fn make_http_server(
                 if empty.elapsed().as_secs() < grace {
                     continue;
                 }
-                log::info!(
-                    target: crate::PREVIEW_COMPAT_LOG_TARGET,
-                    "nobody here for {grace}s, shutting down"
-                );
-                super::shutdown();
+                super::shutdown(&format!("nobody reading for {grace}s"));
             }
         });
     }

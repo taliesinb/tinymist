@@ -180,10 +180,15 @@ pub fn at_shutdown(task: impl FnOnce() + Send + 'static) {
     }
 }
 
-/// What a server does on its way out, however it was asked: withdraw its note
-/// from the register, take down anything it put up, clear up what it rendered,
-/// and go.
-pub fn shutdown() -> ! {
+/// What a server does on its way out, however it was asked: say why, withdraw
+/// its note from the register, take down anything it put up, clear up what it
+/// rendered, and go.
+///
+/// The reason is said in the same stream as everything else the server narrates,
+/// because a server that stops without saying why is a server somebody has to
+/// go looking for.
+pub fn shutdown(reason: &str) -> ! {
+    crate::tool::registry::announce_shutdown(reason);
     run_shutdown_tasks();
     std::process::exit(0);
 }
@@ -313,16 +318,16 @@ fn age_of(when: Option<std::time::SystemTime>) -> u64 {
 /// helpers; a PDF could be read the same way. A few dozen files is a few dozen
 /// small reads, which is nothing; a few thousand is a listing that takes a
 /// moment, and the titles are not worth it.
-static PREPARSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+static INTROSPECT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
-/// Says whether documents are read for their titles.
-pub fn set_preparse(on: bool) {
-    PREPARSE.store(on, std::sync::atomic::Ordering::Relaxed);
+/// Says whether files are read to describe them.
+pub fn set_introspect(on: bool) {
+    INTROSPECT.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Whether they are.
-pub fn preparse() -> bool {
-    PREPARSE.load(std::sync::atomic::Ordering::Relaxed)
+pub fn introspect() -> bool {
+    INTROSPECT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// The `.typ` files directly under a directory, sorted, as listing entries.
@@ -346,7 +351,7 @@ pub fn entries_in(dir: &Path) -> Vec<DocEntry> {
             let slug = path.file_stem()?.to_string_lossy().into_owned();
             // Not read at all: every `.typ` file is a document, and its name is
             // what it is called.
-            if !preparse() {
+            if !introspect() {
                 return Some(DocEntry {
                     title: slug.clone(),
                     slug,

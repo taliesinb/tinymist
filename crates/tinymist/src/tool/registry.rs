@@ -119,6 +119,38 @@ pub fn announce_server(note: &ServerNote) -> std::io::Result<PathBuf> {
     Ok(path)
 }
 
+/// Says that this server is starting, and what it is serving.
+///
+/// The first line a reader of the stream sees, and the one that says which
+/// server the rest of the lines belong to.
+pub fn announce_init(note: &ServerNote, name: Option<&str>) {
+    tinymist_project::announce(
+        "init",
+        &[
+            ("server", note.server.clone().into()),
+            ("path", note.path.clone().into()),
+            ("root_name", name.unwrap_or_default().into()),
+            ("url", note.url.clone().into()),
+            ("pid", note.pid.into()),
+            (
+                "shared",
+                note.shared.clone().unwrap_or_default().into(),
+            ),
+        ],
+    );
+}
+
+/// Says that this server is stopping, and why.
+pub fn announce_shutdown(reason: &str) {
+    tinymist_project::announce(
+        "shutdown",
+        &[
+            ("reason", reason.into()),
+            ("pid", std::process::id().into()),
+        ],
+    );
+}
+
 /// The process that started this one, where that can be asked.
 pub fn parent_pid() -> u32 {
     #[cfg(unix)]
