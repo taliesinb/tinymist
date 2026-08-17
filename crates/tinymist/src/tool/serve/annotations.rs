@@ -153,6 +153,17 @@ pub trait AnnotationServer: Send + Sync {
         Err("this server cannot audit annotations".into())
     }
 
+    /// Locations taken against an older rendering, expressed against the
+    /// current one. A location that cannot be found again comes back as
+    /// `None`.
+    fn relocate(
+        &self,
+        _render: &str,
+        _locations: &[tinymist_annos::HtmlLocation],
+    ) -> Result<Vec<Option<tinymist_annos::HtmlLocation>>, String> {
+        Err("this server cannot relocate".into())
+    }
+
     /// Rewrites that block, returning the annotations whose anchors the
     /// rewrite deliberately dropped.
     fn replace_block(
@@ -1096,6 +1107,30 @@ impl crate::tool::serve::AnnotationServer for DiskAnnotationServer {
             ],
         );
         Ok(edit.dropped)
+    }
+
+    fn relocate(
+        &self,
+        render: &str,
+        locations: &[tinymist_annos::HtmlLocation],
+    ) -> Result<Vec<Option<tinymist_annos::HtmlLocation>>, String> {
+        let art = self.art()?;
+        let document = document_path(&art).ok_or("cannot determine the document path")?;
+        let was = super::renders::get(&document, render)
+            .ok_or("that rendering is no longer held; reload the page and try again")?;
+        let now = super::renders::latest().ok_or("nothing has been rendered yet")?;
+        let now_text = std::fs::read_to_string(&document)
+            .map_err(|err| format!("cannot read {}: {err}", document.display()))?;
+        let ctx = tinymist_annos::relocate::Between {
+            was: &was.map,
+            was_text: &was.text,
+            now: &now,
+            now_text: &now_text,
+        };
+        Ok(locations
+            .iter()
+            .map(|location| tinymist_annos::relocate::relocate(&ctx, location))
+            .collect())
     }
 
     fn audit(&self) -> Result<serde_json::Value, String> {

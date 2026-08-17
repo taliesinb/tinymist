@@ -263,14 +263,21 @@ fn stop_server(host: &str, port: u16) {
     }
 }
 
-/// Waits for a server of an older build to let go of the port it holds.
-fn wait_for_port(host: &str, port: u16) {
-    for _ in 0..40 {
+/// Waits for a server to let go of the port it holds.
+///
+/// A server asked to stop finishes what it is doing first — a compile, a
+/// request — so this waits in seconds rather than in milliseconds. It reports
+/// whether the address came free, since a caller that meant to take it has
+/// something to say when it did not.
+fn wait_for_port(host: &str, port: u16, patience: std::time::Duration) -> bool {
+    let until = std::time::Instant::now() + patience;
+    while std::time::Instant::now() < until {
         if probe(host, port).is_none() {
-            return;
+            return true;
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
+    probe(host, port).is_none()
 }
 
 /// Opens a URL as the arguments ask, the same way the preview does.
@@ -439,10 +446,18 @@ pub fn serve_main(args: ServeArgs) -> Result<()> {
     // from the path for exactly this reason, and a server whose binary has been
     // replaced has already exited on its own. Asking for it again means "show
     // it to me", not "bind this port twice".
-    // Asked to take the address: whatever is there is told to stop first.
+    // Asked to take the address: whatever is there is told to stop first, and
+    // this waits for it to go. Saying "already serving" here would be the one
+    // thing the flag exists to prevent.
     if args.force_launch && probe(&args.host, port).is_some() {
         stop_server(&args.host, port);
-        wait_for_port(&args.host, port);
+        if !wait_for_port(&args.host, port, std::time::Duration::from_secs(20)) {
+            return Err(error_once!(
+                "the server on this address will not let go of it",
+                url: url,
+            ));
+        }
+        eprintln!("stopped the server on {url}");
     }
     match probe(&args.host, port) {
         Some(stamp) if stamp == tinymist::tool::webapp::build_stamp() => {
@@ -454,7 +469,9 @@ pub fn serve_main(args: ServeArgs) -> Result<()> {
         }
         // An older build is still there: it has been told to stop and is about
         // to, so this one waits for its address rather than taking its place.
-        Some(_) => wait_for_port(&args.host, port),
+        Some(_) => {
+            wait_for_port(&args.host, port, std::time::Duration::from_secs(20));
+        }
         None => {}
     }
 

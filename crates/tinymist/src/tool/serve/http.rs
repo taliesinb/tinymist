@@ -643,6 +643,36 @@ pub async fn make_http_server(
                         .body(Body::new(Full::<Bytes>::from(body)))
                         .unwrap();
                     Ok(res)
+                } else if path == "/dev/html/relocate" && annot.is_some() {
+                    // Locations a page is holding against a rendering that has
+                    // been replaced, expressed against the one it is showing
+                    // now. A page asks after a compile; what it holds is what
+                    // it has not managed to send.
+                    use http_body_util::BodyExt;
+                    #[derive(serde::Deserialize)]
+                    struct Ask {
+                        render: String,
+                        #[serde(default)]
+                        locations: Vec<tinymist_annos::HtmlLocation>,
+                    }
+                    let annot = annot.unwrap();
+                    let body = req.into_body().collect().await?.to_bytes();
+                    let asked = serde_json::from_slice::<Ask>(&body)
+                        .map_err(|err| err.to_string())
+                        .and_then(|ask| annot.relocate(&ask.render, &ask.locations));
+                    let payload = match asked {
+                        Ok(locations) => serde_json::json!({
+                            "ok": true,
+                            "locations": locations,
+                        }),
+                        Err(err) => serde_json::json!({"ok": false, "error": err}),
+                    };
+                    let res = hyper::Response::builder()
+                        .header(hyper::header::CONTENT_TYPE, "application/json")
+                        .header(hyper::header::CACHE_CONTROL, "no-cache")
+                        .body(Body::new(Full::<Bytes>::from(payload.to_string())))
+                        .unwrap();
+                    Ok(res)
                 } else if path.starts_with("/dev/html/") && html.is_some() {
                     // HTML mode's own endpoints. The document arrives as a
                     // fragment with every piece labelled with the source range

@@ -86,6 +86,10 @@ pub struct OverlayPayload {
     /// itself changing — somebody replied, an agent claimed something, a file
     /// was edited outside the compile. A page fetches them again when it moves.
     pub anno_version: u64,
+    /// The process answering. A page that sees this change is talking to a
+    /// server that has been restarted, which is a different thing from the same
+    /// server having new assets, and the two are worth telling apart.
+    pub pid: u32,
 }
 
 /// The vertical extent of a block on a page.
@@ -118,6 +122,7 @@ impl Default for OverlayPayload {
             asset_version: 0,
             doc_version: 0,
             anno_version: 0,
+            pid: std::process::id(),
         }
     }
 }
@@ -496,6 +501,7 @@ pub fn diagnostics_payload(
         asset_version: 0,
         doc_version: 0,
         anno_version: 0,
+        pid: std::process::id(),
     }
 }
 

@@ -2446,6 +2446,10 @@
   //
   // One store for drafts and pending annotations alike, since they are the same
   // thing at different stages and differ only in whether they have been sent.
+  // Why the page reloaded, written just before it does and read once it is
+  // back. The page cannot otherwise tell a reload it asked for from one the
+  // reader asked for.
+  const RELOADED = `tinymist-html-reloaded:${BASE}`;
   const HELD = `tinymist-html-held:${BASE}`;
   const HELD_FIELDS = [
     "uuid",
@@ -3026,6 +3030,86 @@
     if (passing === CANNOT_LOAD) showBanner(null);
   };
 
+  // Whether this page has shown a document yet, for telling the first arrival
+  // from every one after it.
+  let shown = false;
+  const announceLoad = (res) => {
+    const first = !shown;
+    const changed = !!renderId && res.render !== renderId;
+    shown = true;
+    // A page that has just reloaded has already said why, and the document
+    // arriving is what a reload *is*: saying it again would replace the reason
+    // with a consequence. The console still records it.
+    const quiet = Date.now() - reloadedAt < PASSING;
+    if (quiet) {
+      // nothing on the banner
+    } else if (first) showBanner("Document loaded", "note");
+    else if (changed) showBanner("Document updated", "ok");
+    // The document is loaded twice in quick succession when a page opens —
+    // once by the page, once when the first compile reports — and the second
+    // is not news.
+    else if (Date.now() - announcedAt > SETTLE) showBanner("Document reloaded", "note");
+    announcedAt = Date.now();
+    const files = (res.map && res.map.files) || [];
+    console.log(
+      `talimist: ${first ? "loaded" : changed ? "updated" : "reloaded"}`,
+      {
+        document: files[0] ? files[0].path : documentName(res),
+        source: files[0] ? files[0].hash : undefined,
+        render: res.render,
+        was: renderId || undefined,
+        files: files.length,
+        serverPid,
+      },
+    );
+  };
+
+  // When the page last said something about a load, and when it last said why
+  // it reloaded.
+  let announcedAt = 0;
+  let reloadedAt = 0;
+  // How close together two loads have to be to count as one.
+  const SETTLE = 2000;
+
+  // Locations this page is holding, carried from the rendering they were taken
+  // against to the one now on the page.
+  //
+  // Drawing them where they last were is what happens without this, and that is
+  // right only for as long as the text does not move. A draft written while
+  // somebody edits the paragraph above it would otherwise end up pointing at
+  // whatever slid into its place.
+  const carryLocal = (was) => {
+    const held = local.filter((pin) => pin.location);
+    if (!held.length) return;
+    post("/dev/html/relocate", {
+      render: was,
+      locations: held.map((pin) => pin.location),
+    }).then((res) => {
+      if (!res || !res.ok || !Array.isArray(res.locations)) return;
+      let moved = 0;
+      let lost = 0;
+      held.forEach((pin, at) => {
+        // A place that is no longer in the document leaves its annotation
+        // about the document instead. It keeps its letter and its words, it is
+        // drawn in the corner with the others that lost their place, and it can
+        // be read and copied — which a mark frozen over text it no longer
+        // names cannot claim.
+        const now = res.locations[at] || { type: "document" };
+        if (!res.locations[at]) lost += 1;
+        else moved += 1;
+        pin.location = now;
+        // What is sent when it goes travels with it: the draft points at the
+        // rendering the page is showing, not the one it was written against.
+        if (pin.draft) pin.draft = { ...pin.draft, location: now, render: renderId };
+        delete pin.held;
+      });
+      if (moved || lost) console.log("talimist: carried", { moved, lost, render: renderId });
+      keepHeld();
+      render();
+      refreshOpen();
+    });
+  };
+
   // What to call the document: the file it was rendered from, by name.
   const documentName = (res) => {
     const path = res.map && res.map.files && res.map.files[0] && res.map.files[0].path;
@@ -3041,15 +3125,12 @@
           return;
         }
         loaded();
-        // A compile that produced a different rendering is worth saying: the
-        // page changed under whoever is reading it, and which version it is
-        // now showing is the one thing they cannot see.
-        if (res.render && res.render !== renderId) {
-          showBanner(
-            `Loaded ${documentName(res)}, version ${res.render.slice(0, 8)}`,
-            "note",
-          );
-        }
+        const was = renderId;
+        // Which document the page is showing, and which version of it, is the
+        // one thing the reader cannot see. The banner says which of the three
+        // things happened; the console says everything about it, since a line
+        // long enough to be complete is too long to read at a glance.
+        announceLoad(res);
         const doc = document.getElementById(DOC_ID);
         if (!doc) return;
         // The rendering and its map arrive together, so the ids in one always
@@ -3065,6 +3146,11 @@
         // Indexed on every fetch: the map may have changed even when the body
         // did not, and the index is what everything else looks things up in.
         indexDocument();
+        // What this page is still holding was written against the rendering
+        // that has just been replaced, and every id in it means something else
+        // now. The server knows where those places went, since it knows what
+        // the document was and what it is.
+        if (was && was !== renderId) carryLocal(was);
       })
       .catch(() => cannotLoad(null));
 
@@ -3094,6 +3180,7 @@
 
   let assetVersion = null;
   let docVersion = null;
+  let serverPid = null;
   const listen = () => {
     const sse = new EventSource(url("/dev/diagnostics"));
     sse.onmessage = (ev) => {
@@ -3104,8 +3191,33 @@
       } catch (err) {
         return;
       }
+      // Which process is answering, and which version of the page it is
+      // serving. A different process is a server that has been restarted; the
+      // same process with new assets is this page's own script and styles
+      // having changed. Both mean the page reloads, and they are worth telling
+      // apart afterwards.
+      if (serverPid === null && data.pid) {
+        serverPid = data.pid;
+        console.log("talimist: connected", {
+          serverPid,
+          assets: data.assetVersion,
+          url: location.href,
+        });
+      } else if (data.pid && data.pid !== serverPid) {
+        try {
+          sessionStorage.setItem(RELOADED, `server ${serverPid} ${data.pid}`);
+        } catch (err) {}
+        return void location.reload();
+      }
       if (assetVersion === null) assetVersion = data.assetVersion;
-      else if (data.assetVersion !== assetVersion) return void location.reload();
+      else if (data.assetVersion !== assetVersion) {
+        // The page is about to reload itself, and afterwards it has no way of
+        // knowing why: a note left here is what it reads when it comes back.
+        try {
+          sessionStorage.setItem(RELOADED, `client ${data.assetVersion}`);
+        } catch (err) {}
+        return void location.reload();
+      }
       compileErrors = data.ok ? null : data.messages;
       showStatus(compileErrors);
       // A compile that produced the same page is not a reason to fetch it
@@ -3159,8 +3271,10 @@
   let passing = null;
   let passingKind = "warn";
   let passingTimer = null;
-  // How long something that has just happened stays on the page.
-  const PASSING = 3000;
+  // How long something that has just happened stays on the page, and how long
+  // it takes to go once its time is up.
+  const PASSING = 5000;
+  const PASSING_FADE = 1000;
   const paintBanner = () => {
     const text = standing || working || passing;
     let el = document.getElementById(BANNER_ID);
@@ -3176,6 +3290,7 @@
     // Waiting for something, or being told what was loaded, is not the same as
     // something being wrong, and the two do not look alike.
     el.dataset.kind = standing ? "warn" : working === text ? "note" : passingKind;
+    if (text !== el.textContent) el.classList.remove("tm-going");
     el.textContent = text;
   };
   const holdBanner = (text) => {
@@ -3190,7 +3305,15 @@
     passing = text || null;
     passingKind = kind || "warn";
     clearTimeout(passingTimer);
-    if (passing) passingTimer = setTimeout(() => showBanner(null), PASSING);
+    if (passing) {
+      // Faded rather than removed, and removed when the fade is done: a line
+      // that vanishes mid-sentence reads as a glitch.
+      passingTimer = setTimeout(() => {
+        const el = document.getElementById(BANNER_ID);
+        if (el && !standing && !working) el.classList.add("tm-going");
+        passingTimer = setTimeout(() => showBanner(null), PASSING_FADE);
+      }, PASSING - PASSING_FADE);
+    }
     paintBanner();
   };
 
@@ -3431,6 +3554,21 @@
     // Anything that never reached the server goes again.
     flush();
   };
+
+  // Said once, on the way back in.
+  try {
+    const why = (sessionStorage.getItem(RELOADED) || "").split(" ");
+    if (why[0]) sessionStorage.removeItem(RELOADED);
+    if (why[0] === "server") {
+      reloadedAt = Date.now();
+      showBanner("Server reloaded", "warn");
+      console.log("talimist: server reloaded", { was: why[1], now: why[2] });
+    } else if (why[0] === "client") {
+      reloadedAt = Date.now();
+      showBanner("Client reloaded", "warn");
+      console.log("talimist: client reloaded", { assets: why[1] });
+    }
+  } catch (err) {}
 
   watchConnection();
   setInterval(beat, BEAT);

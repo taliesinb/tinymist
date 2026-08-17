@@ -24,6 +24,7 @@ pub mod audit;
 pub mod location;
 pub mod migrate;
 pub mod record;
+pub mod relocate;
 pub mod render_map;
 pub mod resolve;
 pub mod store;

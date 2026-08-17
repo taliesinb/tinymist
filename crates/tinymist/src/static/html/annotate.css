@@ -11,8 +11,9 @@
   /* The one colour the UI chooses for itself, rather than taking from an
      annotation: what "on" looks like. */
   --tm-accent: #3f74c8;
-  /* And what "something is wrong" looks like. */
+  /* And what "something is wrong" looks like, and "something arrived". */
   --tm-warn: #c76a12;
+  --tm-ok: #2e8b57;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -23,6 +24,7 @@
     --tm-halo: #0e0e0e;
     --tm-accent: #5b90e0;
     --tm-warn: #e08b3a;
+    --tm-ok: #4cb07a;
   }
 }
 
@@ -473,6 +475,22 @@ html.tm-offline #tinymist-marks * {
   padding: 6px 10px 8px;
   font: 11px/1.4 system-ui, sans-serif;
   color: rgba(255, 255, 255, 0.4);
+}
+
+/* A passing line goes by fading, over the last second of its time. */
+#tinymist-banner {
+  transition: opacity 1s linear;
+}
+
+#tinymist-banner.tm-going {
+  opacity: 0;
+}
+
+/* A new version of the document arriving is neither a warning nor nothing. */
+#tinymist-banner[data-kind="ok"] {
+  border-color: color-mix(in oklab, var(--tm-ok) 45%, transparent);
+  background: color-mix(in oklab, var(--tm-ok) 20%, var(--tm-bg) 72%);
+  color: color-mix(in oklab, var(--tm-ok) 55%, var(--tm-fg));
 }
 
 #tinymist-banner[data-kind="note"] {
