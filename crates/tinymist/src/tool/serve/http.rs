@@ -49,7 +49,13 @@ pub async fn make_http_server(
     /// count is the honest measure of "is anyone there": a browser keeps idle
     /// TCP connections pooled long after the tab that opened them is gone, but
     /// it tears down the event stream immediately.
-    struct ClientGuard(std::sync::Arc<std::sync::atomic::AtomicUsize>, usize);
+    struct ClientGuard(
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        usize,
+        /// The page the stream belongs to, so that the line saying a client has
+        /// gone names what it was reading.
+        String,
+    );
     impl Drop for ClientGuard {
         fn drop(&mut self) {
             super::http::LIVE_CLIENTS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
@@ -59,7 +65,11 @@ pub async fn make_http_server(
                 .saturating_sub(1);
             tinymist_project::announce(
                 "client_disconnected",
-                &[("id", self.1.into()), ("connected", left.into())],
+                &[
+                    ("id", self.1.into()),
+                    ("url", self.2.clone().into()),
+                    ("connected", left.into()),
+                ],
             );
         }
     }
@@ -573,7 +583,14 @@ pub async fn make_http_server(
                     LIVE_CLIENTS.fetch_add(1, SeqCst);
                     served_anyone.store(true, SeqCst);
                     let id = next_client.fetch_add(1, SeqCst);
-                    let guard = ClientGuard(live.clone(), id);
+                    // Which page is watching: the stream is asked for from the
+                    // page it belongs to, so the page is its address without
+                    // the endpoint on the end.
+                    let page = raw_path
+                        .strip_suffix("dev/diagnostics")
+                        .unwrap_or(&raw_path)
+                        .to_owned();
+                    let guard = ClientGuard(live.clone(), id, page.clone());
                     if tinymist_project::announcing() {
                         // Who, from the same header the annotations take their
                         // author from: behind `tailscale serve` that is the
@@ -599,6 +616,7 @@ pub async fn make_http_server(
                             "client_connected",
                             &[
                                 ("id", id.into()),
+                                ("url", page.clone().into()),
                                 ("name", name.into()),
                                 ("useragent", agent.into()),
                                 ("ip", ip.into()),
