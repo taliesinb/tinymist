@@ -122,7 +122,8 @@
   /* What is not being shown, between the beginning of the run and its end. */
   .tm-more {
     padding: 0.35rem 0.6rem;
-    color: color-mix(in oklab, var(--tm-fg) 45%, transparent);
+    text-align: center;
+    color: color-mix(in oklab, var(--tm-fg) 28%, transparent);
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   }
 
@@ -370,16 +371,17 @@
       }
       docs.textContent = "";
       document.querySelector(".tm-listing").classList.toggle("tm-browsing", browsing);
-      // The first of them, then the last two, with what was skipped said in
-      // between: the end of a run is worth seeing — it says how far the letter
-      // reaches — and a page that stops at thirteen looks like a page that
-      // found thirteen.
+      // The first of them, then the last two, with a mark between: the end of a
+      // run is worth seeing — it says how far the letter reaches — and a page
+      // that stops at thirteen looks like a page that found thirteen.
       const cut = browsing && shown.length > HEAD + TAIL + 1;
       if (cut) {
         for (const row of shown.slice(0, HEAD)) drawRow(row);
         const li = document.createElement("li");
         li.className = "tm-more";
-        li.textContent = `… ${shown.length - HEAD - TAIL} more`;
+        // How many were skipped is said beside the search field; here it is
+        // enough to say that some were.
+        li.textContent = "⋮";
         docs.append(li);
         for (const row of shown.slice(-TAIL)) drawRow(row);
       } else {

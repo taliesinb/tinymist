@@ -167,7 +167,25 @@ pub async fn make_http_server(
                 // after the mode's prefix — `/a/paper/dev/html/doc` — and a
                 // single document leaves it out, so the same dispatch serves
                 // both and every endpoint sits under the page that uses it.
-                let raw_path = req.uri().path().to_owned();
+                // Read back from what a browser sent: a document called
+                // 道德經 arrives as `%E9%81%93%E5%BE%B7%E7%B6%93`, and a file of
+                // that name is not found by looking for one called `%E9%81%93…`.
+                //
+                // Decoding is also how a path climbs out of what is being
+                // served — `%2e%2e%2f` is `../`, which the raw path could not
+                // contain — so a decoded path that says `..` anywhere is
+                // refused here rather than trusted to be caught later.
+                let raw_path = unescape(req.uri().path(), false);
+                if raw_path
+                    .split('/')
+                    .any(|part| part == ".." || part.contains('\0'))
+                {
+                    return Ok(hyper::Response::builder()
+                        .status(hyper::StatusCode::BAD_REQUEST)
+                        .header(hyper::header::CONTENT_TYPE, "text/plain")
+                        .body(Body::new(Full::<Bytes>::from("no\n")))
+                        .unwrap());
+                }
                 let listing = site.is_listing();
                 // What a path under a directory names is the directory's own
                 // business: a document may be several directories down, and
@@ -506,7 +524,7 @@ pub async fn make_http_server(
                             query
                                 .split('&')
                                 .find_map(|pair| pair.strip_prefix("under="))
-                                .map(unescape)
+                                .map(|value| unescape(value, true))
                         })
                         .unwrap_or_default();
                     let dir = match site.locate(&under) {
@@ -1156,9 +1174,12 @@ fn mime_of(path: &std::path::Path) -> &'static str {
     }
 }
 
-/// A query value with its escapes read back: a path with a space in it arrives
-/// as `%20`, and a directory listing is asked for by path.
-fn unescape(value: &str) -> String {
+/// A query value with its escapes read back.
+///
+/// `plus_is_space` is the difference between the two places this is used: in a
+/// query a `+` stands for a space, and in a path it is a plus, which is a
+/// character a file name may have.
+fn unescape(value: &str, plus_is_space: bool) -> String {
     let bytes = value.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut at = 0;
@@ -1177,7 +1198,7 @@ fn unescape(value: &str) -> String {
                     }
                 }
             }
-            b'+' => {
+            b'+' if plus_is_space => {
                 out.push(b' ');
                 at += 1;
             }
