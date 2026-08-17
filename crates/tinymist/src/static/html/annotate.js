@@ -2810,6 +2810,23 @@
     holdBanner(online ? null : "No connection; changes stored locally");
   };
 
+  // While the server is there, ask for something small every few seconds as
+  // well. The event stream is what usually reports the server going away, but a
+  // connection that is cut rather than closed — the machine sleeps, the network
+  // drops, Safari holds a stream open that nothing is behind — never errors,
+  // and the page would go on believing it is connected.
+  const BEAT = 5000;
+  const BEAT_WAIT = 4000;
+  const beat = () => {
+    if (flying || !online) return;
+    const stop = new AbortController();
+    const timer = setTimeout(() => stop.abort(), BEAT_WAIT);
+    fetch(url("/dev/build"), { signal: stop.signal })
+      .then((r) => setOnline(r.ok))
+      .catch(() => setOnline(false))
+      .finally(() => clearTimeout(timer));
+  };
+
   // While the server is away, ask for something small every few seconds; the
   // first answer puts the page back together.
   let retrying = null;
@@ -2972,6 +2989,7 @@
   // thing to measure once.
   window.addEventListener("resize", measureStatus);
   watchConnection();
+  setInterval(beat, BEAT);
   refresh()
     .then(() => sendStored())
     .then(listen);
