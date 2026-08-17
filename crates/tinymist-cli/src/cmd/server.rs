@@ -311,6 +311,11 @@ pub fn build_document(cfg: &DocConfig, input: &Path) -> Result<(Arc<DocServices>
                 for path in html::asset_paths() {
                     stamps.push(std::fs::metadata(path).and_then(|m| m.modified()).ok());
                 }
+                // The reader's own stylesheet is one of the page's assets:
+                // editing it reloads the pages that are showing it.
+                if let Some(css) = tinymist::tool::webapp::injected_css() {
+                    stamps.push(std::fs::metadata(css).and_then(|m| m.modified()).ok());
+                }
                 if stamps != asset_mtime {
                     asset_mtime = stamps;
                     if !first {

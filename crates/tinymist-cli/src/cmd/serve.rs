@@ -141,6 +141,14 @@ pub struct ServeArgs {
     #[clap(long = "daemon")]
     pub daemon: bool,
 
+    /// A stylesheet of your own, put in front of every document this server
+    /// shows — not the listing, which is the server's own page. Read from disk
+    /// on every request, and watched: editing it reloads the pages that are
+    /// open. Use it to give a collection a look of its own without touching the
+    /// documents.
+    #[clap(long = "inject-typst-css", value_name = "FILE")]
+    pub inject_typst_css: Option<PathBuf>,
+
     /// Do not read files to list them. Every `.typ` file is offered, named by
     /// its file name rather than by its title, and nothing is opened. A
     /// directory of thousands of documents is listed at once this way; a
@@ -447,6 +455,11 @@ pub fn serve_main(args: ServeArgs) -> Result<()> {
     tinymist::tool::webapp::note_build_stamp();
     if args.no_file_introspection {
         tinymist::tool::serve::set_introspect(false);
+    }
+    if let Some(css) = &args.inject_typst_css {
+        let css = std::fs::canonicalize(css)
+            .with_context("cannot find the stylesheet to inject", || None)?;
+        tinymist::tool::webapp::set_injected_css(Some(css));
     }
     if let Some(ms) = args.annotate_latency {
         tinymist::tool::serve::set_annotate_latency(ms);

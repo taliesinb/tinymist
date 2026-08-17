@@ -228,6 +228,25 @@ pub async fn make_http_server(
 
                     // Return the response so the spawned future can continue.
                     Ok(response.map(|b| Body::new(b)))
+                } else if raw_path == crate::tool::webapp::CSS_ROUTE {
+                    // The reader's own stylesheet, read from disk on every
+                    // request so an edit to it needs no restart. Not announced:
+                    // it is furniture, asked for once per page.
+                    let said = crate::tool::webapp::injected_css()
+                        .and_then(|path| std::fs::read(path).ok());
+                    let res = match said {
+                        Some(bytes) => hyper::Response::builder()
+                            .header(hyper::header::CONTENT_TYPE, "text/css; charset=utf-8")
+                            .header(hyper::header::CACHE_CONTROL, "no-cache")
+                            .body(Body::new(Full::<Bytes>::from(bytes)))
+                            .unwrap(),
+                        None => hyper::Response::builder()
+                            .status(hyper::StatusCode::NOT_FOUND)
+                            .header(hyper::header::CONTENT_TYPE, "text/plain")
+                            .body(Body::new(Full::<Bytes>::from("no stylesheet\n")))
+                            .unwrap(),
+                    };
+                    Ok(res)
                 } else if let Some(icon) = crate::tool::webapp::icon_asset(&raw_path, port, &identity) {
                     let res = hyper::Response::builder()
                         .header(hyper::header::CONTENT_TYPE, "image/png")
@@ -308,7 +327,7 @@ pub async fn make_http_server(
                         let page = super::listing_html()
                             .replace("href=\"dev/", &format!("href=\"{prefix}dev/"))
                             .replace("src=\"dev/", &format!("src=\"{prefix}dev/"));
-                        let body = crate::tool::webapp::mode_head(&page, &identity, port);
+                        let body = crate::tool::webapp::mode_head(&page, &identity, port, true);
                         return Ok(hyper::Response::builder()
                             .header(hyper::header::CONTENT_TYPE, "text/html; charset=utf-8")
                             .body(Body::new(Full::<Bytes>::from(body)))
@@ -343,6 +362,7 @@ pub async fn make_http_server(
                         std::str::from_utf8(&frontend_html).unwrap_or_default(),
                         &identity,
                         port,
+                        false,
                     );
                     let res = hyper::Response::builder()
                         .header(hyper::header::CONTENT_TYPE, "text/html; charset=utf-8")

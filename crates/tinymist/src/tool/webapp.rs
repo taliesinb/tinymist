@@ -110,6 +110,35 @@ pub fn build_stamp() -> String {
 /// This is the prefix to write in front of the names a page is given.
 static PUBLIC_BASE: std::sync::RwLock<String> = std::sync::RwLock::new(String::new());
 
+/// A stylesheet of the reader's own, put in front of every document this
+/// server shows.
+///
+/// A document rendered to HTML is styled by the annotator's own stylesheet,
+/// which is about a page rather than about a document. A collection with a look
+/// of its own — a wiki, a handbook — brings its own, and this is where it is
+/// kept: the path on disk, which is read on every request so an edit needs no
+/// restart. It is for documents: the listing is the server's own page and is
+/// left alone.
+static INJECTED_CSS: std::sync::RwLock<Option<std::path::PathBuf>> =
+    std::sync::RwLock::new(None);
+
+/// The route it is served at. Its own, rather than a file under the directory
+/// being served: a stylesheet given on the command line is not part of what is
+/// being read, and a listing that offered it would be listing the furniture.
+pub const CSS_ROUTE: &str = "/c/typst.css";
+
+/// Says which stylesheet to put in front of every page.
+pub fn set_injected_css(path: Option<std::path::PathBuf>) {
+    if let Ok(mut held) = INJECTED_CSS.write() {
+        *held = path;
+    }
+}
+
+/// Where it is on disk, if there is one.
+pub fn injected_css() -> Option<std::path::PathBuf> {
+    INJECTED_CSS.read().ok().and_then(|held| held.clone())
+}
+
 /// Says that this server is reached under a path.
 pub fn set_public_base(base: &str) {
     let base = base.trim_end_matches('/').to_owned();
@@ -168,7 +197,7 @@ pub fn role_of_path(path: &str) -> Option<(IconRole, &str)> {
 /// the name, start URL, icons and scope from the manifest when there is one,
 /// and treats in-scope links as belonging to that app — which is what the
 /// per-mode prefix is for.
-pub fn mode_head(html: &str, identity: &WebAppIdentity, port: u16) -> String {
+pub fn mode_head(html: &str, identity: &WebAppIdentity, port: u16, listing: bool) -> String {
     let prefix = public_prefix(identity.role);
     let manifest = format!("{prefix}manifest.webmanifest");
     let icon = public_path(match identity.role {
@@ -181,12 +210,25 @@ pub fn mode_head(html: &str, identity: &WebAppIdentity, port: u16) -> String {
     // page: the same page is served under `/a/` when it is annotated and `/v/`
     // when it is only read, and a page that looked for one of those in its own
     // address would be wrong in the other mode.
+    // The reader's own stylesheet last, so that it wins where it disagrees
+    // with the annotator's. Documents only: a listing is the server's page.
+    let their_css = (!listing)
+        .then(injected_css)
+        .flatten()
+        .map(|_| {
+            format!(
+                "<link rel=\"stylesheet\" href=\"{}\">",
+                public_path(CSS_ROUTE)
+            )
+        })
+        .unwrap_or_default();
     let head = format!(
         "<title>{title}</title>\
          <meta name=\"tm-mount\" content=\"{prefix}\">\
          <link rel=\"manifest\" href=\"{manifest}\">\
          <link rel=\"apple-touch-icon\" href=\"{icon}\">\
-         <link rel=\"icon\" type=\"image/png\" href=\"{icon}\">"
+         <link rel=\"icon\" type=\"image/png\" href=\"{icon}\">\
+         {their_css}"
     );
 
     // The bundled frontend ships its own title and icon; a browser takes the
