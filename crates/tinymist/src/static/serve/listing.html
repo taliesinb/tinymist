@@ -20,10 +20,23 @@
     margin: 0 0 0.25rem;
   }
 
-  .tm-listing .tm-where {
+  /* The path from the root, each part a way back to it. */
+  .tm-listing h1 {
+    margin-bottom: 2rem;
+  }
+
+  .tm-listing h1 a {
     color: color-mix(in oklab, var(--tm-fg) 55%, transparent);
-    font-size: 0.85rem;
-    margin: 0 0 2rem;
+    text-decoration: none;
+  }
+
+  .tm-listing h1 a:hover {
+    color: var(--tm-fg);
+  }
+
+  .tm-listing h1 .tm-sep {
+    color: color-mix(in oklab, var(--tm-fg) 32%, transparent);
+    padding: 0 0.35rem;
   }
 
   .tm-listing ul {
@@ -36,7 +49,7 @@
     border-top: 1px solid var(--tm-rule);
   }
 
-  .tm-listing a {
+  .tm-listing #tm-docs a {
     display: grid;
     /* A column wide enough for the file names in a directory of documents, so
        the titles beside them line up rather than stepping in and out. */
@@ -50,7 +63,7 @@
     color: inherit;
   }
 
-  .tm-listing a:hover {
+  .tm-listing #tm-docs a:hover {
     background: color-mix(in oklab, var(--tm-fg) 7%, transparent);
   }
 
@@ -93,6 +106,11 @@
     display: none;
   }
 
+  /* Held open, so the page does not jump when the name arrives. */
+  .tm-listing h1:empty::after {
+    content: "\00a0";
+  }
+
   .tm-empty {
     color: color-mix(in oklab, var(--tm-fg) 55%, transparent);
   }
@@ -114,7 +132,6 @@
     padding: 0.35rem 0.5rem;
   }
 
-  .tm-browsing .tm-listing a,
   .tm-browsing #tm-docs a {
     padding: 0.4rem 0.6rem;
   }
@@ -130,6 +147,12 @@
   /* A directory of thousands is not a list to scroll: it is looked into. The
      search field and the letters are how, and they are there only when a
      directory is big enough to need them. */
+  /* A rule that sets `display` beats the browser's own rule for `hidden`, so
+     what is hidden has to say so here as well. */
+  [hidden] {
+    display: none !important;
+  }
+
   .tm-find {
     display: flex;
     align-items: center;
@@ -195,8 +218,7 @@
 </head>
 <body>
 <main class="tm-listing">
-  <h1 id="tm-title">Documents</h1>
-  <p class="tm-where" id="tm-where"></p>
+  <h1 id="tm-title"></h1>
   <div class="tm-find" id="tm-find" hidden>
     <input id="tm-search" type="search" placeholder="fuzzy search" autocomplete="off" spellcheck="false">
     <span class="tm-count" id="tm-count"></span>
@@ -263,7 +285,6 @@
     // What a row is, whatever it is a row of.
     const rowsOf = (data) => {
       const rows = [];
-      if (data.under) rows.push({ kind: "up", href: "../", file: "..", name: "" });
       for (const dir of data.dirs || []) {
         rows.push({ kind: "dir", href: dir + "/", file: dir + "/", name: "" });
       }
@@ -423,11 +444,27 @@
       // What the directory is called, not what is showing it: a listing page
       // is a directory, and "Typst Annotator: hgxz" is the annotator's name for
       // a document it is not showing.
-      const called = (data.title || "Documents").replace(/^[^:]*:\s*/, "");
-      const name = under ? under.split("/").pop() : called;
-      document.title = name;
-      document.getElementById("tm-title").textContent = name;
-      document.getElementById("tm-where").textContent = data.dir || "";
+      const called = (data.title || "").replace(/^[^:]*:\s*/, "");
+      const parts = under ? under.split("/") : [];
+      const name = parts.length ? parts[parts.length - 1] : called;
+      document.title = name || "Documents";
+      // The path from the root, each part above this one a way back to it:
+      // the way out of a directory is the name of what it is in, which is what
+      // a reader looks for and what an ".." row only hints at.
+      const head = document.getElementById("tm-title");
+      head.textContent = "";
+      const step = (label, up) => {
+        const a = document.createElement("a");
+        a.href = "../".repeat(up);
+        a.textContent = label;
+        head.append(a);
+        head.append(text("span", "tm-sep", "/"));
+      };
+      if (parts.length) {
+        step(called, parts.length);
+        parts.slice(0, -1).forEach((part, at) => step(part, parts.length - 1 - at));
+      }
+      head.append(document.createTextNode(name));
       const fresh = rowsOf(data);
       // Redrawn only when it has changed: this is asked for every few seconds,
       // and a page that rebuilds itself under a reader's pointer loses their
