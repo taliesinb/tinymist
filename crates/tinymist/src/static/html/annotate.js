@@ -224,6 +224,8 @@
   const byUid = new Map();
 
   const BLOCK_KINDS = ["block", "para", "item", "math_block", "math.block", "svg", "image"];
+  // Regions with nothing annotatable inside them.
+  const PICTURE_KINDS = ["svg", "image", "math.block"];
   const ATOM_KINDS = ["math", "link", "raw", "inline"];
   const BLOCK_SELECTOR =
     "p,li,dt,dd,figure,table,blockquote,pre,div,section,article,aside,h1,h2,h3,h4,h5,h6";
@@ -240,9 +242,11 @@
   };
 
   // Whether an element holds anything a reader can see: words, or a picture.
+  // An image is a picture and has nothing inside it, so the element itself
+  // counts as well as its descendants.
   const SEEN_INSIDE = "img,svg,math,table,hr,canvas,video,iframe";
   const hasSubstance = (el) =>
-    !!el.textContent.trim() || !!el.querySelector(SEEN_INSIDE);
+    !!el.textContent.trim() || el.matches(SEEN_INSIDE) || !!el.querySelector(SEEN_INSIDE);
 
   const indexDocument = () => {
     forget();
@@ -962,6 +966,7 @@
         if (!el) return null;
         return { scope: kind, boxes: mergeLines(Array.from(el.getClientRects())), el };
       }
+      case "image":
       case "svg": {
         // A drawing is a picture, marked as one: a frame around all of it.
         const el = elementOf(loc.ref);
@@ -1146,10 +1151,11 @@
       openFor(label, pin);
     };
 
-    if (scope === "math.block" || scope === "svg") {
-      // A block equation and a drawing both stand on their own, with space
-      // around them: a strip down one side would say nothing about where they
-      // end. Nothing inside is annotatable on its own, so all of it opens it.
+    if (scope === "math.block" || scope === "svg" || scope === "image") {
+      // A block equation, a drawing and an image all stand on their own, with
+      // space around them: a strip down one side would say nothing about where
+      // they end. Nothing inside is annotatable on its own, so all of it opens
+      // it.
       drawBox(false, geom.enclosed);
       return;
     }
@@ -1874,6 +1880,11 @@
           if (y < line.top - 2 || y > line.top + line.height + 2) continue;
           if (x < line.left || x > box.left - 1) continue;
         }
+      } else if (PICTURE_KINDS.includes(kind)) {
+        // A picture has nothing inside it to annotate instead, so all of it
+        // offers itself rather than only its edges.
+        if (x < box.left - REACH || x > box.right + REACH) continue;
+        if (y < box.top - REACH || y > box.bottom + REACH) continue;
       } else if (REGION_SHAPE === "box") {
         if (!onFrame(x, y, box, block.enclosed)) continue;
       } else {
@@ -2888,6 +2899,7 @@
         raw: "code",
         inline: "inline",
         svg: "drawing",
+        image: "image",
       };
       compose(named[atom.kind] || atom.kind, nodeLocation(atom.kind, atom));
       return;

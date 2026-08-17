@@ -281,6 +281,43 @@ impl RenderMap {
         best.map(|(uid, _)| uid)
     }
 
+    /// A node of one of the given kinds lying inside a stretch of a file.
+    ///
+    /// For a picture whose anchor could not be written beside it. A label may
+    /// not go inside a call's arguments, so an image written as
+    /// `#figure(image(..), caption: ..)` takes its anchor after the whole call,
+    /// and nothing of the image's own kind ends there. What the label names is
+    /// the figure; the picture is the one inside it.
+    pub fn node_within(
+        &self,
+        file: FileIndex,
+        range: SrcRange,
+        kinds: &[NodeKind],
+    ) -> Option<&str> {
+        let mut best: Option<(&str, usize)> = None;
+        for (uid, node) in &self.nodes {
+            if !kinds.is_empty() && !kinds.contains(&node.kind) {
+                continue;
+            }
+            let Some(own) = node.range else { continue };
+            if own.file != file || own.start < range.start || own.end > range.end {
+                continue;
+            }
+            // The widest, since a picture is the largest thing of its kind in
+            // whatever holds it.
+            let width = own.end.saturating_sub(own.start);
+            if best.is_none_or(|(_, known)| width > known) {
+                best = Some((uid.as_str(), width));
+            }
+        }
+        best.map(|(uid, _)| uid)
+    }
+
+    /// The range recorded for a node.
+    pub fn range_of(&self, uid: &str) -> Option<SrcRange> {
+        self.node(uid)?.range
+    }
+
     /// The file a rendering is *of* — the document being annotated, which is
     /// always the first one.
     pub fn document(&self) -> Option<&FileEntry> {

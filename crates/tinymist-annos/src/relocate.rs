@@ -174,6 +174,9 @@ pub fn relocate(ctx: &Between, location: &HtmlLocation) -> Option<HtmlLocation> 
         Location::Svg { reference } => Location::Svg {
             reference: node(reference)?,
         },
+        Location::Image { reference } => Location::Image {
+            reference: node(reference)?,
+        },
         // It names nothing in either rendering.
         Location::Document => Location::Document,
     })

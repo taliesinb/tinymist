@@ -327,6 +327,9 @@ pub fn resolve(ctx: &Context, location: &HtmlLocation) -> Result<Resolution, Fai
                     (&reference.node, |r| Location::Link { reference: r })
                 }
                 Location::Svg { reference } => (&reference.node, |r| Location::Svg { reference: r }),
+                Location::Image { reference } => {
+                    (&reference.node, |r| Location::Image { reference: r })
+                }
                 _ => unreachable!("every location kind is handled"),
             };
             let offset = ctx.offset_after_node(uid)?;
@@ -388,6 +391,31 @@ pub fn project(ctx: &Context, location: &TypstLocation) -> Result<HtmlLocation, 
             pos,
             l: None,
             r: None,
+        })
+    };
+    // A picture's anchor cannot always be written beside it: a label may not go
+    // inside a call's arguments, so an image inside a `#figure(..)` takes its
+    // anchor after the whole call. What the label names is then the figure, and
+    // the picture is the one inside it.
+    let picture_ref = |label: &str,
+                       want: NodeKind|
+     -> Result<crate::location::HtmlNodeRef, Failure> {
+        if let Ok(node) = ctx.rendered_node(label, &[want]) {
+            return Ok(crate::location::HtmlNodeRef {
+                node: node.to_owned(),
+            });
+        }
+        let holder = ctx.rendered_region(label, &BLOCKS)?;
+        let range = ctx
+            .map
+            .range_of(holder)
+            .ok_or_else(|| Failure::NoSource(label.to_owned()))?;
+        let node = ctx
+            .map
+            .node_within(0, range, &[want])
+            .ok_or_else(|| Failure::NoSource(label.to_owned()))?;
+        Ok(crate::location::HtmlNodeRef {
+            node: node.to_owned(),
         })
     };
     let node_ref = |label: &str,
@@ -470,7 +498,10 @@ pub fn project(ctx: &Context, location: &TypstLocation) -> Result<HtmlLocation, 
             reference: node_ref(&reference.label, &[NodeKind::Link])?,
         },
         Location::Svg { reference } => Location::Svg {
-            reference: node_ref(&reference.label, &[NodeKind::Svg])?,
+            reference: picture_ref(&reference.label, NodeKind::Svg)?,
+        },
+        Location::Image { reference } => Location::Image {
+            reference: picture_ref(&reference.label, NodeKind::Image)?,
         },
         // Nothing to look up: it is about the document, and the document is
         // what the page is showing.

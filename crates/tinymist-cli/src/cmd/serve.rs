@@ -127,6 +127,13 @@ pub struct ServeArgs {
     #[clap(long = "daemon")]
     pub daemon: bool,
 
+    /// Keep running when the `talimist` binary is replaced. Normally a server
+    /// stops, since it would otherwise go on serving a build that is no longer
+    /// on disk; while that build is being worked on, a server that outlives it
+    /// is the point.
+    #[clap(long = "survive-rebuild")]
+    pub survive_rebuild: bool,
+
     /// Exit once the last browser disconnects.
     #[clap(long = "shutdown-on-last-client")]
     pub shutdown_on_last_client: bool,
@@ -397,7 +404,9 @@ pub fn serve_main(args: ServeArgs) -> Result<()> {
     if !args.daemon {
         tinymist::tool::preview::exit_when_orphaned();
     }
-    crate::utils::exit_when_binary_replaced();
+    if !args.survive_rebuild {
+        crate::utils::exit_when_binary_replaced();
+    }
 
     // Everything served is rendered to disk once, when it compiles, rather than
     // made again in the answer to every request. The directory is this

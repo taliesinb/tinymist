@@ -315,6 +315,15 @@ pub enum Location<F: Flavor> {
         #[serde(rename = "ref")]
         reference: F::Node,
     },
+    /// An image the document includes: a plot, a photograph, a screenshot.
+    /// Annotated whole, like a drawing, but it comes from a file rather than
+    /// from Typst code.
+    #[serde(rename = "image")]
+    Image {
+        /// The image.
+        #[serde(rename = "ref")]
+        reference: F::Node,
+    },
     /// The document itself, rather than anywhere in it.
     ///
     /// It names no anchor, so nothing about the document can make it stale:
@@ -352,6 +361,7 @@ impl<F: Flavor> Location<F> {
             Self::MathBlock { .. } => "math.block",
             Self::Link { .. } => "link",
             Self::Svg { .. } => "svg",
+            Self::Image { .. } => "image",
             Self::Document => "document",
         }
     }
@@ -391,7 +401,8 @@ impl TypstLocation {
             | Self::Math { reference }
             | Self::MathBlock { reference }
             | Self::Link { reference }
-            | Self::Svg { reference } => vec![reference.label.as_str()],
+            | Self::Svg { reference }
+            | Self::Image { reference } => vec![reference.label.as_str()],
             Self::Document => vec![],
         }
     }
