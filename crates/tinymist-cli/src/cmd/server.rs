@@ -83,12 +83,44 @@ impl DirSite {
     /// The file a name in the URL refers to, if it is one of ours. Names are
     /// file stems and nothing else: no separators, no `..`, so a URL cannot
     /// reach out of the directory it was answered from.
+    /// The file a name stands for, which may be several directories down:
+    /// `report/report` is `<dir>/report/report.typ`.
     fn path_of(&self, slug: &str) -> Option<PathBuf> {
-        if slug.is_empty() || slug.contains(['/', '\\']) || slug.starts_with('.') {
+        if slug.is_empty() {
             return None;
         }
-        let path = self.dir.join(format!("{slug}.typ"));
+        // Appended, not substituted: `with_extension` would turn
+        // `report/report.pdf` into `report/report.typ` and serve a document
+        // where a file was asked for.
+        let path = self.under(&format!("{slug}.typ"))?;
         path.is_file().then_some(path)
+    }
+
+    /// A path under the directory being served, refusing anything that climbs
+    /// out of it or names something hidden.
+    fn under(&self, rest: &str) -> Option<PathBuf> {
+        if rest.is_empty() {
+            return Some(self.dir.clone());
+        }
+        let mut path = self.dir.clone();
+        for part in rest.split('/') {
+            if part.is_empty() || part == "." || part == ".." || part.starts_with('.') {
+                return None;
+            }
+            if part.contains('\\') {
+                return None;
+            }
+            path.push(part);
+        }
+        // Symlinks and the like: what is served has to be under what is being
+        // served, whatever the path looks like.
+        let root = std::fs::canonicalize(&self.dir).ok()?;
+        match std::fs::canonicalize(&path) {
+            Ok(real) => real.starts_with(&root).then_some(path),
+            // Not there yet — a document that has not been written, a name with
+            // `.typ` to be added — which the caller checks for itself.
+            Err(_) => Some(path),
+        }
     }
 }
 
@@ -105,11 +137,70 @@ impl DocumentSite for DirSite {
         tinymist::tool::serve::entries_in(&self.dir)
     }
 
+    /// A path names the longest prefix of itself that is a document, and what
+    /// is left is what is being asked of that document. Failing that it is a
+    /// file to hand over, or a directory to list.
+    fn locate(&self, rest: &str) -> tinymist::tool::serve::Located {
+        use tinymist::tool::serve::Located;
+        let rest = rest.trim_end_matches('/');
+        if rest.is_empty() {
+            return Located::Listing(self.dir.clone());
+        }
+        // Longest first: a document called `report/report` wins over the
+        // directory `report`, and `report/report/dev/html/doc` is that
+        // document being asked for its body.
+        let parts: Vec<&str> = rest.split('/').collect();
+        for take in (1..=parts.len()).rev() {
+            let slug = parts[..take].join("/");
+            if self.path_of(&slug).is_some() {
+                return Located::Document {
+                    slug,
+                    tail: parts[take..].join("/"),
+                };
+            }
+        }
+        let Some(path) = self.under(rest) else {
+            return Located::Missing;
+        };
+        if path.is_dir() {
+            return Located::Listing(path);
+        }
+        if path.is_file() && tinymist::tool::serve::is_asset(&path) {
+            return Located::File(path);
+        }
+        Located::Missing
+    }
+
     fn sidecars(&self) -> Vec<PathBuf> {
-        tinymist::tool::serve::entries_in(&self.dir)
-            .into_iter()
-            .map(|entry| self.dir.join(entry.file).with_extension("annos.typ"))
-            .collect()
+        // Every document under the directory, not only the ones at the top: a
+        // server deciding whether anybody is in the middle of something has to
+        // ask about all of them.
+        fn walk(dir: &Path, depth: usize, found: &mut Vec<PathBuf>) {
+            if depth == 0 {
+                return;
+            }
+            let Ok(read) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in read.flatten() {
+                let path = entry.path();
+                let hidden = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_none_or(|name| name.starts_with('.') || name == "target");
+                if hidden {
+                    continue;
+                }
+                if path.is_dir() {
+                    walk(&path, depth - 1, found);
+                } else if path.extension().is_some_and(|ext| ext == "typ") {
+                    found.push(tinymist_annos::sidecar_path(&path));
+                }
+            }
+        }
+        let mut found = vec![];
+        walk(&self.dir, 6, &mut found);
+        found
     }
 
     fn services<'a>(

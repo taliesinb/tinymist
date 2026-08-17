@@ -94,6 +94,31 @@ pub struct DocEntry {
     pub annotations: usize,
 }
 
+/// What a path under a site names.
+///
+/// A directory holds documents, other files, and more directories, and a path
+/// can be any of them: `report/report` is a document, `report/plot.png` is a
+/// file to hand over as it is, `report` is a directory to list. Only the site
+/// knows which, since only the site knows what is on disk.
+#[derive(Debug, Clone)]
+pub enum Located {
+    /// A document, and what is being asked of it: `/dev/html/doc`, or nothing
+    /// for the page itself.
+    Document {
+        /// Its name, which is its path under the directory without `.typ`.
+        slug: String,
+        /// The rest of the request.
+        tail: String,
+    },
+    /// A file to serve as it is: a PDF, an image, a note in Markdown. A
+    /// directory of documents is also the place their pictures live.
+    File(PathBuf),
+    /// A directory, which is a listing.
+    Listing(PathBuf),
+    /// Nothing of this site's.
+    Missing,
+}
+
 /// A document server's contents, addressed by name.
 pub trait DocumentSite: Send + Sync + 'static {
     /// Whether this site is a directory, and so has a listing to show at its
@@ -120,6 +145,17 @@ pub trait DocumentSite: Send + Sync + 'static {
         vec![]
     }
 
+    /// What a path names: a document, a file, a directory, or nothing.
+    ///
+    /// A site of one document is asked nothing about paths: everything under
+    /// it is that document's.
+    fn locate(&self, rest: &str) -> Located {
+        Located::Document {
+            slug: String::new(),
+            tail: rest.to_owned(),
+        }
+    }
+
     /// The services for one document, built if this is the first time it has
     /// been asked for. The empty name is the single-document case.
     fn services<'a>(
@@ -136,6 +172,92 @@ pub fn shutdown() -> ! {
     }
     cache::drop_site_cache();
     std::process::exit(0);
+}
+
+/// The extensions a directory hands over as they are.
+///
+/// A document's pictures, the PDF it was exported to, the notes beside it: a
+/// directory of documents is where those live, and a reader following a link
+/// to one is not asking for anything to be compiled.
+pub const ASSET_EXTENSIONS: [&str; 12] = [
+    "pdf", "png", "jpg", "jpeg", "gif", "webp", "svg", "md", "txt", "csv", "json", "html",
+];
+
+/// Whether a path is one of those.
+pub fn is_asset(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ASSET_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
+/// Whether a directory holds anything worth listing, at any depth.
+///
+/// A directory of source, or of build output, is not a directory of documents,
+/// and a listing full of them is a listing nobody can read. Bounded: a deep
+/// tree is answered by the first document in it.
+pub fn holds_documents(dir: &Path, depth: usize) -> bool {
+    if depth == 0 {
+        return false;
+    }
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    let mut dirs = vec![];
+    for entry in read.flatten() {
+        let path = entry.path();
+        if hidden(&path) {
+            continue;
+        }
+        if path.is_dir() {
+            dirs.push(path);
+        } else if path.extension().is_some_and(|ext| ext == "typ") && !is_sidecar(&path) {
+            return true;
+        }
+    }
+    dirs.iter().any(|dir| holds_documents(dir, depth - 1))
+}
+
+/// Whether a name is one to leave alone: dotfiles, and the directories that
+/// hold what a build left behind.
+fn hidden(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return true;
+    };
+    name.starts_with('.') || matches!(name, "target" | "node_modules" | "__pycache__")
+}
+
+/// The directories under a directory that hold documents somewhere below.
+pub fn dirs_in(dir: &Path) -> Vec<String> {
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return vec![];
+    };
+    let mut found: Vec<String> = read
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir() && !hidden(path))
+        .filter(|path| holds_documents(path, 6))
+        .filter_map(|path| Some(path.file_name()?.to_string_lossy().into_owned()))
+        .collect();
+    found.sort();
+    found
+}
+
+/// The files under a directory that are served as they are.
+pub fn assets_in(dir: &Path) -> Vec<String> {
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return vec![];
+    };
+    let mut found: Vec<String> = read
+        .flatten()
+        .map(|entry| entry.path())
+        // A sidecar is not a file to read: it is what a document is annotated
+        // with, and it belongs to that document.
+        .filter(|path| path.is_file() && !hidden(path) && is_asset(path) && !is_sidecar(path))
+        .filter_map(|path| Some(path.file_name()?.to_string_lossy().into_owned()))
+        .collect();
+    found.sort();
+    found
 }
 
 /// The `.typ` files directly under a directory, sorted, as listing entries.
@@ -318,6 +440,19 @@ pub fn listing_html() -> String {
 
 /// The directory as the listing page asks for it.
 pub fn listing_json(title: &str, dir: &Path, entries: &[DocEntry]) -> String {
+    listing_json_of(title, dir, entries, &dirs_in(dir), &assets_in(dir), "")
+}
+
+/// The same, for a directory somewhere under the one being served: `under` is
+/// the path from the root, which the page needs to make links with.
+pub fn listing_json_of(
+    title: &str,
+    dir: &Path,
+    entries: &[DocEntry],
+    dirs: &[String],
+    assets: &[String],
+    under: &str,
+) -> String {
     let docs: Vec<_> = entries
         .iter()
         .map(|entry| {
@@ -340,7 +475,12 @@ pub fn listing_json(title: &str, dir: &Path, entries: &[DocEntry]) -> String {
         "ok": true,
         "title": title,
         "dir": dir.display().to_string(),
+        // Where this listing sits under the directory being served, so the page
+        // can say where it is and link out of it.
+        "under": under,
         "docs": docs,
+        "dirs": dirs,
+        "files": assets,
     })
     .to_string()
 }

@@ -240,7 +240,16 @@ fn main() -> Result<()> {
     // Nothing should outlive the binary it came from: a language server or
     // preview left running after `cargo install` would serve code that no
     // longer exists on disk.
-    crate::utils::exit_when_binary_replaced();
+    //
+    // Except a tool a client spawned and speaks to over its own stdin. Nothing
+    // will start it again: the client is told the tool has gone and does not
+    // ask twice, so the session it belongs to loses those tools for good. It
+    // keeps running, old binary and all, and dispatches to servers that are
+    // current.
+    let spawned_by_a_client = matches!(&cmd, Commands::Mcp(args) if args.stdio);
+    if !spawned_by_a_client {
+        crate::utils::exit_when_binary_replaced();
+    }
 
     match cmd {
         Commands::Probe => Ok(()),

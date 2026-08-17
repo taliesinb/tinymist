@@ -141,8 +141,13 @@ pub fn mode_head(html: &str, identity: &WebAppIdentity, port: u16) -> String {
         IconRole::Annotate => (manifest.as_str(), "/icon/anno-192.png"),
     };
     let title = identity.title(port);
+    // Where this page is mounted, said by the server rather than guessed by the
+    // page: the same page is served under `/a/` when it is annotated and `/v/`
+    // when it is only read, and a page that looked for one of those in its own
+    // address would be wrong in the other mode.
     let head = format!(
         "<title>{title}</title>\
+         <meta name=\"tm-mount\" content=\"{prefix}\">\
          <link rel=\"manifest\" href=\"{manifest}\">\
          <link rel=\"apple-touch-icon\" href=\"{icon}\">\
          <link rel=\"icon\" type=\"image/png\" href=\"{icon}\">"

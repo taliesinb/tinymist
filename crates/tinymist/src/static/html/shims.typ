@@ -157,7 +157,42 @@
 // The text size in effect around a run, recorded by the containers on the way
 // past. A run that changes its size can only say so as a ratio — CSS sizes are
 // relative to the parent element — and this is what it is a ratio of.
-#let _base-size = state("talimist-base-size", 11pt)
+// Nothing until something says: a guessed size would make every block in a
+// document set in another size carry a ratio against a number nobody chose.
+#let _base-size = state("talimist-base-size", none)
+
+// How one size compares with another, as CSS says it: `0.8em`, or nothing when
+// the two are the same size.
+#let _size-em(size, base) = {
+  if base == none or base == 0pt { return none }
+  let ratio = size / base
+  if calc.abs(ratio - 1.0) < 0.03 { none } else {
+    str(calc.round(ratio, digits: 3)) + "em"
+  }
+}
+
+// The size a run is compared against, for the length of one element.
+//
+// Recording it is not enough, twice over. A heading is set larger than the
+// prose around it, and a base left at the heading's size makes everything after
+// it look smaller than it is — so what sets it puts it back. And a run inside
+// an element of another size agrees with the new base and says nothing, so the
+// element itself has to say what its runs no longer do: a raw block set at 8pt
+// in a 10pt document would otherwise reach the page at the size of the prose.
+//
+// `carry: false` is for an element that is already building a wrapper and will
+// put the size in it.
+#let _in-base(body, carry: true) = context {
+  let outer = _base-size.get()
+  let own = _size-em(text.size, outer)
+  _base-size.update(text.size)
+  if own == none or not carry {
+    body
+  } else {
+    html.elem("div", attrs: (style: "font-size: " + own), body)
+  }
+  _base-size.update(outer)
+}
 
 // Drawings — cetz canvases, fletcher diagrams, anything that puts shapes on a
 // coordinate grid — are laid out rather than written, and HTML export drops
@@ -323,8 +358,7 @@
   }
   // A centred title is sized against the text around the block it sits in,
   // not against the last paragraph before it.
-  _base-size.update(text.size)
-  _wrap("div", _style(_prop("text-align", _text-align(it.alignment))), it.body)
+  _in-base(_wrap("div", _style(_prop("text-align", _text-align(it.alignment))), it.body))
 }
 
 // A document's palette is chosen against a white page. Read in a dark theme,
@@ -376,7 +410,7 @@
   )
 }
 
-#let _container-style(it) = _style(
+#let _container-props(it) = (
   _prop("background", _ground(it.fill))
     + _prop("color", _contrast(it.fill))
     + _box-sides("padding", it.inset)
@@ -384,25 +418,41 @@
     + _spacing(it)
     + _radius(it.radius)
     + _border(it.stroke)
-    + _prop("width", _len(it.width)),
+    + _prop("width", _len(it.width))
 )
+
+#let _container-style(it) = _style(_container-props(it))
 
 #let _rule-block = it => context {
   // A block is a place where the surrounding text size is settled, so it is
   // also a place to record it: a title inside one is sized against the block,
   // not against whatever paragraph came before.
   if not _html-here() { return it }
-  _base-size.update(text.size)
+  // Recording it is not enough. A block set in another size — a raw block,
+  // which Typst sets smaller than the text around it — makes every run inside
+  // it agree with the new base and say nothing, and the block itself would
+  // carry no size either: the page would show it at the size of the prose. So
+  // the block says what the runs no longer have to.
+  let outer = _base-size.get()
+  let own = if outer == none or outer == 0pt { none } else {
+    let ratio = text.size / outer
+    if calc.abs(ratio - 1.0) < 0.03 { none } else {
+      str(calc.round(ratio, digits: 3)) + "em"
+    }
+  }
   // A drawing inside an `align` is left to the align rule: it knows which way
   // to put the drawing, and a frame made here would take that decision away
   // and leave it flush left.
   let child = _sole-child(it)
   let aligned = child != none and child.func() == align
   if not aligned and _wants-frame(it, 6) { return _frame-drawing(it) }
-  let style = _container-style(it)
+  let style = _style(_container-props(it) + _prop("font-size", own))
   // Left alone, a block still becomes a `<div>`; only its appearance is lost,
   // and only that is worth a wrapper.
-  if style == "" { it } else { html.elem("div", attrs: (style: style), it.body) }
+  _in-base(
+    if style == "" { it } else { html.elem("div", attrs: (style: style), it.body) },
+    carry: false,
+  )
 }
 
 // A box is inline, and its outset paints outside the line without taking part
@@ -466,21 +516,15 @@
 // document would fight the page's own typography and shrink every styled run
 // to boot. The block's size is the only thing a run can be compared against,
 // and only the block knows it, so it leaves it here on the way past.
-#let _rule-par = it => context {
-  _base-size.update(text.size)
-  it
-}
+#let _rule-par = it => _in-base(it)
 
-#let _rule-heading = it => context {
-  _base-size.update(text.size)
-  it
-}
+#let _rule-heading = it => _in-base(it)
 
 // A size worth mentioning: anything that is not the block's own, give or take
 // rounding.
 #let _size-ratio() = {
   let base = _base-size.get()
-  if base == 0pt { return none }
+  if base == none or base == 0pt { return none }
   let ratio = text.size / base
   if calc.abs(ratio - 1.0) < 0.03 { return none }
   str(calc.round(ratio, digits: 3)) + "em"

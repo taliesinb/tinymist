@@ -90,6 +90,9 @@ pub async fn make_http_server(
     // by having asked recently.
     let started = std::time::Instant::now();
     let last_call = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // The listing as it was last reported, so a page asking again every few
+    // seconds does not say the same thing every few seconds.
+    let last_listing = std::sync::Arc::new(parking_lot::Mutex::new(None::<String>));
     let site = site.clone();
     let make_service = {
         let last_call = last_call.clone();
@@ -99,6 +102,7 @@ pub async fn make_http_server(
         let identity = identity.clone();
         let allowed_origins = allowed_origins.clone();
         let next_client = next_client.clone();
+        let last_listing = last_listing.clone();
         move |peer: std::net::SocketAddr| {
         let last_call = last_call.clone();
         let frontend_html = frontend_html.clone();
@@ -110,6 +114,7 @@ pub async fn make_http_server(
         let identity = identity.clone();
         let allowed_origins = allowed_origins.clone();
         let next_client = next_client.clone();
+        let last_listing = last_listing.clone();
         service_fn(move |mut req: hyper::Request<Incoming>| {
             let identity = identity.clone();
             let allowed_origins = allowed_origins.clone();
@@ -119,6 +124,7 @@ pub async fn make_http_server(
             let static_file_addr = static_file_addr.clone();
             let site = site.clone();
             let next_client = next_client.clone();
+            let last_listing = last_listing.clone();
             let live = live.clone();
             let served_anyone = served_anyone.clone();
             async move {
@@ -162,16 +168,28 @@ pub async fn make_http_server(
                 // both and every endpoint sits under the page that uses it.
                 let raw_path = req.uri().path().to_owned();
                 let listing = site.is_listing();
+                // What a path under a directory names is the directory's own
+                // business: a document may be several directories down, and
+                // what is not a document may be a file to hand over or a
+                // directory to list.
+                let mut located = None;
                 let (page_role, slug, path) = match crate::tool::webapp::role_of_path(&raw_path) {
                     // The site's own endpoints — the listing's data, chiefly —
                     // are not a document called `dev`.
                     Some((role, rest)) if listing && rest.starts_with("dev/") => {
                         (Some(role), String::new(), format!("/{rest}"))
                     }
-                    Some((role, rest)) if listing => match rest.split_once('/') {
-                        Some((slug, tail)) => (Some(role), slug.to_owned(), format!("/{tail}")),
-                        None => (Some(role), rest.to_owned(), String::new()),
-                    },
+                    Some((role, rest)) if listing => {
+                        let found = site.locate(rest);
+                        let answer = match &found {
+                            super::Located::Document { slug, tail } => {
+                                (Some(role), slug.clone(), format!("/{tail}"))
+                            }
+                            _ => (Some(role), String::new(), String::new()),
+                        };
+                        located = Some(found);
+                        answer
+                    }
                     Some((role, rest)) => (Some(role), String::new(), format!("/{rest}")),
                     // Assets and the paged frontend's own endpoints are named
                     // absolutely, from a page that is always the only one.
@@ -239,12 +257,48 @@ pub async fn make_http_server(
                     // names the document, which is how one server comes to serve
                     // a directory.
                     let identity = identity.with_role(role);
+                    // A file the directory holds — a PDF, a picture, a note —
+                    // is handed over as it is.
+                    if let Some(super::Located::File(file)) = &located {
+                        return Ok(match file_bytes(file) {
+                            Some((bytes, mime)) => hyper::Response::builder()
+                                .header(hyper::header::CONTENT_TYPE, mime)
+                                .header(hyper::header::CACHE_CONTROL, "no-cache")
+                                .body(Body::new(Full::<Bytes>::from(bytes)))
+                                .unwrap(),
+                            None => hyper::Response::builder()
+                                .status(hyper::StatusCode::NOT_FOUND)
+                                .header(hyper::header::CONTENT_TYPE, "text/plain")
+                                .body(Body::new(Full::<Bytes>::from("cannot read that file\n")))
+                                .unwrap(),
+                        });
+                    }
+                    if let Some(super::Located::Missing) = &located {
+                        return Ok(hyper::Response::builder()
+                            .status(hyper::StatusCode::NOT_FOUND)
+                            .header(hyper::header::CONTENT_TYPE, "text/plain")
+                            .body(Body::new(Full::<Bytes>::from(format!(
+                                "nothing here: {raw_path}\n"
+                            ))))
+                            .unwrap());
+                    }
                     if listing && slug.is_empty() {
-                        // The directory's own front page. It holds no documents
-                        // — it asks for them — so it is the same page whatever
-                        // is in the directory, and can be an asset like the
+                        // The directory's own front page, and the same page for
+                        // every directory under it. It holds no documents — it
+                        // asks for them — so it can be an asset like the
                         // annotator's own script and stylesheet.
-                        let body = crate::tool::webapp::mode_head(&super::listing_html(), &identity, port);
+                        //
+                        // Its stylesheet is named at the mount rather than
+                        // beside the page: the same page is served at every
+                        // depth, and a relative name at `/a/report/` would ask
+                        // for a stylesheet inside a directory. A document's own
+                        // page keeps the relative name, since there the tail
+                        // after the document *is* the endpoint.
+                        let prefix = crate::tool::webapp::role_prefix(role);
+                        let page = super::listing_html()
+                            .replace("href=\"dev/", &format!("href=\"{prefix}dev/"))
+                            .replace("src=\"dev/", &format!("src=\"{prefix}dev/"));
+                        let body = crate::tool::webapp::mode_head(&page, &identity, port);
                         return Ok(hyper::Response::builder()
                             .header(hyper::header::CONTENT_TYPE, "text/html; charset=utf-8")
                             .body(Body::new(Full::<Bytes>::from(body)))
@@ -408,18 +462,55 @@ pub async fn make_http_server(
                     Ok(res)
                 } else if path == "/dev/docs" && listing {
                     // What the listing page draws: the directory as it is now.
+                    //
+                    // The page asks again every few seconds, and saying so
+                    // every time buries everything else the server has to say.
+                    // Only a listing that has changed is worth a line.
                     let began = std::time::Instant::now();
-                    let entries = site.listing();
-                    tinymist_project::announce(
-                        "compiled_listing",
-                        &[
-                            ("path", site.root().display().to_string().into()),
-                            ("file_count", entries.len().into()),
-                            ("elapsed", began.elapsed().as_secs_f64().into()),
-                        ],
+                    // Which directory: the one being served, or one under it,
+                    // named by the query since the path is the endpoint's.
+                    let under = req
+                        .uri()
+                        .query()
+                        .and_then(|query| {
+                            query
+                                .split('&')
+                                .find_map(|pair| pair.strip_prefix("under="))
+                                .map(unescape)
+                        })
+                        .unwrap_or_default();
+                    let dir = match site.locate(&under) {
+                        super::Located::Listing(dir) => dir,
+                        _ => site.root().to_path_buf(),
+                    };
+                    let entries = super::entries_in(&dir);
+                    let seen = format!(
+                        "{}:{}",
+                        dir.display(),
+                        entries
+                            .iter()
+                            .map(|entry| format!("{}@{}", entry.slug, entry.annotations))
+                            .collect::<Vec<_>>()
+                            .join(",")
                     );
-                    let body =
-                        super::listing_json(&identity.title(port), site.root(), &entries);
+                    if last_listing.lock().replace(seen.clone()).as_deref() != Some(seen.as_str()) {
+                        tinymist_project::announce(
+                            "listed",
+                            &[
+                                ("path", dir.display().to_string().into()),
+                                ("file_count", entries.len().into()),
+                                ("elapsed", began.elapsed().as_secs_f64().into()),
+                            ],
+                        );
+                    }
+                    let body = super::listing_json_of(
+                        &identity.title(port),
+                        &dir,
+                        &entries,
+                        &super::dirs_in(&dir),
+                        &super::assets_in(&dir),
+                        &under,
+                    );
                     let res = hyper::Response::builder()
                         .header(hyper::header::CONTENT_TYPE, "application/json")
                         .body(Body::new(Full::<Bytes>::from(body)))
@@ -810,7 +901,20 @@ pub async fn make_http_server(
                     Ok(res)
                 } else {
                     // Anything else is a page asked for without a mode: send it
-                    // into this server's own, keeping whatever it named.
+                    // into this server's own, keeping whatever it named. A path
+                    // that already names a mode is not sent anywhere — it named
+                    // something this server does not have, and redirecting it
+                    // into the mode it is already in is how a browser ends up
+                    // following `/a/a/a/…` until it gives up.
+                    if crate::tool::webapp::role_of_path(&raw_path).is_some() {
+                        return Ok(hyper::Response::builder()
+                            .status(hyper::StatusCode::NOT_FOUND)
+                            .header(hyper::header::CONTENT_TYPE, "text/plain")
+                            .body(Body::new(Full::<Bytes>::from(format!(
+                                "nothing here: {raw_path}\n"
+                            ))))
+                            .unwrap());
+                    }
                     let target = format!(
                         "{}{}",
                         crate::tool::webapp::role_prefix(identity.role),
@@ -973,6 +1077,74 @@ fn log_connection_error(err: &(dyn std::error::Error + 'static)) {
         cause = err.source();
     }
     log::error!("cannot serve http: {err}");
+}
+
+/// A file from the directory being served, as it is.
+///
+/// A directory of documents is also where their pictures and their exports
+/// live, and a link to one is not a request to compile anything. Read whole:
+/// these are a few hundred kilobytes at most, and streaming them would mean
+/// holding a file open across an await for no gain.
+fn file_bytes(path: &std::path::Path) -> Option<(Vec<u8>, &'static str)> {
+    let bytes = std::fs::read(path).ok()?;
+    Some((bytes, mime_of(path)))
+}
+
+/// What a file says it is, by its extension. Anything unrecognised is offered
+/// as bytes, which a browser will download rather than mangle.
+fn mime_of(path: &std::path::Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("pdf") => "application/pdf",
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("svg") => "image/svg+xml",
+        Some("html") => "text/html; charset=utf-8",
+        Some("json") => "application/json",
+        Some("csv") => "text/csv; charset=utf-8",
+        Some("md" | "txt") => "text/plain; charset=utf-8",
+        _ => "application/octet-stream",
+    }
+}
+
+/// A query value with its escapes read back: a path with a space in it arrives
+/// as `%20`, and a directory listing is asked for by path.
+fn unescape(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'%' if at + 2 < bytes.len() => {
+                let hex = std::str::from_utf8(&bytes[at + 1..at + 3]).ok();
+                match hex.and_then(|hex| u8::from_str_radix(hex, 16).ok()) {
+                    Some(byte) => {
+                        out.push(byte);
+                        at += 3;
+                    }
+                    None => {
+                        out.push(bytes[at]);
+                        at += 1;
+                    }
+                }
+            }
+            b'+' => {
+                out.push(b' ');
+                at += 1;
+            }
+            byte => {
+                out.push(byte);
+                at += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// The identity a request carries, when it has one.

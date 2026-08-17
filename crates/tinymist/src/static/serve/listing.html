@@ -115,16 +115,55 @@
       if (seconds < 86400) return `${Math.floor(seconds / 3600)} h`;
       return `${Math.floor(seconds / 86400)} d`;
     };
+    // Which directory this page is showing, as a path under the one being
+    // served. The page is the same page at every depth; the path is in the
+    // URL, and everything it asks for is asked about that path.
+    // Where this page is mounted, from the server: `/a/` when the document is
+    // annotated, `/v/` when it is only read. The page is the same page at every
+    // depth, and everything after the mount is the directory being shown.
+    const mount = () => {
+      const said = document.querySelector('meta[name="tm-mount"]');
+      return (said && said.content) || "/a/";
+    };
+    const here = () => {
+      const at = location.pathname.indexOf(mount());
+      const rest = at < 0 ? "" : location.pathname.slice(at + mount().length);
+      return rest.replace(/^\/+|\/+$/g, "");
+    };
     const render = (data) => {
-      document.title = data.title || "Documents";
-      document.getElementById("tm-title").textContent = data.title || "Documents";
+      const under = data.under || "";
+      const name = under ? under.split("/").pop() : data.title || "Documents";
+      document.title = name;
+      document.getElementById("tm-title").textContent = name;
       document.getElementById("tm-where").textContent = data.dir || "";
       docs.textContent = "";
-      empty.hidden = data.docs.length > 0;
+      empty.hidden =
+        data.docs.length + (data.dirs || []).length + (data.files || []).length > 0;
+      // Up first, then the directories, then the documents, then whatever else
+      // is in here: a reader walks down a tree and back out of it.
+      if (under) {
+        const li = document.createElement("li");
+        const a = document.createElement("a");
+        a.href = "../";
+        a.append(text("span", "tm-name", "..."));
+        a.append(text("span", "tm-file", "up"));
+        li.append(a);
+        docs.append(li);
+      }
+      for (const dir of data.dirs || []) {
+        const li = document.createElement("li");
+        const a = document.createElement("a");
+        a.href = dir + "/";
+        a.append(text("span", "tm-name", dir));
+        a.append(text("span", "tm-file", "directory"));
+        li.append(a);
+        docs.append(li);
+      }
       for (const doc of data.docs) {
         const li = document.createElement("li");
         const a = document.createElement("a");
-        a.href = doc.slug + "/";
+        // Names are relative to this directory, since the page is at it.
+        a.href = doc.slug.split("/").pop() + "/";
         a.append(text("span", "tm-name", doc.title));
         a.append(text("span", "tm-file", doc.file));
         const meta = document.createElement("span");
@@ -141,9 +180,21 @@
         li.append(a);
         docs.append(li);
       }
+      for (const file of data.files || []) {
+        const li = document.createElement("li");
+        const a = document.createElement("a");
+        a.href = file;
+        a.append(text("span", "tm-name", file));
+        a.append(text("span", "tm-file", "file"));
+        li.append(a);
+        docs.append(li);
+      }
     };
     const load = () =>
-      fetch("dev/docs")
+      // Asked at the mount, not relative to this page: the endpoint belongs to
+      // the site, and a relative address at `/a/report/` would ask the site for
+      // a document called `report/dev`.
+      fetch(`${mount()}dev/docs?under=${encodeURIComponent(here())}`)
         .then((r) => r.json())
         .then(render)
         .catch(() => {});
