@@ -116,14 +116,19 @@ pub struct ServeArgs {
     #[clap(long = "icon-color", value_name = "HEX")]
     pub icon_color: Option<String>,
 
-    /// Publish this server on a tailnet, at `host` or `host/path`: the machine
-    /// is told to proxy that path to this server, the address to share is
-    /// printed, and the proxy is taken down again when this server stops.
-    /// Without a path, the server's own name is used — `--root-name`, or the
-    /// name of what is being served.
+    /// Publish this server on this machine's tailnet: it is told to proxy a
+    /// path to this server, the address to share is printed, and the proxy is
+    /// taken down again when this server stops. The path is the server's own
+    /// name — `--root-name`, or the name of what is being served — unless one
+    /// is given as `--tailscale=path`.
     #[cfg(feature = "tailscale")]
-    #[clap(long = "tailscale-host", value_name = "HOST[/PATH]")]
-    pub tailscale_host: Option<String>,
+    #[clap(
+        long = "tailscale",
+        value_name = "PATH",
+        num_args = 0..=1,
+        default_missing_value = "",
+    )]
+    pub tailscale: Option<String>,
 
     /// An origin to accept besides loopback, e.g. `http://typst` when this
     /// server is reached through `tailscale serve`. Without it the browser's
@@ -463,15 +468,12 @@ pub fn serve_main(args: ServeArgs) -> Result<()> {
     } else {
         args.port_salt.clone()
     };
-    // Published on a tailnet, the machine's name is what tells one server from
-    // another: two documents published from the same machine are two paths, and
-    // two machines publishing the same document are two servers.
+    // A published server answers on its own port: one that is being shared and
+    // one that is not are two servers, even for the same document.
     #[cfg(feature = "tailscale")]
-    let salt = match (&args.tailscale_host, salt) {
-        (Some(host), None) => Some(host.split('/').next().unwrap_or(host).to_owned()),
-        (Some(host), Some(salt)) => {
-            Some(format!("{salt}{}", host.split('/').next().unwrap_or(host)))
-        }
+    let salt = match (&args.tailscale, salt) {
+        (Some(_), None) => Some("tailscale".to_owned()),
+        (Some(_), Some(salt)) => Some(format!("{salt}tailscale")),
         (None, salt) => salt,
     };
     let port = args
@@ -544,14 +546,19 @@ pub fn serve_main(args: ServeArgs) -> Result<()> {
     // since a reader given the address should find something at it, and taken
     // down again on the way out.
     #[cfg(feature = "tailscale")]
-    let _tailnet = match &args.tailscale_host {
-        Some(spec) => {
-            let called = args
-                .root_name
-                .clone()
-                .or_else(|| name.clone())
-                .unwrap_or_else(|| tinymist::tool::serve::slug_for(&canonical));
-            let mount = tinymist_tailscale::Mount::parse(spec, &called)
+    let _tailnet = match &args.tailscale {
+        Some(path) => {
+            // What to call it in a URL: the name it was given, or the name of
+            // the file or directory being served — not its title, which is a
+            // sentence and makes a path nobody wants to type.
+            let called = args.root_name.clone().unwrap_or_else(|| {
+                canonical
+                    .file_stem()
+                    .map(|stem| stem.to_string_lossy().to_ascii_lowercase())
+                    .unwrap_or_else(|| tinymist::tool::serve::slug_for(&canonical))
+            });
+            let asked = (!path.trim().is_empty()).then_some(path.as_str());
+            let mount = tinymist_tailscale::Mount::here(asked, &called)
                 .map_err(|err| error_once!("cannot publish on the tailnet", err: err))?;
             tinymist_tailscale::publish(&mount, port)
                 .map_err(|err| error_once!("cannot publish on the tailnet", err: err))?;

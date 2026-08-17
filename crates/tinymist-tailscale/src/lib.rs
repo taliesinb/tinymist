@@ -12,39 +12,37 @@
 
 use std::process::{Command, Stdio};
 
-/// Where a server is published: which machine, and under which path.
+/// Where a server is published: this machine's name on the tailnet, and the
+/// path it is published under.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Mount {
-    /// The machine's name on the tailnet, as a reader types it: `tbwork`.
+    /// The machine's name as a reader types it: `tbwork`.
     pub host: String,
+    /// The same on the tailnet's own domain, when it can be read.
+    pub full: Option<String>,
     /// The path it is published under, with a leading slash: `/report`.
     pub path: String,
 }
 
 impl Mount {
-    /// Reads `host` or `host/path`.
+    /// A mount on this machine, under the given path.
     ///
-    /// `fallback` is the path to use when only a host was given — the name the
-    /// server calls what it is serving.
-    pub fn parse(spec: &str, fallback: &str) -> Result<Self, String> {
-        let spec = spec.trim().trim_start_matches("http://").trim_matches('/');
-        let (host, path) = match spec.split_once('/') {
-            Some((host, path)) => (host, path.to_owned()),
-            None => (spec, clean(fallback)),
-        };
-        if host.is_empty() {
-            return Err("which machine? --tailscale-host takes a name on your tailnet".into());
-        }
-        let path = clean(&path);
+    /// The machine is always this one — `tailscale serve` publishes what is
+    /// running here — so the only choice is the path. `called` is what to use
+    /// when none was given: the name the server calls what it is serving.
+    pub fn here(path: Option<&str>, called: &str) -> Result<Self, String> {
+        let (host, full) = self_host()
+            .ok_or("cannot read this machine's name from tailscale; is it running?")?;
+        let path = clean(path.unwrap_or(called));
         if path.is_empty() {
             return Err(
-                "which path? give one as --tailscale-host host/path, or name the server \
-                 with --root-name"
+                "which path? give one as --tailscale=path, or name the server with --root-name"
                     .into(),
             );
         }
         Ok(Self {
-            host: host.to_owned(),
+            host,
+            full,
             path: format!("/{path}"),
         })
     }
@@ -54,10 +52,10 @@ impl Mount {
         format!("http://{}{}", self.host, self.path)
     }
 
-    /// The same, on the tailnet's own domain, when that can be read from
-    /// Tailscale. Some clients need the full name.
+    /// The same, on the tailnet's own domain, when that is known. Some clients
+    /// need the full name.
     pub fn full_url(&self) -> Option<String> {
-        Some(format!("http://{}{}", full_host(&self.host)?, self.path))
+        Some(format!("http://{}{}", self.full.as_ref()?, self.path))
     }
 
     /// Every origin a browser might send when reading this: the short name, the
@@ -68,7 +66,7 @@ impl Mount {
             format!("http://{}", self.host),
             format!("https://{}", self.host),
         ];
-        if let Some(full) = full_host(&self.host) {
+        if let Some(full) = &self.full {
             out.push(format!("http://{full}"));
             out.push(format!("https://{full}"));
         }
@@ -76,20 +74,18 @@ impl Mount {
     }
 }
 
-/// A path with the punctuation a URL cannot carry taken out.
+/// A path with the punctuation a URL cannot carry taken out, and no run of
+/// dashes where a run of punctuation was.
 fn clean(path: &str) -> String {
-    path.trim_matches('/')
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '/') {
-                ch
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>()
-        .trim_matches('-')
-        .to_owned()
+    let mut out = String::with_capacity(path.len());
+    for ch in path.trim_matches('/').chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '/') {
+            out.push(ch);
+        } else if !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    out.trim_matches('-').to_owned()
 }
 
 /// Whether the `tailscale` command is there to be run.
@@ -123,25 +119,26 @@ pub fn withdraw(mount: &Mount) -> Result<(), String> {
     .map(|_| ())
 }
 
-/// This machine's full name on its tailnet, as MagicDNS knows it.
+/// This machine's name on its tailnet: the short one a reader types, and the
+/// full one MagicDNS knows.
 ///
 /// Read from `tailscale status --json` by hand rather than with a JSON parser:
-/// one field is wanted, and this crate is otherwise dependency-free.
-pub fn full_host(host: &str) -> Option<String> {
+/// one field is wanted, and this crate is otherwise dependency-free. The
+/// machine's own entry is under `Self`, which comes before the peers.
+pub fn self_host() -> Option<(String, Option<String>)> {
     let status = run(&["status", "--json"]).ok()?;
+    let at = status.find("\"Self\":")?;
     let needle = "\"DNSName\":";
-    for (at, _) in status.match_indices(needle) {
-        let rest = &status[at + needle.len()..];
-        let value = rest.trim_start().strip_prefix('"')?;
-        let end = value.find('"')?;
-        let name = value[..end].trim_end_matches('.');
-        // Every machine on the tailnet is in there; this one is the one whose
-        // name matches.
-        if name.split('.').next() == Some(host) {
-            return Some(name.to_owned());
-        }
+    let at = status[at..].find(needle)? + at + needle.len();
+    let value = status[at..].trim_start().strip_prefix('"')?;
+    let end = value.find('"')?;
+    let full = value[..end].trim_end_matches('.').to_ascii_lowercase();
+    let short = full.split('.').next()?.to_owned();
+    if short.is_empty() {
+        return None;
     }
-    None
+    let full = (full != short).then_some(full);
+    Some((short, full))
 }
 
 /// Runs `tailscale` with the given arguments and returns what it said.
@@ -164,32 +161,38 @@ fn run(args: &[&str]) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::Mount;
+    use super::{clean, Mount};
 
-    #[test]
-    fn a_host_alone_takes_the_servers_own_name() {
-        let mount = Mount::parse("tbwork", "hgxz docs").expect("parses");
-        assert_eq!(mount.host, "tbwork");
-        assert_eq!(mount.path, "/hgxz-docs");
-        assert_eq!(mount.url(), "http://tbwork/hgxz-docs");
+    /// A mount without asking Tailscale for the machine's name.
+    fn mount(path: &str) -> Mount {
+        Mount {
+            host: "machine".into(),
+            full: Some("machine.tailnet.ts.net".into()),
+            path: format!("/{}", clean(path)),
+        }
     }
 
     #[test]
-    fn a_path_is_taken_as_given() {
-        let mount = Mount::parse("tbwork/report", "ignored").expect("parses");
-        assert_eq!(mount.path, "/report");
+    fn a_name_becomes_a_path() {
+        assert_eq!(clean("hgxz docs"), "hgxz-docs");
+        assert_eq!(clean("/report/"), "report");
+        assert_eq!(clean("A Paper: Draft 2"), "A-Paper-Draft-2");
     }
 
     #[test]
-    fn a_url_is_read_as_a_name() {
-        let mount = Mount::parse("http://tbwork/report/", "ignored").expect("parses");
-        assert_eq!(mount.host, "tbwork");
-        assert_eq!(mount.path, "/report");
+    fn a_mount_says_where_it_is() {
+        let mount = mount("report");
+        assert_eq!(mount.url(), "http://machine/report");
+        assert_eq!(
+            mount.full_url().as_deref(),
+            Some("http://machine.tailnet.ts.net/report")
+        );
     }
 
     #[test]
-    fn a_host_with_nothing_to_call_it_is_refused() {
-        assert!(Mount::parse("tbwork", "").is_err());
-        assert!(Mount::parse("", "name").is_err());
+    fn every_name_the_browser_might_send_is_accepted() {
+        let origins = mount("report").origins();
+        assert!(origins.contains(&"http://machine".to_owned()));
+        assert!(origins.contains(&"https://machine.tailnet.ts.net".to_owned()));
     }
 }
