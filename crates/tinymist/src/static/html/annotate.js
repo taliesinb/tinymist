@@ -2238,13 +2238,16 @@
 
   const previewAt = (ev) => {
     if (scrolling) return;
-    pointer = { x: ev.clientX, y: ev.clientY, alt: ev.altKey, ctrl: ev.ctrlKey };
-    // Held down, the modifier means a position — between two words, or between
-    // two blocks — and nothing else. Positions are not offered otherwise: they
-    // are places a pointer lands on only by being exact about it, and holding a
-    // key is easier than that. It is also what makes snapping to the nearest
-    // one safe, since nothing else is competing for the same pixels.
-    if (ev.ctrlKey) {
+    pointer = { x: ev.clientX, y: ev.clientY, alt: ev.altKey, shift: ev.shiftKey };
+    // Held down, shift means a position — between two words, or between two
+    // blocks — and nothing else. Positions are not offered otherwise: they are
+    // places a pointer lands on only by being exact about it, and holding a key
+    // is easier than that. It is also what makes snapping to the nearest one
+    // safe, since nothing else is competing for the same pixels.
+    //
+    // Shift rather than control: on macOS a control-click is a secondary click,
+    // and the browser answers it with its own menu.
+    if (ev.shiftKey) {
       const spot = positionAt(ev.clientX, ev.clientY);
       if (!spot) return clearHover();
       return spot.edge ? previewEdge(spot.edge) : previewPoint(spot.gap.box);
@@ -2374,9 +2377,9 @@
   const onMouseDown = (ev) => {
     if (!annotating || ev.button !== 0 || onOverlay(ev)) return;
     if (openUuid !== null || composeActive) return; // this click only dismisses
-    // Held down, the modifier drags from one place between blocks to another,
-    // which is the stretch of document between them.
-    if (ev.ctrlKey) {
+    // Held down, shift drags from one place between blocks to another, which is
+    // the stretch of document between them.
+    if (ev.shiftKey) {
       const spot = positionAt(ev.clientX, ev.clientY);
       if (!spot || !spot.edge) return;
       vdrag = { from: { x: ev.clientX, y: ev.clientY }, start: spot.edge, moved: false };
@@ -2397,7 +2400,7 @@
       clientX: ev.clientX,
       clientY: ev.clientY,
       altKey: ev.altKey,
-      ctrlKey: ev.ctrlKey,
+      shiftKey: ev.shiftKey,
     };
     if (hoverFrame) return;
     hoverFrame = requestAnimationFrame(() => {
@@ -2522,7 +2525,7 @@
       return;
     }
     clearHover();
-    if (ev.ctrlKey) {
+    if (ev.shiftKey) {
       const spot = positionAt(ev.clientX, ev.clientY);
       if (!spot) return;
       ev.preventDefault();
@@ -2929,14 +2932,14 @@
     document.addEventListener("click", onClick, true);
     document.addEventListener("keydown", onArrow, true);
     const modifier = (e) => {
-      if ((e.key !== "Alt" && e.key !== "Control") || !pointer) return;
+      if ((e.key !== "Alt" && e.key !== "Shift") || !pointer) return;
       if (openUuid !== null || composeActive) return;
       const down = e.type === "keydown";
       previewAt({
         clientX: pointer.x,
         clientY: pointer.y,
         altKey: e.key === "Alt" ? down : !!pointer.alt,
-        ctrlKey: e.key === "Control" ? down : !!pointer.ctrl,
+        shiftKey: e.key === "Shift" ? down : !!pointer.shift,
       });
     };
     document.addEventListener("keydown", modifier, true);
