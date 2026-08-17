@@ -2230,6 +2230,10 @@
       const gap = snapPoint(caret, x);
       return gap ? { gap } : null;
     }
+    // Code, an equation, a drawing: the pointer is on something rather than
+    // between things, and there is no position inside it to offer. Falling
+    // through would put a caret between blocks for a pointer that is on a line.
+    if (atomElementAt(x, y)) return null;
     const edge = verticalGapAt(x, y, SNAP_REACH);
     if (!edge) return null;
     const away = Math.abs(y - (edge.box.top + EDGE_H / 2));
