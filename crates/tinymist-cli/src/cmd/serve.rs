@@ -298,6 +298,33 @@ fn fork_document(path: &Path) -> Result<PathBuf> {
     Ok(forked)
 }
 
+/// Where a stylesheet named on the command line actually is.
+///
+/// An absolute path is itself. A relative one is read against the working
+/// directory, and then against what is being served — the directory, or the
+/// directory a document is in — since a collection keeps its own stylesheet
+/// beside itself and is usually named from somewhere else.
+fn find_css(asked: &Path, served: &Path) -> Result<PathBuf> {
+    let beside = if served.is_dir() {
+        served.to_path_buf()
+    } else {
+        served.parent().unwrap_or(served).to_path_buf()
+    };
+    let tries = [asked.to_path_buf(), beside.join(asked)];
+    for path in &tries {
+        if let Ok(found) = std::fs::canonicalize(path) {
+            if found.is_file() {
+                return Ok(found);
+            }
+        }
+    }
+    Err(error_once!(
+        "cannot find the stylesheet to inject",
+        asked: asked.display(),
+        looked_in: beside.display()
+    ))
+}
+
 /// Asks whatever is serving on an address to stop.
 fn stop_server(host: &str, port: u16) {
     use std::io::Write;
@@ -456,11 +483,7 @@ pub fn serve_main(args: ServeArgs) -> Result<()> {
     if args.no_file_introspection {
         tinymist::tool::serve::set_introspect(false);
     }
-    if let Some(css) = &args.inject_typst_css {
-        let css = std::fs::canonicalize(css)
-            .with_context("cannot find the stylesheet to inject", || None)?;
-        tinymist::tool::webapp::set_injected_css(Some(css));
-    }
+
     if let Some(ms) = args.annotate_latency {
         tinymist::tool::serve::set_annotate_latency(ms);
     }
@@ -490,6 +513,15 @@ pub fn serve_main(args: ServeArgs) -> Result<()> {
     } else {
         canonical
     };
+    // The stylesheet, once what is being served is known: a relative path is
+    // read against the working directory first, and against the thing being
+    // served after that, since that is where a collection keeps its own.
+    let injected_css = match &args.inject_typst_css {
+        Some(asked) => Some(find_css(asked, &canonical)?),
+        None => None,
+    };
+    tinymist::tool::webapp::set_injected_css(injected_css.clone());
+
     let role = if args.anno {
         IconRole::Annotate
     } else {
@@ -684,7 +716,12 @@ pub fn serve_main(args: ServeArgs) -> Result<()> {
     // The first line of the stream: which server this is and what it is
     // serving, so that everything after it has something to belong to.
     let agents = args.mcp.then(|| format!("http://{}:{port}/m/", args.host));
-    tinymist::tool::registry::announce_init(&note, name.as_deref(), agents.as_deref());
+    tinymist::tool::registry::announce_init(
+        &note,
+        name.as_deref(),
+        agents.as_deref(),
+        injected_css.as_deref(),
+    );
     // Then where else it can be read, which is a fact about this server and
     // belongs after the line that says which server it is.
     #[cfg(feature = "tailscale")]

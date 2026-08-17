@@ -123,7 +123,12 @@ pub fn announce_server(note: &ServerNote) -> std::io::Result<PathBuf> {
 ///
 /// The first line a reader of the stream sees, and the one that says which
 /// server the rest of the lines belong to.
-pub fn announce_init(note: &ServerNote, name: Option<&str>, agents: Option<&str>) {
+pub fn announce_init(
+    note: &ServerNote,
+    name: Option<&str>,
+    agents: Option<&str>,
+    injected_css: Option<&std::path::Path>,
+) {
     tinymist_project::announce(
         "init",
         &[
@@ -136,6 +141,12 @@ pub fn announce_init(note: &ServerNote, name: Option<&str>, agents: Option<&str>
                 agents.map(Into::into).unwrap_or(serde_json::Value::Null),
             ),
             ("directory", note.directory.into()),
+            (
+                "injected_typst_css",
+                injected_css
+                    .map(|path| path.display().to_string().into())
+                    .unwrap_or(serde_json::Value::Null),
+            ),
             ("pid", note.pid.into()),
         ],
     );
