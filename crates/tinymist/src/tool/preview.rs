@@ -656,6 +656,7 @@ fn announce_preview(root: &Path, addr: &str) {
     };
     let note = crate::tool::registry::ServerNote {
         fork: false,
+        shared: None,
         server: crate::tool::registry::slug_for(&canonical),
         path: canonical.display().to_string(),
         url: format!("http://{addr}/"),

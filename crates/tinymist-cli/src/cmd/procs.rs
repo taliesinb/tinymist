@@ -29,6 +29,12 @@ pub struct ShutdownArgs {
     /// rendered, its note in the register — and that is worth waiting for.
     #[clap(long = "grace", value_name = "SECONDS", default_value_t = 3)]
     pub grace: u64,
+
+    /// Stop shared servers as well. They are left alone by default: a shared
+    /// server is somebody else's window on a document, and stopping it takes
+    /// the address they are reading it at down with it.
+    #[clap(long = "shared")]
+    pub shared: bool,
 }
 
 /// Runs a `procs` subcommand.
@@ -42,7 +48,7 @@ pub fn procs_main(cmd: ProcsCommands) -> Result<()> {
 /// One note, on one line.
 fn describe(note: &ServerNote, live: bool) -> String {
     format!(
-        "{state}  {server:<20} {role:<9} pid {pid:<7} parent {ppid:<7} {url}           {path}{mcp}{hosted}{fork}  since {started}",
+        "{state}  {server:<20} {role:<9} pid {pid:<7} parent {ppid:<7} {url}           {path}{mcp}{hosted}{fork}{shared}  since {started}",
         state = if live { "live " } else { "stale" },
         hosted = if note.hosted { "  hosted" } else { "" },
         fork = if note.fork { "  fork" } else { "" },
@@ -53,6 +59,11 @@ fn describe(note: &ServerNote, live: bool) -> String {
         url = note.url,
         path = note.path,
         mcp = if note.mcp { "  mcp" } else { "" },
+        shared = note
+            .shared
+            .as_deref()
+            .map(|url| format!("  shared {url}"))
+            .unwrap_or_default(),
         started = note.started,
     )
 }
@@ -82,8 +93,20 @@ fn shutdown(args: ShutdownArgs) -> Result<()> {
     let (mine_note, others): (Vec<_>, Vec<_>) = notes
         .into_iter()
         .partition(|(note, _)| note.pid == mine);
+    // A shared server is a window somebody else has open; stopping it takes
+    // their address down with it, so it is left alone unless it is named.
+    let (shared, others): (Vec<_>, Vec<_>) = others
+        .into_iter()
+        .partition(|(note, _)| note.shared.is_some() && !args.shared);
     for (note, _) in &mine_note {
         println!("keeping   {} (this process)", note.server);
+    }
+    for (note, _) in &shared {
+        println!(
+            "keeping   {} (shared at {}; --shared stops it too)",
+            note.server,
+            note.shared.as_deref().unwrap_or("")
+        );
     }
     if others.is_empty() {
         println!("nothing to stop");

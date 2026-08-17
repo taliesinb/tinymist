@@ -141,6 +141,13 @@ pub struct ServeArgs {
     #[clap(long = "daemon")]
     pub daemon: bool,
 
+    /// Do not read files to list them. Every `.typ` file is offered, named by
+    /// its file name rather than by its title, and nothing is opened. A
+    /// directory of thousands of documents is listed at once this way; a
+    /// directory of dozens is no faster and loses the titles.
+    #[clap(long = "no-file-preparsing")]
+    pub no_file_preparsing: bool,
+
     /// Keep running when the `talimist` binary is replaced. Normally a server
     /// stops, since it would otherwise go on serving a build that is no longer
     /// on disk; while that build is being worked on, a server that outlives it
@@ -177,6 +184,25 @@ pub struct ServeArgs {
     /// this server's port. Chrome only.
     #[clap(long = "open-cdp", value_name = "PORT")]
     pub open_cdp: Option<String>,
+}
+
+impl ServeArgs {
+    /// Whether this server keeps running when the binary is replaced.
+    ///
+    /// Asked before the server starts, since the watchdog that stops it is
+    /// armed before any command runs. A published server counts: it is somebody
+    /// else's window on the document, and stopping it takes their address with
+    /// it.
+    pub fn stays_through_a_rebuild(&self) -> bool {
+        #[cfg(feature = "tailscale")]
+        {
+            self.survive_rebuild || self.tailscale.is_some()
+        }
+        #[cfg(not(feature = "tailscale"))]
+        {
+            self.survive_rebuild
+        }
+    }
 }
 
 /// Whether a document server is already answering on this address.
@@ -419,6 +445,9 @@ pub fn serve_main(args: ServeArgs) -> Result<()> {
         output: None,
     });
     tinymist::tool::webapp::note_build_stamp();
+    if args.no_file_preparsing {
+        tinymist::tool::serve::set_preparse(false);
+    }
     if let Some(ms) = args.annotate_latency {
         tinymist::tool::serve::set_annotate_latency(ms);
     }
@@ -431,10 +460,6 @@ pub fn serve_main(args: ServeArgs) -> Result<()> {
     if !args.daemon {
         tinymist::tool::preview::exit_when_orphaned();
     }
-    if !args.survive_rebuild {
-        crate::utils::exit_when_binary_replaced();
-    }
-
     // Everything served is rendered to disk once, when it compiles, rather than
     // made again in the answer to every request. The directory is this
     // process's own and goes when it does.
@@ -542,9 +567,15 @@ pub fn serve_main(args: ServeArgs) -> Result<()> {
         })
     });
 
+    // Where this server is published for other people, when it is.
+    #[cfg(not(feature = "tailscale"))]
+    let shared_at: Option<String> = None;
+
     // Published on a tailnet: the proxy is set up before anything is served,
     // since a reader given the address should find something at it, and taken
     // down again on the way out.
+    #[cfg(feature = "tailscale")]
+    let mut shared_at: Option<String> = None;
     #[cfg(feature = "tailscale")]
     let _tailnet = match &args.tailscale {
         Some(path) => {
@@ -568,6 +599,7 @@ pub fn serve_main(args: ServeArgs) -> Result<()> {
             for origin in mount.origins() {
                 allowed_origins.push(origin);
             }
+            shared_at = Some(mount.url());
             eprintln!("  shared    {}", mount.url());
             if let Some(full) = mount.full_url() {
                 eprintln!("            {full}");
@@ -633,6 +665,7 @@ pub fn serve_main(args: ServeArgs) -> Result<()> {
         // This process serves this and nothing else.
         hosted: false,
         fork: args.annotate_fork,
+        shared: shared_at.clone(),
         started: tinymist_project::iso_now(),
     };
     if let Err(err) = tinymist::tool::serve::announce_server(&note) {

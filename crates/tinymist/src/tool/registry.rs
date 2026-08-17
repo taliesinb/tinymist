@@ -52,6 +52,12 @@ pub struct ServerNote {
     /// typing: the note points at a process that is not ours to kill.
     #[serde(default)]
     pub hosted: bool,
+    /// Where it is published for other people to read, when it is.
+    ///
+    /// A shared server is somebody else's window on the document, so it is not
+    /// swept up with the rest: stopping it takes the address down with it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared: Option<String>,
     /// Whether what it serves is a copy made for this server alone, named after
     /// its process. The copy is nobody else's: it has its own port, its own
     /// sidecar, and no other server will ever be asked to share it.

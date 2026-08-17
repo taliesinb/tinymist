@@ -128,6 +128,13 @@ pub fn exit_when_binary_replaced() {
                 "{} was replaced since this process started, shutting down",
                 path.display()
             );
+            // The same tidying as any other way out: the note in the register,
+            // a proxy this server put up, the site it rendered. Exiting without
+            // it leaves a stale note and an address that answers with a
+            // gateway error.
+            #[cfg(feature = "serve")]
+            tinymist::tool::serve::shutdown();
+            #[cfg(not(feature = "serve"))]
             std::process::exit(0);
         }
     });

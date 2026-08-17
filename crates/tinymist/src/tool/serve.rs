@@ -270,21 +270,59 @@ pub fn dirs_in(dir: &Path) -> Vec<String> {
     found
 }
 
+/// One file a directory serves as it is.
+pub struct AssetEntry {
+    /// Its name, as it sits in the directory.
+    pub file: String,
+    /// When it was last written.
+    pub modified: Option<std::time::SystemTime>,
+}
+
 /// The files under a directory that are served as they are.
-pub fn assets_in(dir: &Path) -> Vec<String> {
+pub fn assets_in(dir: &Path) -> Vec<AssetEntry> {
     let Ok(read) = std::fs::read_dir(dir) else {
         return vec![];
     };
-    let mut found: Vec<String> = read
+    let mut found: Vec<AssetEntry> = read
         .flatten()
         .map(|entry| entry.path())
         // A sidecar is not a file to read: it is what a document is annotated
         // with, and it belongs to that document.
         .filter(|path| path.is_file() && !hidden(path) && is_asset(path) && !is_sidecar(path))
-        .filter_map(|path| Some(path.file_name()?.to_string_lossy().into_owned()))
+        .filter_map(|path| {
+            Some(AssetEntry {
+                file: path.file_name()?.to_string_lossy().into_owned(),
+                modified: std::fs::metadata(&path).and_then(|meta| meta.modified()).ok(),
+            })
+        })
         .collect();
-    found.sort();
+    found.sort_by(|one, two| one.file.cmp(&two.file));
     found
+}
+
+/// How long ago something was written, in seconds.
+fn age_of(when: Option<std::time::SystemTime>) -> u64 {
+    when.and_then(|when| when.elapsed().ok())
+        .map(|since| since.as_secs())
+        .unwrap_or(0)
+}
+
+/// Whether a listing reads the files it lists.
+///
+/// A document is read to find its title and to tell a document from a file of
+/// helpers; a PDF could be read the same way. A few dozen files is a few dozen
+/// small reads, which is nothing; a few thousand is a listing that takes a
+/// moment, and the titles are not worth it.
+static PREPARSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Says whether documents are read for their titles.
+pub fn set_preparse(on: bool) {
+    PREPARSE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether they are.
+pub fn preparse() -> bool {
+    PREPARSE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// The `.typ` files directly under a directory, sorted, as listing entries.
@@ -306,6 +344,17 @@ pub fn entries_in(dir: &Path) -> Vec<DocEntry> {
         .filter_map(|path| {
             let file = path.file_name()?.to_string_lossy().into_owned();
             let slug = path.file_stem()?.to_string_lossy().into_owned();
+            // Not read at all: every `.typ` file is a document, and its name is
+            // what it is called.
+            if !preparse() {
+                return Some(DocEntry {
+                    title: slug.clone(),
+                    slug,
+                    modified: std::fs::metadata(&path).and_then(|meta| meta.modified()).ok(),
+                    annotations: annotation_count(&path),
+                    file,
+                });
+            }
             let text = std::fs::read_to_string(&path).ok()?;
             // A directory of documents usually holds a few files that are not
             // documents: a style file, a library of helpers, a list of
@@ -477,7 +526,7 @@ pub fn listing_json_of(
     dir: &Path,
     entries: &[DocEntry],
     dirs: &[String],
-    assets: &[String],
+    assets: &[AssetEntry],
     under: &str,
 ) -> String {
     let docs: Vec<_> = entries
@@ -490,11 +539,7 @@ pub fn listing_json_of(
                 "annotations": entry.annotations,
                 // Age rather than a stamp: the page says "3 h", and a clock
                 // that disagrees with the server's would say it wrongly.
-                "age": entry
-                    .modified
-                    .and_then(|when| when.elapsed().ok())
-                    .map(|since| since.as_secs())
-                    .unwrap_or(0),
+                "age": age_of(entry.modified),
             })
         })
         .collect();
@@ -507,7 +552,10 @@ pub fn listing_json_of(
         "under": under,
         "docs": docs,
         "dirs": dirs,
-        "files": assets,
+        "files": assets
+            .iter()
+            .map(|asset| serde_json::json!({ "file": asset.file, "age": age_of(asset.modified) }))
+            .collect::<Vec<_>>(),
     })
     .to_string()
 }

@@ -246,8 +246,15 @@ fn main() -> Result<()> {
     // ask twice, so the session it belongs to loses those tools for good. It
     // keeps running, old binary and all, and dispatches to servers that are
     // current.
-    let spawned_by_a_client = matches!(&cmd, Commands::Mcp(args) if args.stdio);
-    if !spawned_by_a_client {
+    // Or a server that was told to stay: one somebody else is reading, or one
+    // being kept while this binary is worked on.
+    let asked_to_stay = match &cmd {
+        Commands::Mcp(args) => args.stdio,
+        #[cfg(feature = "serve")]
+        Commands::Serve(args) => args.stays_through_a_rebuild(),
+        _ => false,
+    };
+    if !asked_to_stay {
         crate::utils::exit_when_binary_replaced();
     }
 

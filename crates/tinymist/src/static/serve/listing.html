@@ -38,7 +38,10 @@
 
   .tm-listing a {
     display: grid;
-    grid-template-columns: 1fr auto;
+    /* A column wide enough for the file names in a directory of documents, so
+       the titles beside them line up rather than stepping in and out. */
+    grid-template-columns: minmax(11rem, auto) minmax(0, 1fr) auto;
+    align-items: baseline;
     gap: 0.15rem 1rem;
     padding: 0.85rem 0.6rem;
     margin: 0 -0.6rem;
@@ -51,9 +54,14 @@
     background: color-mix(in oklab, var(--tm-fg) 7%, transparent);
   }
 
+  /* The same face and size as the file name beside it: the two are read as one
+     line, and a larger title makes the names look like a subtitle. */
   .tm-name {
-    font-weight: 600;
-    font-size: 1.02rem;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.85rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .tm-file,
@@ -65,21 +73,24 @@
 
   .tm-file {
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    flex: none;
   }
 
   /* The right-hand column: how much has been said about the document, and how
      long ago it changed. */
   .tm-meta {
-    grid-column: 2;
-    grid-row: 1 / span 2;
-    align-self: center;
-    text-align: right;
-    display: grid;
-    gap: 0.15rem;
+    grid-column: 3;
+    align-self: baseline;
+    justify-self: end;
+    display: flex;
+    gap: 0.75rem;
+    white-space: nowrap;
   }
 
+  /* Not hidden but absent: a hidden one still takes its place, which put the
+     time on a line of its own. */
   .tm-notes[data-count="0"] {
-    visibility: hidden;
+    display: none;
   }
 
   .tm-empty {
@@ -110,6 +121,7 @@
     // "just now", "14 min", "3 h", "2 d": past the day, the exact figure is
     // not what the reader is asking.
     const ago = (seconds) => {
+      if (!(seconds >= 0)) return "";
       if (seconds < 60) return "just now";
       if (seconds < 3600) return `${Math.floor(seconds / 60)} min`;
       if (seconds < 86400) return `${Math.floor(seconds / 3600)} h`;
@@ -132,7 +144,11 @@
     };
     const render = (data) => {
       const under = data.under || "";
-      const name = under ? under.split("/").pop() : data.title || "Documents";
+      // What the directory is called, not what is showing it: a listing page
+      // is a directory, and "Typst Annotator: hgxz" is the annotator's name for
+      // a document it is not showing.
+      const called = (data.title || "Documents").replace(/^[^:]*:\s*/, "");
+      const name = under ? under.split("/").pop() : called;
       document.title = name;
       document.getElementById("tm-title").textContent = name;
       document.getElementById("tm-where").textContent = data.dir || "";
@@ -145,8 +161,8 @@
         const li = document.createElement("li");
         const a = document.createElement("a");
         a.href = "../";
-        a.append(text("span", "tm-name", "..."));
-        a.append(text("span", "tm-file", "up"));
+        a.append(text("span", "tm-file", ".."));
+        a.append(text("span", "tm-name", ""));
         li.append(a);
         docs.append(li);
       }
@@ -154,8 +170,8 @@
         const li = document.createElement("li");
         const a = document.createElement("a");
         a.href = dir + "/";
-        a.append(text("span", "tm-name", dir));
-        a.append(text("span", "tm-file", "directory"));
+        a.append(text("span", "tm-file", dir + "/"));
+        a.append(text("span", "tm-name", ""));
         li.append(a);
         docs.append(li);
       }
@@ -164,8 +180,11 @@
         const a = document.createElement("a");
         // Names are relative to this directory, since the page is at it.
         a.href = doc.slug.split("/").pop() + "/";
-        a.append(text("span", "tm-name", doc.title));
+        // The file name in the column a file name is read down, and the title
+        // beside it: the file is what a reader is looking for, and the title is
+        // what tells them they have found it.
         a.append(text("span", "tm-file", doc.file));
+        a.append(text("span", "tm-name", doc.title));
         const meta = document.createElement("span");
         meta.className = "tm-meta";
         const notes = text(
@@ -181,11 +200,18 @@
         docs.append(li);
       }
       for (const file of data.files || []) {
+        // A server that has not been restarted since this page was may still
+        // send a bare name.
+        const named = typeof file === "string" ? { file } : file;
         const li = document.createElement("li");
         const a = document.createElement("a");
-        a.href = file;
-        a.append(text("span", "tm-name", file));
-        a.append(text("span", "tm-file", "file"));
+        a.href = named.file;
+        a.append(text("span", "tm-file", named.file));
+        a.append(text("span", "tm-name", ""));
+        const meta = document.createElement("span");
+        meta.className = "tm-meta";
+        if (named.age !== undefined) meta.append(text("span", "tm-when", ago(named.age)));
+        a.append(meta);
         li.append(a);
         docs.append(li);
       }
