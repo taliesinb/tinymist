@@ -582,12 +582,13 @@ pub fn serve_main(args: ServeArgs) -> Result<()> {
             // What to call it in a URL: the name it was given, or the name of
             // the file or directory being served — not its title, which is a
             // sentence and makes a path nobody wants to type.
-            let called = args.root_name.clone().unwrap_or_else(|| {
+            let called: String = args.root_name.clone().unwrap_or_else(|| {
                 canonical
                     .file_stem()
                     .map(|stem| stem.to_string_lossy().to_ascii_lowercase())
                     .unwrap_or_else(|| tinymist::tool::serve::slug_for(&canonical))
             });
+            let called_it = args.root_name.clone().unwrap_or_else(|| called.clone());
             let asked = (!path.trim().is_empty()).then_some(path.as_str());
             let mount = tinymist_tailscale::Mount::here(asked, &called)
                 .map_err(|err| error_once!("cannot publish on the tailnet", err: err))?;
@@ -600,10 +601,6 @@ pub fn serve_main(args: ServeArgs) -> Result<()> {
                 allowed_origins.push(origin);
             }
             shared_at = Some(mount.url());
-            eprintln!("  shared    {}", mount.url());
-            if let Some(full) = mount.full_url() {
-                eprintln!("            {full}");
-            }
             // Taken down however this server stops: a guard covers the ordinary
             // way out, and this covers being told to stop.
             let held = mount.clone();
@@ -673,7 +670,25 @@ pub fn serve_main(args: ServeArgs) -> Result<()> {
     }
     // The first line of the stream: which server this is and what it is
     // serving, so that everything after it has something to belong to.
-    tinymist::tool::registry::announce_init(&note, name.as_deref());
+    let agents = args.mcp.then(|| format!("http://{}:{port}/m/", args.host));
+    tinymist::tool::registry::announce_init(&note, name.as_deref(), agents.as_deref());
+    // Then where else it can be read, which is a fact about this server and
+    // belongs after the line that says which server it is.
+    #[cfg(feature = "tailscale")]
+    if let Some(mount) = _tailnet.as_ref().map(|held| &held.0) {
+        let mut urls = vec![serde_json::Value::from(mount.url())];
+        if let Some(full) = mount.full_url() {
+            urls.push(full.into());
+        }
+        tinymist_project::announce(
+            "tailscale_info",
+            &[
+                ("urls", urls.into()),
+                ("host", mount.host.clone().into()),
+                ("path", mount.path.clone().into()),
+            ],
+        );
+    }
     let _registered = RegistryGuard(port);
     if args.mcp {
         // The address agents are told about is one, fixed, and not this: make
@@ -694,27 +709,14 @@ pub fn serve_main(args: ServeArgs) -> Result<()> {
     let opener = args.clone();
     let mcp = args.mcp;
     let subject = canonical.clone();
+    // Where it is and what it is were said at the start, in the line that says
+    // which server this is; nothing is left to say here.
     let announce = move |port: u16| {
-        println!();
-        println!(
-            "{}",
-            tinymist::tool::webapp::WebAppIdentity {
-                role,
-                color: None,
-                name: subject
-                    .file_name()
-                    .map(|name| name.to_string_lossy().into_owned()),
-            }
-            .title(port)
-        );
-        println!("  {:<9} {url}", if is_dir { "documents" } else { "document" });
-        if mcp {
-            println!("  agents    http://{}:{port}/m/", opener.host);
-        }
         if opener.open {
             open_url(&url, &opener, port);
         }
     };
+    let _ = (subject, mcp, is_dir);
     if is_dir {
         block_on(crate::cmd::server::serve_directory(cfg, canonical, announce))
     } else {

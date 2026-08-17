@@ -243,14 +243,23 @@ pub async fn make_http_server(
                     Ok(res)
                 } else if let (Some(role), true) = (page_role, path.is_empty() || path == "/") {
                     if tinymist_project::announcing() {
-                        // The id a page will answer to: a page opens its event
-                        // stream as soon as it loads, and takes the next number
-                        // when it does, so a request and the client it becomes
-                        // read as one story.
-                        let id = next_client.load(std::sync::atomic::Ordering::SeqCst);
+                        // A page was asked for. Nothing is connected yet and
+                        // may never be — a listing page opens no event stream —
+                        // so this carries no id: an id is for a client that can
+                        // be counted, and counting one that never arrives is
+                        // what keeps a server alive for nobody.
                         tinymist_project::announce(
                             "client_requested",
-                            &[("id", id.into()), ("url", raw_path.clone().into())],
+                            &[
+                                ("url", raw_path.clone().into()),
+                                ("ip", peer.ip().to_string().into()),
+                                (
+                                    "name",
+                                    request_author(req.headers())
+                                        .map(Into::into)
+                                        .unwrap_or(serde_json::Value::Null),
+                                ),
+                            ],
                         );
                     }
                     // The mode rides in the URL's first segment, so each has its

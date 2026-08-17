@@ -123,7 +123,7 @@ pub fn announce_server(note: &ServerNote) -> std::io::Result<PathBuf> {
 ///
 /// The first line a reader of the stream sees, and the one that says which
 /// server the rest of the lines belong to.
-pub fn announce_init(note: &ServerNote, name: Option<&str>) {
+pub fn announce_init(note: &ServerNote, name: Option<&str>, agents: Option<&str>) {
     tinymist_project::announce(
         "init",
         &[
@@ -131,11 +131,12 @@ pub fn announce_init(note: &ServerNote, name: Option<&str>) {
             ("path", note.path.clone().into()),
             ("root_name", name.unwrap_or_default().into()),
             ("url", note.url.clone().into()),
-            ("pid", note.pid.into()),
             (
-                "shared",
-                note.shared.clone().unwrap_or_default().into(),
+                "agents",
+                agents.map(Into::into).unwrap_or(serde_json::Value::Null),
             ),
+            ("directory", note.directory.into()),
+            ("pid", note.pid.into()),
         ],
     );
 }

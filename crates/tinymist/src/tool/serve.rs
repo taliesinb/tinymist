@@ -189,6 +189,10 @@ pub fn at_shutdown(task: impl FnOnce() + Send + 'static) {
 /// go looking for.
 pub fn shutdown(reason: &str) -> ! {
     crate::tool::registry::announce_shutdown(reason);
+    // And in words, after the line a reader parses: somebody watching a
+    // terminal wants to know why the thing they were running went away, and
+    // stderr is where that is read.
+    eprintln!("\nstopping: {reason}");
     run_shutdown_tasks();
     std::process::exit(0);
 }

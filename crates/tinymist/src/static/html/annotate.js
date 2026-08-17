@@ -3049,13 +3049,10 @@
     const first = !shown;
     const changed = !!renderId && res.render !== renderId;
     shown = true;
-    // A page that has just reloaded has already said why, and the document
-    // arriving is what a reload *is*: saying it again would replace the reason
-    // with a consequence. The console still records it.
-    const quiet = Date.now() - reloadedAt < PASSING;
-    if (quiet) {
-      // nothing on the banner
-    } else if (first) showBanner("Document loaded", "note");
+    // A page that has just reloaded says why it reloaded, and then says the
+    // document arrived: the reason is read first and the document is the thing
+    // being waited for.
+    if (first) showBanner("Document loaded", "note");
     else if (changed) showBanner("Document updated", "ok");
     // The document is loaded twice in quick succession when a page opens —
     // once by the page, once when the first compile reports — and the second
@@ -3076,10 +3073,8 @@
     );
   };
 
-  // When the page last said something about a load, and when it last said why
-  // it reloaded.
+  // When the page last said something about a load.
   let announcedAt = 0;
-  let reloadedAt = 0;
   // How close together two loads have to be to count as one.
   const SETTLE = 2000;
 
@@ -3572,11 +3567,9 @@
     const why = (sessionStorage.getItem(RELOADED) || "").split(" ");
     if (why[0]) sessionStorage.removeItem(RELOADED);
     if (why[0] === "server") {
-      reloadedAt = Date.now();
       showBanner("Server reloaded", "warn");
       console.log("talimist: server reloaded", { was: why[1], now: why[2] });
     } else if (why[0] === "client") {
-      reloadedAt = Date.now();
       showBanner("Client reloaded", "warn");
       console.log("talimist: client reloaded", { assets: why[1] });
     }

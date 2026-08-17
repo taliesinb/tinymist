@@ -701,8 +701,18 @@ impl CompileHandlerImpl {
 
         if !should_lint {
             let enc = self.analysis.position_encoding;
+            // Not the ones from the export shims. Those are a library this
+            // compile was given rather than a file anybody has: a diagnostic
+            // raised inside one names a package that is not on disk and not in
+            // any registry, so nothing can open it and reporting it says only
+            // that it could not be opened.
+            let shims = crate::tool::render::shims::shims_id();
+            let mine = art
+                .diagnostics()
+                .filter(|diag| diag.span.id() != Some(shims))
+                .collect::<Vec<_>>();
             let diagnostics =
-                tinymist_query::convert_diagnostics(art.graph.clone(), art.diagnostics(), enc);
+                tinymist_query::convert_diagnostics(art.graph.clone(), mine.into_iter(), enc);
 
             log::trace!("notify diagnostics({dv:?}): {diagnostics:#?}");
 

@@ -189,7 +189,16 @@ impl<'w> DiagWorker<'w> {
     fn diagnostic_span_id(&self, typst_diagnostic: &TypstDiagnostic) -> (TypstFileId, DiagSpan) {
         iter::once(typst_diagnostic.span)
             .chain(typst_diagnostic.trace.iter().map(|trace| trace.span.into()))
-            .find_map(|span| Some((span.id()?, span)))
+            // Only files that are somewhere: a compile may be given a library
+            // of its own, shadowed in under a package name that is not on disk
+            // and not in any registry, and a diagnostic raised inside it has a
+            // span nobody can open. The document it happened while compiling is
+            // where it is reported instead.
+            .find_map(|span| {
+                let id = span.id()?;
+                let known = self.ctx.world().source(id).is_ok();
+                known.then_some((id, span))
+            })
             .unwrap_or_else(|| (self.ctx.world().main(), Span::detached().into()))
     }
 
