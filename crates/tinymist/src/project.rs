@@ -1007,28 +1007,6 @@ impl CompileHandler<LspCompilerFeat, ProjectInsStateExt> for CompileHandlerImpl 
                     .and_then(|path| path.to_err().ok())
                     .map(|path: std::path::PathBuf| path)
             };
-            if tinymist_project::announcing() {
-                // How long the wait was, measured from the change that caused
-                // this compile: the figure between saving a file and being able
-                // to read it.
-                let waited = tinymist_project::since_change()
-                    .map(|since| since.as_secs_f64())
-                    .unwrap_or(0.0);
-                tinymist_project::announce(
-                    "compiled_document",
-                    &[
-                        (
-                            "path",
-                            doc_path
-                                .as_ref()
-                                .map(|path| path.display().to_string())
-                                .unwrap_or_default()
-                                .into(),
-                        ),
-                        ("elapsed", waited.into()),
-                    ],
-                );
-            }
             // The rendering goes to disk, once, for everyone who asks for it —
             // rather than being made again in the answer to each request. Only
             // a document server renders to disk; a previewer draws pages.
@@ -1061,6 +1039,40 @@ impl CompileHandler<LspCompilerFeat, ProjectInsStateExt> for CompileHandlerImpl 
             };
             #[cfg(not(feature = "serve"))]
             let rendered: Option<()> = None;
+            if tinymist_project::announcing() {
+                // How long the wait was, measured from the change that caused
+                // this compile: the figure between saving a file and being able
+                // to read it.
+                let waited = tinymist_project::since_change()
+                    .map(|since| since.as_secs_f64())
+                    .unwrap_or(0.0);
+                // The version the rendering was written at, which is what a
+                // page asks for and what an event about it refers to. A
+                // previewer renders on request and has none.
+                #[cfg(feature = "serve")]
+                let version = rendered
+                    .as_ref()
+                    .map(|body| serde_json::Value::from(body.version))
+                    .unwrap_or(serde_json::Value::Null);
+                #[cfg(not(feature = "serve"))]
+                let version = serde_json::Value::Null;
+                tinymist_project::announce(
+                    "document_compiled",
+                    &[
+                        (
+                            "path",
+                            doc_path
+                                .as_ref()
+                                .map(|path| path.display().to_string())
+                                .unwrap_or_default()
+                                .into(),
+                        ),
+                        ("reason", why_compiled(doc_path.as_deref()).into()),
+                        ("version", version),
+                        ("elapsed", waited.into()),
+                    ],
+                );
+            }
             if let Some(diag_tx) = self.preview.diag_tx(art.id()) {
                 let last_edit = self.last_edit.lock().clone();
                 let payload = crate::tool::preview::diagnostics_payload(
@@ -1137,4 +1149,34 @@ pub enum DevEvent {
 impl lsp_types::notification::Notification for DevEvent {
     const METHOD: &'static str = "tinymist/devEvent";
     type Params = Self;
+}
+
+/// Why a compile ran, from the file whose change set it off.
+///
+/// The watcher records which path moved; comparing it with the document being
+/// compiled says whether the document itself was edited, whether its
+/// annotations were written, or whether something it reads changed. Nothing
+/// recorded means nothing has moved yet, so this is the compile a document
+/// gets when it is first served.
+fn why_compiled(document: Option<&std::path::Path>) -> &'static str {
+    let Some(changed) = tinymist_project::changed_path() else {
+        return "file_opened";
+    };
+    let changed = std::path::Path::new(&changed);
+    let Some(document) = document else {
+        return "file_changed";
+    };
+    if changed == document {
+        return "file_changed";
+    }
+    // The sidecar the annotations live in, which the server writes itself: an
+    // edit to it is somebody annotating the document, not editing it.
+    let sidecar = document
+        .file_stem()
+        .map(|stem| format!("{}.annos.json", stem.to_string_lossy()));
+    let named = changed.file_name().map(|name| name.to_string_lossy().into_owned());
+    if sidecar.is_some() && sidecar == named && changed.parent() == document.parent() {
+        return "annotation_changed";
+    }
+    "dependency_changed"
 }

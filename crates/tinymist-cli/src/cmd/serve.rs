@@ -715,13 +715,7 @@ pub fn serve_main(args: ServeArgs) -> Result<()> {
     }
     // The first line of the stream: which server this is and what it is
     // serving, so that everything after it has something to belong to.
-    let agents = args.mcp.then(|| format!("http://{}:{port}/m/", args.host));
-    tinymist::tool::registry::announce_init(
-        &note,
-        name.as_deref(),
-        agents.as_deref(),
-        injected_css.as_deref(),
-    );
+    tinymist::tool::registry::announce_init(&note, name.as_deref(), injected_css.as_deref());
     // Then where else it can be read, which is a fact about this server and
     // belongs after the line that says which server it is.
     #[cfg(feature = "tailscale")]
@@ -731,7 +725,7 @@ pub fn serve_main(args: ServeArgs) -> Result<()> {
             urls.push(full.into());
         }
         tinymist_project::announce(
-            "tailscale_info",
+            "tailscale_initialized",
             &[
                 ("urls", urls.into()),
                 ("host", mount.host.clone().into()),

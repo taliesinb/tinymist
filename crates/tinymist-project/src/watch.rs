@@ -522,7 +522,7 @@ impl<F: FnMut(FilesystemEvent) + Send + Sync> NotifyActor<F> {
                 // wrote itself is the usual answer. Said the moment the change
                 // is seen; the compile it causes says so itself, later.
                 for path in event.paths.iter() {
-                    crate::note_change();
+                    crate::note_change(&path.display().to_string());
                     crate::announce(
                         "file_changed",
                         &[("path", path.display().to_string().into())],

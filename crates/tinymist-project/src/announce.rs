@@ -127,8 +127,8 @@ pub fn event_signal() -> tokio::sync::watch::Receiver<u64> {
 /// Prose can only be one of those. Stdout stays clear for the address block,
 /// which is the one thing meant to be copied.
 ///
-/// Fields are written in the order given, with `type` first and `ts` last, so
-/// the lines read the way they were designed to.
+/// Fields are written in the order given, after `ts` and `type`. The time comes
+/// first and is a fixed width, so a column of lines is a column of times.
 pub fn announce(kind: &str, fields: &[(&str, serde_json::Value)]) {
     if !announcing() {
         return;
@@ -138,13 +138,17 @@ pub fn announce(kind: &str, fields: &[(&str, serde_json::Value)]) {
     eprintln!("{line}");
 }
 
-/// One event as one line of JSON, with `type` first and `ts` last.
+/// One event as one line of JSON, with `ts` first and `type` after it.
 pub fn event_line(kind: &str, fields: &[(&str, serde_json::Value)]) -> String {
-    let mut line = format!("{{\"type\":{}", serde_json::Value::from(kind));
+    let mut line = format!(
+        "{{\"ts\":{},\"type\":{}",
+        serde_json::Value::from(iso_now()),
+        serde_json::Value::from(kind)
+    );
     for (key, value) in fields {
         line.push_str(&format!(",{}:{value}", serde_json::Value::from(*key)));
     }
-    line.push_str(&format!(",\"ts\":{}}}", serde_json::Value::from(iso_now())));
+    line.push('}');
     line
 }
 
@@ -154,12 +158,16 @@ pub fn event_line(kind: &str, fields: &[(&str, serde_json::Value)]) -> String {
 /// from the change that caused it rather than from when the compiler happened
 /// to be asked: the figure worth reading is the wait between saving a file and
 /// seeing the document.
-static LAST_CHANGE: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+/// The path is kept as well as the time, because a compile says why it ran and
+/// the answer is which file moved: the document itself, its annotations, or
+/// something it reads.
+static LAST_CHANGE: std::sync::Mutex<Option<(std::time::Instant, String)>> =
+    std::sync::Mutex::new(None);
 
 /// Notes that a file changed, as the clock a compile is measured against.
-pub fn note_change() {
+pub fn note_change(path: &str) {
     if let Ok(mut slot) = LAST_CHANGE.lock() {
-        *slot = Some(std::time::Instant::now());
+        *slot = Some((std::time::Instant::now(), path.to_owned()));
     }
 }
 
@@ -168,6 +176,13 @@ pub fn since_change() -> Option<std::time::Duration> {
     LAST_CHANGE
         .lock()
         .ok()
-        .and_then(|slot| *slot)
-        .map(|at| at.elapsed())
+        .and_then(|slot| slot.as_ref().map(|(at, _)| at.elapsed()))
+}
+
+/// Which file the last change was to.
+pub fn changed_path() -> Option<String> {
+    LAST_CHANGE
+        .lock()
+        .ok()
+        .and_then(|slot| slot.as_ref().map(|(_, path)| path.clone()))
 }

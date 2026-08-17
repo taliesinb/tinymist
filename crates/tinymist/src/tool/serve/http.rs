@@ -542,7 +542,7 @@ pub async fn make_http_server(
                     );
                     if last_listing.lock().replace(seen.clone()).as_deref() != Some(seen.as_str()) {
                         tinymist_project::announce(
-                            "listed",
+                            "directory_listed",
                             &[
                                 ("path", dir.display().to_string().into()),
                                 ("file_count", entries.len().into()),

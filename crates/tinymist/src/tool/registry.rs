@@ -126,20 +126,15 @@ pub fn announce_server(note: &ServerNote) -> std::io::Result<PathBuf> {
 pub fn announce_init(
     note: &ServerNote,
     name: Option<&str>,
-    agents: Option<&str>,
     injected_css: Option<&std::path::Path>,
 ) {
     tinymist_project::announce(
-        "init",
+        "initialized",
         &[
             ("server", note.server.clone().into()),
             ("path", note.path.clone().into()),
             ("root_name", name.unwrap_or_default().into()),
             ("url", note.url.clone().into()),
-            (
-                "agents",
-                agents.map(Into::into).unwrap_or(serde_json::Value::Null),
-            ),
             ("directory", note.directory.into()),
             (
                 "injected_typst_css",
