@@ -96,12 +96,78 @@
   .tm-empty {
     color: color-mix(in oklab, var(--tm-fg) 55%, transparent);
   }
+
+  /* A directory of thousands is not a list to scroll: it is looked into. The
+     search field and the letters are how, and they are there only when a
+     directory is big enough to need them. */
+  .tm-find {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    margin: 0 0 0.75rem;
+  }
+
+  .tm-find input {
+    flex: 1;
+    min-width: 0;
+    box-sizing: border-box;
+    padding: 0.45rem 0.6rem;
+    border-radius: 6px;
+    border: 1px solid var(--tm-rule);
+    background: color-mix(in oklab, var(--tm-fg) 5%, transparent);
+    color: inherit;
+    font: 0.9rem ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+
+  .tm-find input:focus {
+    outline: 2px solid color-mix(in oklab, var(--tm-accent) 60%, transparent);
+    outline-offset: -1px;
+  }
+
+  .tm-count {
+    color: color-mix(in oklab, var(--tm-fg) 55%, transparent);
+    font-size: 0.8rem;
+    white-space: nowrap;
+  }
+
+  .tm-letters {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.15rem;
+    margin: 0 0 1rem;
+  }
+
+  .tm-letters button {
+    min-width: 1.6rem;
+    padding: 0.15rem 0.3rem;
+    border: 1px solid transparent;
+    border-radius: 4px;
+    background: none;
+    color: color-mix(in oklab, var(--tm-fg) 65%, transparent);
+    font: 0.85rem ui-monospace, SFMono-Regular, Menlo, monospace;
+    cursor: pointer;
+  }
+
+  .tm-letters button:hover {
+    background: color-mix(in oklab, var(--tm-fg) 8%, transparent);
+  }
+
+  .tm-letters button[data-on] {
+    color: var(--tm-fg);
+    border-color: color-mix(in oklab, var(--tm-fg) 25%, transparent);
+    background: color-mix(in oklab, var(--tm-fg) 10%, transparent);
+  }
 </style>
 </head>
 <body>
 <main class="tm-listing">
   <h1 id="tm-title">Documents</h1>
   <p class="tm-where" id="tm-where"></p>
+  <div class="tm-find" id="tm-find" hidden>
+    <input id="tm-search" type="search" placeholder="Type to find a document" autocomplete="off" spellcheck="false">
+    <span class="tm-count" id="tm-count"></span>
+  </div>
+  <div class="tm-letters" id="tm-letters" hidden></div>
   <ul id="tm-docs"></ul>
   <p class="tm-empty" id="tm-empty" hidden>No documents here yet.</p>
 </main>
@@ -112,6 +178,15 @@
   (() => {
     const docs = document.getElementById("tm-docs");
     const empty = document.getElementById("tm-empty");
+    const find = document.getElementById("tm-find");
+    const letters = document.getElementById("tm-letters");
+    const search = document.getElementById("tm-search");
+    const count = document.getElementById("tm-count");
+    search.addEventListener("input", () => {
+      query = search.value.trim().toLowerCase();
+      draw();
+      drawLetters();
+    });
     const text = (tag, cls, value) => {
       const el = document.createElement(tag);
       el.className = cls;
@@ -142,6 +217,160 @@
       const rest = at < 0 ? "" : location.pathname.slice(at + mount().length);
       return rest.replace(/^\/+|\/+$/g, "");
     };
+    // How many rows are drawn at once. A directory of twenty thousand files is
+    // not a list to scroll: it is looked into, so the page shows a screenful
+    // and leaves the rest to the search field and the letters.
+    const PAGE = 16;
+    // Below this a directory is just a list, and chrome for finding things in
+    // it is chrome in the way.
+    const BROWSE_FROM = 16;
+
+    // What a row is, whatever it is a row of.
+    const rowsOf = (data) => {
+      const rows = [];
+      if (data.under) rows.push({ kind: "up", href: "../", file: "..", name: "" });
+      for (const dir of data.dirs || []) {
+        rows.push({ kind: "dir", href: dir + "/", file: dir + "/", name: "" });
+      }
+      for (const doc of data.docs || []) {
+        rows.push({
+          kind: "doc",
+          // Names are relative to this directory, since the page is at it.
+          href: doc.slug.split("/").pop() + "/",
+          file: doc.file,
+          name: doc.title || "",
+          age: doc.age,
+          annotations: doc.annotations,
+        });
+      }
+      for (const file of data.files || []) {
+        // A server that has not been restarted since this page was may still
+        // send a bare name.
+        const named = typeof file === "string" ? { file } : file;
+        rows.push({ kind: "file", href: named.file, file: named.file, name: "", age: named.age });
+      }
+      return rows;
+    };
+
+    // Every letter that begins something here, in order, so a directory of
+    // Greek or of numbers is not offered a Latin alphabet it has nothing under.
+    const letterOf = (row) => {
+      const first = (row.file || "").replace(/^[^\p{L}\p{N}]+/u, "").charAt(0).toUpperCase();
+      if (!first) return "#";
+      return /\p{L}|\p{N}/u.test(first) ? first : "#";
+    };
+
+    // Does the query appear in the text, in order, and how well?
+    //
+    // A subsequence match, scored by how tightly the letters sit together and
+    // whether they start words: typing "brcod" should find
+    // "brown-comenetz-duality" without knowing where the dashes are.
+    const fuzzy = (text, query) => {
+      const said = text.toLowerCase();
+      let at = 0;
+      let score = 0;
+      let last = -2;
+      for (const want of query) {
+        const found = said.indexOf(want, at);
+        if (found < 0) return -1;
+        // Together, and at the start of a word, are what makes a match feel
+        // like the thing that was meant.
+        if (found === last + 1) score += 3;
+        if (found === 0 || /[^\p{L}\p{N}]/u.test(said[found - 1] || "")) score += 2;
+        score += 1;
+        last = found;
+        at = found + 1;
+      }
+      // A short name matching is a better match than a long one that happens to
+      // contain the letters.
+      return score - said.length / 100;
+    };
+
+    let rows = [];
+    let letter = "";
+    let query = "";
+
+    const drawRow = (row) => {
+      const li = document.createElement("li");
+      const a = document.createElement("a");
+      a.href = row.href;
+      a.append(text("span", "tm-file", row.file));
+      a.append(text("span", "tm-name", row.name));
+      if (row.age !== undefined || row.annotations !== undefined) {
+        const meta = document.createElement("span");
+        meta.className = "tm-meta";
+        if (row.annotations !== undefined) {
+          const notes = text(
+            "span",
+            "tm-notes",
+            row.annotations === 1 ? "1 annotation" : `${row.annotations} annotations`,
+          );
+          notes.dataset.count = row.annotations;
+          meta.append(notes);
+        }
+        if (row.age !== undefined) meta.append(text("span", "tm-when", ago(row.age)));
+        a.append(meta);
+      }
+      li.append(a);
+      docs.append(li);
+    };
+
+    const draw = () => {
+      const browsing = rows.length > BROWSE_FROM;
+      find.hidden = !browsing;
+      letters.hidden = !browsing;
+      // A search is over everything; a letter is a place to start reading from.
+      let shown = rows;
+      if (browsing) {
+        if (query) {
+          shown = rows
+            .map((row) => ({ row, score: fuzzy(`${row.file} ${row.name}`, query) }))
+            .filter((hit) => hit.score >= 0)
+            .sort((one, two) => two.score - one.score)
+            .map((hit) => hit.row);
+        } else if (letter) {
+          shown = rows.filter((row) => row.kind !== "doc" && row.kind !== "file"
+            ? false
+            : letterOf(row) === letter);
+        }
+      }
+      const drawn = shown.slice(0, browsing ? PAGE : shown.length);
+      docs.textContent = "";
+      for (const row of drawn) drawRow(row);
+      empty.hidden = shown.length > 0;
+      count.textContent = browsing
+        ? shown.length > drawn.length
+          ? `${drawn.length} of ${shown.length}`
+          : `${shown.length}`
+        : "";
+    };
+
+    const drawLetters = () => {
+      const seen = [];
+      for (const row of rows) {
+        if (row.kind !== "doc" && row.kind !== "file") continue;
+        const at = letterOf(row);
+        if (!seen.includes(at)) seen.push(at);
+      }
+      seen.sort();
+      letters.textContent = "";
+      const add = (label, value) => {
+        const button = document.createElement("button");
+        button.textContent = label;
+        button.toggleAttribute("data-on", letter === value && !query);
+        button.onclick = () => {
+          letter = letter === value ? "" : value;
+          query = "";
+          search.value = "";
+          draw();
+          drawLetters();
+        };
+        letters.append(button);
+      };
+      add("all", "");
+      for (const at of seen) add(at, at);
+    };
+
     const render = (data) => {
       const under = data.under || "";
       // What the directory is called, not what is showing it: a listing page
@@ -152,70 +381,28 @@
       document.title = name;
       document.getElementById("tm-title").textContent = name;
       document.getElementById("tm-where").textContent = data.dir || "";
-      docs.textContent = "";
-      empty.hidden =
-        data.docs.length + (data.dirs || []).length + (data.files || []).length > 0;
-      // Up first, then the directories, then the documents, then whatever else
-      // is in here: a reader walks down a tree and back out of it.
-      if (under) {
-        const li = document.createElement("li");
-        const a = document.createElement("a");
-        a.href = "../";
-        a.append(text("span", "tm-file", ".."));
-        a.append(text("span", "tm-name", ""));
-        li.append(a);
-        docs.append(li);
-      }
-      for (const dir of data.dirs || []) {
-        const li = document.createElement("li");
-        const a = document.createElement("a");
-        a.href = dir + "/";
-        a.append(text("span", "tm-file", dir + "/"));
-        a.append(text("span", "tm-name", ""));
-        li.append(a);
-        docs.append(li);
-      }
-      for (const doc of data.docs) {
-        const li = document.createElement("li");
-        const a = document.createElement("a");
-        // Names are relative to this directory, since the page is at it.
-        a.href = doc.slug.split("/").pop() + "/";
-        // The file name in the column a file name is read down, and the title
-        // beside it: the file is what a reader is looking for, and the title is
-        // what tells them they have found it.
-        a.append(text("span", "tm-file", doc.file));
-        a.append(text("span", "tm-name", doc.title));
-        const meta = document.createElement("span");
-        meta.className = "tm-meta";
-        const notes = text(
-          "span",
-          "tm-notes",
-          doc.annotations === 1 ? "1 annotation" : `${doc.annotations} annotations`,
-        );
-        notes.dataset.count = doc.annotations;
-        meta.append(notes);
-        meta.append(text("span", "tm-when", ago(doc.age)));
-        a.append(meta);
-        li.append(a);
-        docs.append(li);
-      }
-      for (const file of data.files || []) {
-        // A server that has not been restarted since this page was may still
-        // send a bare name.
-        const named = typeof file === "string" ? { file } : file;
-        const li = document.createElement("li");
-        const a = document.createElement("a");
-        a.href = named.file;
-        a.append(text("span", "tm-file", named.file));
-        a.append(text("span", "tm-name", ""));
-        const meta = document.createElement("span");
-        meta.className = "tm-meta";
-        if (named.age !== undefined) meta.append(text("span", "tm-when", ago(named.age)));
-        a.append(meta);
-        li.append(a);
-        docs.append(li);
-      }
+      const fresh = rowsOf(data);
+      // Redrawn only when it has changed: this is asked for every few seconds,
+      // and a page that rebuilds itself under a reader's pointer loses their
+      // place and their selection.
+      const same =
+        fresh.length === rows.length &&
+        fresh.every((row, at) => {
+          const was = rows[at];
+          return (
+            was &&
+            was.file === row.file &&
+            was.name === row.name &&
+            was.age === row.age &&
+            was.annotations === row.annotations
+          );
+        });
+      if (same) return;
+      rows = fresh;
+      draw();
+      drawLetters();
     };
+
     const load = () =>
       // Asked at the mount, not relative to this page: the endpoint belongs to
       // the site, and a relative address at `/a/report/` would ask the site for
