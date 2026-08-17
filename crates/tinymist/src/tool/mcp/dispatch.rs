@@ -29,7 +29,9 @@ fn hub_tools() -> Value {
             "title": "List document servers",
             "description": "The document servers running now: a short name for each, what it \
                             is serving, and the documents in it. Everything else takes one of \
-                            these names as `server`. Start here.",
+                            these names as `server`. Start here. An empty list means nothing is \
+                            being served: open_document a path to start a server, or ask the \
+                            person to start their own.",
             "inputSchema": {
                 "type": "object",
                 "properties": {},
@@ -40,9 +42,11 @@ fn hub_tools() -> Value {
         {
             "name": "open_document",
             "title": "Open a document or directory",
-            "description": "Serves a file or directory that nothing is serving yet, and \
-                            returns the server's name. Say show: true to open a window on it, \
-                            which is how to show a person what you are working on.",
+            "description": "Serves a file or directory, and returns the server's name. \
+                            `state` says which happened: \"started\" for a server this call \
+                            started, \"reused\" for one that was already serving that path. \
+                            Say show: true to open a window on it, which is how to show a \
+                            person what you are working on.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -186,14 +190,37 @@ pub fn handle(request: Value) -> Option<Value> {
                 "title": "Talimist documents",
                 "version": env!("CARGO_PKG_VERSION"),
             },
-            "instructions": "Typst documents that a person is reading and annotating. Each \
-                             server serves one file or one directory. Call list_servers first, \
-                             then pass that name as `server` to every other tool. An annotation \
-                             is a question or a request left in the margin. The usual sequence \
-                             is: wait_for_annotations, claim, get_block, replace_block, reply, \
-                             resolve. An annotation is named by its id or by the letter the \
-                             reader sees on the page. Some annotations are about the document \
-                             rather than a place in it, and have no block to rewrite.",
+            "instructions": "Typst documents that a person is reading and annotating. An \
+                             annotation is a question or a request left in the margin of one.\n\n\
+                             Start with list_servers. Each server serves one file or one \
+                             directory; pass its name as `server` to every other tool. An empty \
+                             list means nothing is being served yet: open_document a path to \
+                             start a server, or ask the person to start their own — they may \
+                             want it in a window they can see.\n\n\
+                             The usual sequence is wait_for_annotations, claim, get_block, \
+                             replace_block, reply, resolve. Every step after claim is optional. \
+                             Fixing the cause outside the document is a proper resolution: when \
+                             a document is generated from a script or a data file, the edit \
+                             belongs in what generates it, and replace_block refuses a file \
+                             that says it is generated. An annotation about a picture, a \
+                             layout or a number usually has no text to rewrite either. Claim \
+                             it, fix whatever is really wrong, then reply and resolve.\n\n\
+                             An annotation is named by its id or by the letter the reader sees \
+                             on the page. Some are about the document rather than a place in \
+                             it, and have no block to rewrite: annotate leaves one of those, \
+                             audit reports the ones that lost their place, delete removes an \
+                             annotation outright (resolve is nearly always what is meant).\n\n\
+                             The document is rebuilt on its own whenever anything it is made \
+                             of changes — the file, what it imports, the data it reads, the \
+                             pictures it embeds. Nothing has to ask for that; document_status \
+                             says whether the rebuild landed, what it said if it failed, and \
+                             who is reading. render_snippet compiles a fragment beside the \
+                             document to see how something would come out, without touching \
+                             it.\n\n\
+                             Annotations live in a `<document>.annos.json` file beside the \
+                             document. It is the person's work, belongs in version control, \
+                             and is never yours to delete or edit by hand — these tools are \
+                             how it changes.",
         })),
         "ping" => Ok(json!({})),
         "tools/list" => {
@@ -283,14 +310,14 @@ fn call(name: &str, args: &Value) -> Value {
                 .find(|note| Path::new(&note.path) == canonical)
             {
                 return result(
-                    json!({ "server": note.server, "url": note.url, "started": false }),
+                    json!({ "server": note.server, "url": note.url, "state": "reused" }),
                     false,
                 );
             }
             let show = args.get("show").and_then(Value::as_bool).unwrap_or(false);
             match start_server(&path, show) {
                 Ok(note) => result(
-                    json!({ "server": note.server, "url": note.url, "started": true }),
+                    json!({ "server": note.server, "url": note.url, "state": "started" }),
                     false,
                 ),
                 Err(err) => result(json!({ "error": err }), true),

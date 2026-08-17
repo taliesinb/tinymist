@@ -24,6 +24,7 @@ pub mod pins;
 pub mod renders;
 pub mod http;
 pub mod sidecar;
+pub mod snippet;
 
 pub use crate::tool::registry::{
     announce_server, running_servers, slug_for, withdraw_server, ServerNote,

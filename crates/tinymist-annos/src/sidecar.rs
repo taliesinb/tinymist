@@ -16,9 +16,22 @@ use crate::record::Annotation;
 /// so rather than guessing at fields that are not there.
 pub const VERSION: u32 = 1;
 
+/// What the file says about itself, first, to whoever opens it.
+///
+/// A sidecar sits beside a document among that document's build output, and
+/// looks enough like build output to be swept up with it. This is what a person
+/// or an agent reads before deciding it is litter.
+pub const NOTE: &str = "Annotations for companion .typ file; written by \
+                        talimist; keep in git; do not delete; agents: use \
+                        talimist mcp tool to edit.";
+
 /// What a sidecar file holds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Sidecar {
+    /// What this file is, written first and read by nobody: whatever a file on
+    /// disk says here is replaced by [`NOTE`] when it is next written.
+    #[serde(rename = "_", default = "note")]
+    pub note: String,
     /// The format version.
     pub version: u32,
     /// The annotations, in the order they were written.
@@ -26,9 +39,14 @@ pub struct Sidecar {
     pub annotations: Vec<Annotation>,
 }
 
+fn note() -> String {
+    NOTE.to_owned()
+}
+
 impl Default for Sidecar {
     fn default() -> Self {
         Self {
+            note: note(),
             version: VERSION,
             annotations: Vec::new(),
         }
@@ -64,7 +82,11 @@ impl Sidecar {
     /// is the order the types declare, which is why the records hold vectors
     /// rather than maps — a map would reorder itself and rewrite the file.
     pub fn to_json(&self) -> String {
-        let mut text = serde_json::to_string_pretty(self).unwrap_or_else(|_| "{}".to_owned());
+        // Said afresh every time: a file whose note was edited away, or written
+        // by an older build that had none, gets one back.
+        let mut said = self.clone();
+        said.note = note();
+        let mut text = serde_json::to_string_pretty(&said).unwrap_or_else(|_| "{}".to_owned());
         text.push('\n');
         text
     }

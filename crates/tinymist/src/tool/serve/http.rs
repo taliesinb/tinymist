@@ -52,6 +52,7 @@ pub async fn make_http_server(
     struct ClientGuard(std::sync::Arc<std::sync::atomic::AtomicUsize>, usize);
     impl Drop for ClientGuard {
         fn drop(&mut self) {
+            super::http::LIVE_CLIENTS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
             let left = self
                 .0
                 .fetch_sub(1, std::sync::atomic::Ordering::SeqCst)
@@ -522,6 +523,7 @@ pub async fn make_http_server(
                     let init = rx.borrow().clone();
                     use std::sync::atomic::Ordering::SeqCst;
                     let now = live.fetch_add(1, SeqCst) + 1;
+                    LIVE_CLIENTS.fetch_add(1, SeqCst);
                     served_anyone.store(true, SeqCst);
                     let id = next_client.fetch_add(1, SeqCst);
                     let guard = ClientGuard(live.clone(), id);
@@ -1077,6 +1079,18 @@ fn log_connection_error(err: &(dyn std::error::Error + 'static)) {
         cause = err.source();
     }
     log::error!("cannot serve http: {err}");
+}
+
+/// How many readers are connected, across every document this process serves.
+///
+/// A page says it is there by holding its event stream open, which is what this
+/// counts: an agent asking whether anyone is reading what it just changed wants
+/// the answer for the machine, not for one document.
+static LIVE_CLIENTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The count, for whoever asks.
+pub fn live_clients() -> usize {
+    LIVE_CLIENTS.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 /// A file from the directory being served, as it is.

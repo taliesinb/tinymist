@@ -193,6 +193,7 @@ fn tools() -> Vec<Tool> {
                              it; the annotations that pointed at them become annotations about \
                              the document, and are not deleted).",
                         ),
+                        "force": {"type": "boolean", "description": "Edit a file that says it is generated. Refused without this, since such an edit lasts only until whatever generates the file runs again."},
                     }),
                     &["uuid", "blockId", "text"],
                 )
@@ -240,6 +241,46 @@ fn tools() -> Vec<Tool> {
                         "document": optional_string("Which document, when the server holds several."),
                     }),
                     &["text"],
+                )
+            },
+        },
+        Tool {
+            name: "document_status",
+            title: "How the document stands",
+            description: "Reports whether the document compiles and what it said if not, which \
+                          rendering the readers are looking at, how many are connected, whether \
+                          the document says it is generated, and which files a change to would \
+                          rebuild it. The server watches those files, so a document is rebuilt \
+                          on its own after an edit — to a figure, a data file, whatever it \
+                          imports — and this is how to see that the rebuild landed. Example: {}",
+            schema: || {
+                schema(
+                    json!({ "document": optional_string("Which document, when the server holds several.") }),
+                    &[],
+                )
+            },
+        },
+        Tool {
+            name: "render_snippet",
+            title: "Render a fragment of Typst",
+            description: "Compiles a fragment of Typst beside the document — with the same \
+                          imports, fonts and data files, so `#import \"style.typ\"` resolves — and \
+                          returns the result as a picture, a PDF, an SVG or HTML. Use it to see \
+                          how something would come out before putting it in the document: a \
+                          table, a figure, a piece of markup. The fragment is written to a \
+                          temporary file that is deleted as soon as it has been compiled, and \
+                          the document is not touched. A fragment that fails to compile comes \
+                          back with the error rather than nothing. Examples: {\"source\": \
+                          \"#table(columns: 2, [a], [b])\"}; {\"source\": \"...\", \"format\": \
+                          \"html\"} to see it as the reader's page would.",
+            schema: || {
+                schema(
+                    json!({
+                        "source": string("The Typst to compile, as a whole document: it may import, set styles, and use anything the document itself can."),
+                        "format": optional_string("png (default), pdf, svg, or html."),
+                        "document": optional_string("Which document's directory to compile it in, when the server holds several."),
+                    }),
+                    &["source"],
                 )
             },
         },
@@ -399,6 +440,19 @@ fn record_json(rec: &crate::tool::serve::annotations::AnnotationRecord, excerpt:
     value
 }
 
+/// Where an annotation is, in words: the headings above it and what it names.
+///
+/// The location says which node in which rendering, which is what the server
+/// needs and nothing a caller can picture. This is the same fact for a reader.
+fn where_of(annot: &Arc<dyn AnnotationServer>, uuid: &str, kind: &str) -> Option<String> {
+    let block = annot.block(uuid, false).ok()?;
+    let mut said = block.heading_path.join(" › ");
+    if said.is_empty() {
+        said = "the document".to_owned();
+    }
+    Some(format!("{said} ({kind})"))
+}
+
 /// The annotation a caller named, by id or by letter.
 ///
 /// A person reads letters off the page and says "look at g"; a tool passes ids
@@ -496,9 +550,24 @@ async fn call_tool(site: &Arc<dyn DocumentSite>, name: &str, args: &Value) -> Re
                     })
                 })
                 .filter(|rec| author.as_ref().is_none_or(|want| &rec.author == want))
-                .map(|rec| record_json(rec, excerpt_of(&annot, &rec.uuid)))
+                .map(|rec| {
+                    let mut value = record_json(rec, excerpt_of(&annot, &rec.uuid));
+                    if let (Some(map), Some(said)) = (
+                        value.as_object_mut(),
+                        where_of(&annot, &rec.uuid, rec.location.kind()),
+                    ) {
+                        map.insert("where".into(), said.into());
+                    }
+                    value
+                })
                 .collect();
-            Ok(json!({ "document": document, "annotations": annotations }))
+            let mut answer = json!({ "annotations": annotations });
+            // Named only when it names something: a server of one document has
+            // no name for it, and an empty string is a field to wonder about.
+            if !document.is_empty() {
+                answer["document"] = document.into();
+            }
+            Ok(answer)
         }
         "wait_for_annotations" => {
             let cursor = args.get("cursor").and_then(Value::as_u64);
@@ -585,6 +654,18 @@ async fn call_tool(site: &Arc<dyn DocumentSite>, name: &str, args: &Value) -> Re
             let annot = annot_of(&doc).await?;
             annot.audit()
         }
+        "document_status" => {
+            let (_, doc) = document_of(site, args).await?;
+            let annot = annot_of(&doc).await?;
+            annot.status()
+        }
+        "render_snippet" => {
+            let source = text("source").ok_or("what should it render? pass source")?;
+            let format = text("format").unwrap_or_default();
+            let (_, doc) = document_of(site, args).await?;
+            let annot = annot_of(&doc).await?;
+            annot.render_snippet(&source, &format)
+        }
         "get_block" => {
             let context = args
                 .get("context")
@@ -631,7 +712,8 @@ async fn call_tool(site: &Arc<dyn DocumentSite>, name: &str, args: &Value) -> Re
             let annot = annot_of(&doc).await?;
             let uuid = identify(&annot, &uuid)?;
             let was = annot.compile_revision();
-            let dropped = annot.replace_block(&uuid, &block_id, &new_text, policy)?;
+            let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
+            let dropped = annot.replace_block(&uuid, &block_id, &new_text, policy, force)?;
             let report = compile_report(&annot, was).await;
             // What the block is now, so the next rewrite has an id that is not
             // already stale.
