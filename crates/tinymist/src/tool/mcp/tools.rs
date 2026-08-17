@@ -440,10 +440,10 @@ fn record_json(rec: &crate::tool::serve::annotations::AnnotationRecord, excerpt:
     value
 }
 
-/// Where an annotation is, in words: the headings above it and what it names.
+/// Where an annotation is, in words: the headings above it, and its kind.
 ///
-/// The location says which node in which rendering, which is what the server
-/// needs and nothing a caller can picture. This is the same fact for a reader.
+/// A location names a node in a rendering, which the server needs and a caller
+/// cannot interpret. This is the same position said in the document's terms.
 fn where_of(annot: &Arc<dyn AnnotationServer>, uuid: &str, kind: &str) -> Option<String> {
     let block = annot.block(uuid, false).ok()?;
     let mut said = block.heading_path.join(" › ");
@@ -562,8 +562,8 @@ async fn call_tool(site: &Arc<dyn DocumentSite>, name: &str, args: &Value) -> Re
                 })
                 .collect();
             let mut answer = json!({ "annotations": annotations });
-            // Named only when it names something: a server of one document has
-            // no name for it, and an empty string is a field to wonder about.
+            // Omitted for a server of one document, which has no name for it.
+            // An empty string reads as a value rather than as an absence.
             if !document.is_empty() {
                 answer["document"] = document.into();
             }

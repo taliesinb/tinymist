@@ -1083,9 +1083,9 @@ fn log_connection_error(err: &(dyn std::error::Error + 'static)) {
 
 /// How many readers are connected, across every document this process serves.
 ///
-/// A page says it is there by holding its event stream open, which is what this
-/// counts: an agent asking whether anyone is reading what it just changed wants
-/// the answer for the machine, not for one document.
+/// A page holds its event stream open for as long as it is open, so the number
+/// of open streams is the number of readers. Counted per process rather than
+/// per document, which is what a caller asking "is anyone reading this" wants.
 static LIVE_CLIENTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// The count, for whoever asks.

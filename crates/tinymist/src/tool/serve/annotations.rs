@@ -153,14 +153,14 @@ pub trait AnnotationServer: Send + Sync {
         Err("this server cannot audit annotations".into())
     }
 
-    /// How the document stands: whether it compiles, what it is made of, and
-    /// whether anybody is reading it.
+    /// Whether the document compiles, what it is made of, and how many readers
+    /// are connected.
     fn status(&self) -> Result<serde_json::Value, String> {
         Err("this server cannot report its status".into())
     }
 
-    /// Renders a fragment of Typst beside the document, with the same
-    /// libraries and the same files, and reports how it came out.
+    /// Compiles a fragment of Typst with the document's root and libraries, and
+    /// returns the rendering.
     fn render_snippet(
         &self,
         _source: &str,
@@ -412,8 +412,8 @@ pub struct SourceBlock {
     /// Every annotation anchored inside this block, with the offset of its
     /// anchor *within the block* — what a rewrite has to carry across.
     pub anchors: Vec<Anchor>,
-    /// What the file says about being generated, when it says anything: an
-    /// edit to a generated file lasts until whatever generates it runs again.
+    /// The line in which the file declares itself generated, if there is one.
+    /// An edit to such a file is undone by the next run of its generator.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub generated: Option<String>,
     /// The blocks either side, when asked for.
@@ -440,12 +440,11 @@ pub struct Anchor {
     pub annotations: Vec<String>,
 }
 
-/// What a file says about being generated, if it says anything.
+/// The line in which a file says it is generated, if there is one.
 ///
-/// A generated file is rewritten by whatever generates it, so an edit to it
-/// lasts until the next run and no longer. Documents that are generated
-/// usually say so in their first lines, and this is that line, verbatim, for
-/// whoever is about to edit one.
+/// Editing a generated file has no lasting effect: the generator overwrites it
+/// on its next run. Such files usually declare themselves in the first few
+/// lines, and the declaration is returned verbatim so a caller can quote it.
 pub fn generated_note(text: &str) -> Option<String> {
     text.lines().take(8).find_map(|line| {
         let said = line.trim();
@@ -1123,9 +1122,8 @@ impl crate::tool::serve::AnnotationServer for DiskAnnotationServer {
     ) -> Result<Vec<String>, String> {
         let art = self.art()?;
         let edit = prepare_block_replace(&art, uuid, block_id, new_text, policy)?;
-        // A file that says it is generated is rewritten by whatever generates
-        // it, so an edit to it lasts until the next run. Saying so is more use
-        // than making the edit.
+        // Refused rather than written: an edit to a generated file is undone
+        // by the next run of whatever generates it.
         if !force {
             if let Some(said) = std::fs::read_to_string(&edit.path)
                 .ok()
@@ -1198,9 +1196,8 @@ impl crate::tool::serve::AnnotationServer for DiskAnnotationServer {
         let document = document_path(&art).ok_or("cannot determine the document path")?;
         let (ok, messages) = self.diagnostics();
         let world = art.world();
-        // What a compile read, which is what a change to any of them rebuilds:
-        // the document, what it imports, the data it reads, the pictures it
-        // embeds.
+        // Every file the last compile read: the document, its imports, its data
+        // files, its images. A change to any of them triggers a rebuild.
         let mut watched: Vec<String> = art
             .depended_files()
             .iter()
@@ -1216,15 +1213,14 @@ impl crate::tool::serve::AnnotationServer for DiskAnnotationServer {
             "document": document.display().to_string(),
             "compiles": ok,
             "diagnostics": messages,
-            // Which rendering the readers are looking at, and which compile it
-            // came from: a caller that has just rewritten something waits for
-            // this to move.
+            // The rendering the readers currently have. A caller that has just
+            // written to the document waits for this to change.
             "render": super::renders::latest().map(|map| map.render.clone()),
             "revision": self.compile_revision(),
             "readers": crate::tool::serve::http::live_clients(),
             "generated": generated_note(&text),
-            // Changed on disk, and the document is rendered again: nothing has
-            // to ask for that.
+            // Watched by the server; no tool call is needed to trigger a
+            // rebuild after one of them changes.
             "watchedDependencies": watched,
         }))
     }

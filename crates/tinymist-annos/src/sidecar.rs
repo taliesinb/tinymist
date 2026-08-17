@@ -16,11 +16,11 @@ use crate::record::Annotation;
 /// so rather than guessing at fields that are not there.
 pub const VERSION: u32 = 1;
 
-/// What the file says about itself, first, to whoever opens it.
+/// The first field of every sidecar, saying what the file is.
 ///
-/// A sidecar sits beside a document among that document's build output, and
-/// looks enough like build output to be swept up with it. This is what a person
-/// or an agent reads before deciding it is litter.
+/// A sidecar sits beside the document, in the same directory as build output
+/// such as a PDF, and has been mistaken for build output and deleted. This is
+/// what anyone opening the file reads first.
 pub const NOTE: &str = "Annotations for companion .typ file; written by \
                         talimist; keep in git; do not delete; agents: use \
                         talimist mcp tool to edit.";
@@ -28,8 +28,8 @@ pub const NOTE: &str = "Annotations for companion .typ file; written by \
 /// What a sidecar file holds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Sidecar {
-    /// What this file is, written first and read by nobody: whatever a file on
-    /// disk says here is replaced by [`NOTE`] when it is next written.
+    /// What this file is. Not read back: whatever the file on disk says here is
+    /// replaced by [`NOTE`] when the file is next written.
     #[serde(rename = "_", default = "note")]
     pub note: String,
     /// The format version.
@@ -82,8 +82,8 @@ impl Sidecar {
     /// is the order the types declare, which is why the records hold vectors
     /// rather than maps — a map would reorder itself and rewrite the file.
     pub fn to_json(&self) -> String {
-        // Said afresh every time: a file whose note was edited away, or written
-        // by an older build that had none, gets one back.
+        // Written fresh every time, so a file that lost the note — edited by
+        // hand, or written by a build that predates it — gets it back.
         let mut said = self.clone();
         said.note = note();
         let mut text = serde_json::to_string_pretty(&said).unwrap_or_else(|_| "{}".to_owned());

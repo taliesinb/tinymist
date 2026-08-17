@@ -1,15 +1,14 @@
-//! Rendering a fragment of Typst beside a document, and throwing it away.
+//! Rendering a fragment of Typst beside a document, and deleting it afterwards.
 //!
-//! An agent asked to change how something looks has no way to see what it did:
-//! the document is source, the reader is a person, and the loop between them is
-//! the person. This closes it for the small case — a table, a figure, a piece
-//! of markup — by compiling what the agent wrote as if it were part of the
-//! document, and answering with the result.
+//! A Typst document is source. Nothing in these tools shows what a change would
+//! look like, so an agent editing a table or a figure has to write the change
+//! into the document and ask somebody to look at it. This compiles a fragment
+//! on its own and returns the rendering, so the change can be checked first.
 //!
-//! Beside the document, not in a temporary directory of its own: a fragment is
-//! written against the document's own imports, its own fonts and its own data
-//! files, and `#import "style.typ"` has to resolve. The file is deleted as soon
-//! as it has been compiled, whether or not it compiled.
+//! The fragment is written beside the document rather than in a temporary
+//! directory, because it is compiled with the document's root: `#import
+//! "style.typ"` and any relative path to data or images must resolve. The file
+//! is deleted after the compile, whether or not the compile succeeded.
 
 use std::path::{Path, PathBuf};
 
@@ -32,8 +31,7 @@ fn known(format: &str) -> Result<&'static str, String> {
     }
 }
 
-/// A file beside the document that this process owns and nobody else will
-/// mistake for the document's own.
+/// A file to delete when this value goes out of scope.
 struct Scratch(PathBuf);
 
 impl Drop for Scratch {
@@ -42,21 +40,21 @@ impl Drop for Scratch {
     }
 }
 
-/// Renders a fragment, and says how it came out.
+/// Renders a fragment and reports the result.
 ///
-/// The answer carries the diagnostics whether or not it compiled: a snippet
-/// that fails is exactly the case an agent wants the message from.
+/// Diagnostics are returned whether or not the compile succeeded, since the
+/// error message is the useful part of a failed compile.
 pub fn render(document: &Path, source: &str, format: &str) -> Result<serde_json::Value, String> {
     let format = known(format)?;
     let dir = document
         .parent()
         .map(Path::to_path_buf)
         .ok_or("the document has no directory")?;
-    // Where the project starts, so that an import reaching above the
-    // document's own directory still resolves.
+    // The document's own directory is the root, which is what makes a relative
+    // import in the fragment resolve the same way it does in the document.
     let root = Some(dir.clone());
-    // Named after this process and the moment: two agents asking at once are
-    // two files, and a crash leaves one behind that says what it was.
+    // The name carries the process id and the time, so that two calls at once
+    // write two files. A leading dot keeps it out of directory listings.
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|since| since.as_millis())
@@ -66,9 +64,8 @@ pub fn render(document: &Path, source: &str, format: &str) -> Result<serde_json:
         .map_err(|err| format!("cannot write {}: {err}", path.display()))?;
     let _scratch = Scratch(path.clone());
 
-    // Compiled against the document's own root, so that everything the
-    // document can read, the snippet can read: its style file, its data, its
-    // fonts.
+    // The document's root, so the fragment can read the same files the document
+    // can: its style file, its data files, its images.
     let args = crate::CompileOnceArgs {
         input: Some(path.display().to_string()),
         root: root.clone(),
@@ -78,8 +75,8 @@ pub fn render(document: &Path, source: &str, format: &str) -> Result<serde_json:
         .map_err(|err| format!("cannot read the project: {err}"))?;
     let html_out = format == "html";
     if html_out {
-        // The same shims a served document is compiled through: a snippet
-        // rendered without them is not what the reader would see.
+        // The same shims a served document is compiled with, so that the
+        // fragment renders the way it would in the document.
         if let Err(err) = html::install_shims(&mut universe) {
             log::warn!("rendering a snippet without the HTML shims: {err}");
         }
@@ -110,9 +107,8 @@ pub fn render(document: &Path, source: &str, format: &str) -> Result<serde_json:
             "pdf" => {
                 let bytes = typst_pdf::pdf(&paged, &typst_pdf::PdfOptions::default())
                     .map_err(|err| format!("cannot make a PDF of the snippet: {err:?}"))?;
-                // Under `image`, which is what the tool layer lifts into a
-                // block of its own: a picture a model can look at, rather than
-                // base64 in the middle of the text.
+                // Under `image`, which the tool layer turns into an image
+                // content block rather than base64 inside the text.
                 serde_json::json!({
                     "image": {
                         "mimeType": "application/pdf",
