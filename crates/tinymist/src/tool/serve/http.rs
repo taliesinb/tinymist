@@ -711,6 +711,14 @@ pub async fn make_http_server(
                     // annotation at a clicked position; POST
                     // /dev/annotate/delete removes one by id.
                     use http_body_util::BodyExt;
+                    // A server started with a latency answers these slowly on
+                    // purpose: what a page does while it waits — the mark that
+                    // stands in for an annotation until the server has it — is
+                    // otherwise only visible on a machine slow enough to see.
+                    let wait = crate::tool::serve::annotate_latency();
+                    if wait > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
+                    }
                     #[derive(serde::Deserialize)]
                     struct UuidReq {
                         uuid: String,

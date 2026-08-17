@@ -80,6 +80,20 @@ pub struct ServeArgs {
     #[clap(long = "theme", value_name = "THEME", default_value = "light")]
     pub theme: tinymist::ThemeArg,
 
+    /// Answer the annotation endpoints this many milliseconds late, on
+    /// purpose. What a page shows while the server has an annotation and has
+    /// not sent it back yet is otherwise gone before it can be looked at.
+    #[clap(long = "annotate-latency", value_name = "MS")]
+    pub annotate_latency: Option<u64>,
+
+    /// Take the address even if something is already serving there: the server
+    /// holding it is asked to stop, and this one waits for it to let go. A
+    /// server started with different arguments — a latency, another theme —
+    /// would otherwise be answered with "already serving" by the one already
+    /// running.
+    #[clap(long = "force-launch")]
+    pub force_launch: bool,
+
     /// Print the URL this document is served at and exit, without serving it.
     #[clap(long = "print-url")]
     pub print_url: bool,
@@ -177,6 +191,26 @@ fn probe(host: &str, port: u16) -> Option<String> {
         return Some(body.trim().to_owned());
     }
     None
+}
+
+/// Asks whatever is serving on an address to stop.
+fn stop_server(host: &str, port: u16) {
+    use std::io::Write;
+    use std::net::{TcpStream, ToSocketAddrs};
+
+    let timeout = std::time::Duration::from_millis(400);
+    let Ok(addrs) = (host, port).to_socket_addrs() else {
+        return;
+    };
+    for addr in addrs {
+        let Ok(mut sock) = TcpStream::connect_timeout(&addr, timeout) else {
+            continue;
+        };
+        let _ = sock.set_write_timeout(Some(timeout));
+        let request = format!("GET /dev/stop HTTP/1.0\r\nHost: {host}:{port}\r\n\r\n");
+        let _ = sock.write_all(request.as_bytes());
+        return;
+    }
 }
 
 /// Waits for a server of an older build to let go of the port it holds.
@@ -294,6 +328,9 @@ pub fn serve_main(args: ServeArgs) -> Result<()> {
         output: None,
     });
     tinymist::tool::webapp::note_build_stamp();
+    if let Some(ms) = args.annotate_latency {
+        tinymist::tool::serve::set_annotate_latency(ms);
+    }
     // A person is watching this in a terminal, so it narrates: what changed on
     // disk, and who is connected. The LSP shares its streams with the editor
     // and stays silent.
@@ -334,6 +371,11 @@ pub fn serve_main(args: ServeArgs) -> Result<()> {
     // from the path for exactly this reason, and a server whose binary has been
     // replaced has already exited on its own. Asking for it again means "show
     // it to me", not "bind this port twice".
+    // Asked to take the address: whatever is there is told to stop first.
+    if args.force_launch && probe(&args.host, port).is_some() {
+        stop_server(&args.host, port);
+        wait_for_port(&args.host, port);
+    }
     match probe(&args.host, port) {
         Some(stamp) if stamp == tinymist::tool::webapp::build_stamp() => {
             eprintln!("already serving {url}");

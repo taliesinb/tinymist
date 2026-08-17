@@ -38,6 +38,25 @@ pub use tinymist_annos::ANCHOR_PREFIX;
 
 pub use http::{make_http_server, HttpServer};
 
+/// How long the annotation endpoints wait before doing anything, in
+/// milliseconds.
+///
+/// Zero unless a server was started with a latency. A page holds an annotation
+/// on screen itself while the server has it and has not sent it back yet, and
+/// on a machine that answers in ten milliseconds that state cannot be looked
+/// at; this makes it last as long as it needs to be seen.
+static ANNOTATE_LATENCY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Sets the delay the annotation endpoints answer with.
+pub fn set_annotate_latency(ms: u64) {
+    ANNOTATE_LATENCY.store(ms, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The delay the annotation endpoints answer with.
+pub fn annotate_latency() -> u64 {
+    ANNOTATE_LATENCY.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub use cache::{
     drop_site_cache, site_cache, sweep_stale_sites, temp_site_dir, use_site_cache, CachedBody,
     SiteCache,
