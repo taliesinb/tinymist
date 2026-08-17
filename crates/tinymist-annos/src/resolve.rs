@@ -262,6 +262,9 @@ pub fn resolve(ctx: &Context, location: &HtmlLocation) -> Result<Resolution, Fai
                 },
             }
         }
+        // About the document rather than anywhere in it: no anchor to write,
+        // and nothing that can go stale.
+        Location::Document => Location::Document,
         Location::PosV { reference } => {
             if !ctx.is_block(&reference.node)? {
                 return Err(Failure::WrongKind(reference.node.clone()));
@@ -469,6 +472,9 @@ pub fn project(ctx: &Context, location: &TypstLocation) -> Result<HtmlLocation, 
         Location::Svg { reference } => Location::Svg {
             reference: node_ref(&reference.label, &[NodeKind::Svg])?,
         },
+        // Nothing to look up: it is about the document, and the document is
+        // what the page is showing.
+        Location::Document => Location::Document,
     })
 }
 

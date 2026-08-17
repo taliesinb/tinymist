@@ -899,6 +899,9 @@
     const loc = pin && pin.location;
     if (!loc) return null;
     const kind = loc.type;
+    // About the document, so there is nothing in the document to draw it on:
+    // it lives in the corner instead.
+    if (kind === "document") return { scope: "document", boxes: [] };
     switch (kind) {
       case "word": {
         const ref = loc.ref;
@@ -1543,6 +1546,58 @@
   // Where each chip goes: the lane if its text is on screen, the rows above and
   // below if it is not. Chips whose anchors share a line would stack on top of
   // each other in the lane, so they fan out leftward in document order.
+  // Annotations about the document itself: they have nowhere on the page to
+  // point at, so they gather in a bubble in the corner — under the row of chips
+  // for what is above the window, and inside the lane that runs down its right
+  // edge. It is there only when there are any.
+  const DOC_BUBBLE = "tinymist-doc-chips";
+  const drawDocumentChips = (host, pins) => {
+    let bubble = document.getElementById(DOC_BUBBLE);
+    if (!pins.length) {
+      if (bubble) bubble.remove();
+      return;
+    }
+    if (!bubble) {
+      bubble = document.createElement("div");
+      bubble.id = DOC_BUBBLE;
+      host.appendChild(bubble);
+    }
+    bubble.dataset.seen = "1";
+    bubble.style.right = window.innerWidth - laneLeft() + SLOT + "px";
+    for (const el of [...bubble.children]) el.dataset.seen = "";
+    for (const pin of pins) {
+      let chip = bubble.querySelector(`[data-key="${CSS.escape(pin.uuid)}"]`);
+      if (!chip) {
+        chip = document.createElement("div");
+        chip.className = "tm-edge tm-doc-chip";
+        chip.dataset.key = pin.uuid;
+        bubble.appendChild(chip);
+      }
+      chip.dataset.seen = "1";
+      chip.textContent = (pin.letter || "?").toUpperCase();
+      chip.title = (pin.author ? pin.author + ": " : "") + (pin.content || "");
+      const hollow = !!pin.state;
+      chip.style.background = hollow ? "var(--tm-bg)" : pinColor(pin);
+      chip.style.color = hollow ? pinColor(pin) : darkTint(pinColor(pin));
+      chip.style.border = hollow ? `1.5px solid ${pinColor(pin)}` : "";
+      chip.style.opacity = pinOpacity(pin);
+      chip.style.boxShadow =
+        pin.uuid === openUuid
+          ? `0 0 6px 2px ${ownColor(pin)}, 0 0 12px 3px ${ownColor(pin)}66`
+          : "";
+      chip.__pin = pin;
+      chip.onclick = (ev) => {
+        ev.stopPropagation();
+        if (openUuid === chip.__pin.uuid) closeBox();
+        else showAnnot(chip.__pin);
+        render();
+      };
+    }
+    for (const el of [...bubble.children]) {
+      if (!el.dataset.seen) el.remove();
+    }
+  };
+
   const placeChips = (marked) => {
     const lane = laneLeft();
     const above = [];
@@ -1630,8 +1685,13 @@
     const shown = showResolved ? pins : pins.filter((pin) => !pin.resolved);
     const list = local.length ? shown.concat(local) : shown;
     const marked = [];
+    const aboutDocument = [];
     takenBlocks.clear();
     for (const pin of list) {
+      if (pin.location && pin.location.type === "document") {
+        aboutDocument.push(pin);
+        continue;
+      }
       const geom = geometryOf(pin) || heldGeometry(pin);
       if (!geom || !geom.boxes.length) continue;
       // An annotation the server has not sent back yet is drawn where it was
@@ -1654,6 +1714,7 @@
       marked.push({ pin, y: (top + bot) / 2 });
     }
     drawEdgeChips(host, placeChips(marked));
+    drawDocumentChips(host, aboutDocument);
     for (const el of [...host.children]) {
       if (!el.dataset.seen && !el.classList.contains(HOVER_CLASS)) el.remove();
     }
@@ -2108,6 +2169,16 @@
     openUuid = pin.uuid;
     openSig = pinSig(pin);
     const hue = ownColor(pin);
+    // An annotation whose place is gone says so, and says what it was about:
+    // the words it named are the only way back to what it meant.
+    if (pin.orphaned) {
+      const note = document.createElement("div");
+      note.className = "tm-locked";
+      note.textContent =
+        `No longer placed: ${pin.orphaned}.` +
+        (pin.snapshot ? ` It was about “${pin.snapshot}”.` : "");
+      parts.content.append(note);
+    }
     parts.content.append(msgRow(hue, pin.author, pin.time, pin.content, true));
     for (const reply of pin.discussion || []) {
       parts.content.append(msgRow(hue, reply.author, reply.time, reply.content, false));
@@ -2278,12 +2349,26 @@
         keepHeld();
         return refresh();
       }
-      // A refusal is about this annotation and will not fix itself; no
-      // connection is about the page and will. Either way it stays on the page:
-      // an annotation that disappears and leaves a line of text behind is one
-      // somebody has to be told about twice.
-      keepDraft(pin.draft, res && res.error, online);
-      if (online) pin.error = (res && res.error) || "the server refused it";
+      // No connection is about the page and will fix itself; a refusal is
+      // about this annotation and will not. What was written is still worth
+      // keeping, so it is sent again as an annotation about the document: it
+      // has to be somewhere, and the place it was about is not available.
+      if (!online) {
+        keepDraft(pin.draft, res && res.error, false);
+        keepHeld();
+        render();
+        return;
+      }
+      if (!pin.retried) {
+        pin.retried = true;
+        pin.draft = { ...pin.draft, location: { type: "document" }, snapshot: pin.draft.snapshot };
+        pin.location = { type: "document" };
+        keepHeld();
+        render();
+        return send(held);
+      }
+      keepDraft(pin.draft, res && res.error, true);
+      pin.error = (res && res.error) || "the server refused it";
       keepHeld();
       render();
     });

@@ -315,6 +315,12 @@ pub enum Location<F: Flavor> {
         #[serde(rename = "ref")]
         reference: F::Node,
     },
+    /// The document itself, rather than anywhere in it.
+    ///
+    /// It names no anchor, so nothing about the document can make it stale:
+    /// this is where an annotation goes when the place it was about is gone.
+    #[serde(rename = "document")]
+    Document,
 }
 
 /// A location in a rendering, as a browser makes them.
@@ -346,6 +352,7 @@ impl<F: Flavor> Location<F> {
             Self::MathBlock { .. } => "math.block",
             Self::Link { .. } => "link",
             Self::Svg { .. } => "svg",
+            Self::Document => "document",
         }
     }
 
@@ -385,6 +392,7 @@ impl TypstLocation {
             | Self::MathBlock { reference }
             | Self::Link { reference }
             | Self::Svg { reference } => vec![reference.label.as_str()],
+            Self::Document => vec![],
         }
     }
 }

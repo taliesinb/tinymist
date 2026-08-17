@@ -47,10 +47,16 @@ pub struct HtmlPin {
     pub discussion: Vec<super::annotations::AnnotationReply>,
     /// The colour it was made in, as `#rrggbb`.
     pub color: String,
-    /// Where to draw it, or nothing when its anchor is no longer in the
-    /// document.
+    /// Where to draw it. An annotation whose anchor is no longer in the
+    /// document, or whose place cannot be found in this rendering, is about the
+    /// document instead — it has to be somewhere, and the thing it was about is
+    /// gone.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub location: Option<HtmlLocation>,
+    /// Why it is about the document rather than about a place in it, when that
+    /// is not what it was made as.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub orphaned: Option<String>,
     /// What was there when the annotation was made, for saying what a lost
     /// annotation was about.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -84,6 +90,16 @@ pub fn html_pins(art: &LspCompiledArtifact) -> Vec<HtmlPin> {
 }
 
 fn pin_for(rec: &AnnotationRecord, ctx: &tinymist_annos::resolve::Context) -> HtmlPin {
+    // An annotation that cannot be placed is not an annotation that is gone:
+    // somebody wrote it, and it is still about this document even if what it
+    // was about has been edited away.
+    let (location, orphaned) = match tinymist_annos::resolve::project(ctx, &rec.location) {
+        Ok(location) => (Some(location), None),
+        Err(failure) => (
+            Some(HtmlLocation::Document),
+            Some(super::annotations::describe(&failure)),
+        ),
+    };
     HtmlPin {
         kind: rec.kind.clone(),
         uuid: rec.uuid.clone(),
@@ -96,7 +112,8 @@ fn pin_for(rec: &AnnotationRecord, ctx: &tinymist_annos::resolve::Context) -> Ht
         mtime: rec.mtime.clone(),
         discussion: rec.discussion.clone(),
         color: rec.color.clone(),
-        location: tinymist_annos::resolve::project(ctx, &rec.location).ok(),
+        location,
+        orphaned,
         snapshot: rec.snapshot.clone(),
     }
 }

@@ -1086,7 +1086,7 @@ impl crate::tool::serve::AnnotationServer for DiskAnnotationServer {
 }
 
 /// A conversion failure, in words for whoever asked.
-fn describe(failure: &tinymist_annos::resolve::Failure) -> String {
+pub fn describe(failure: &tinymist_annos::resolve::Failure) -> String {
     use tinymist_annos::resolve::Failure;
     match failure {
         Failure::NoSuchNode(uid) => format!("the rendering has nothing called {uid}"),

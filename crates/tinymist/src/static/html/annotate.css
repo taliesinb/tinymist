@@ -443,6 +443,30 @@ html.tm-offline #tinymist-marks * {
 /* At the top, where a warning is read before the page is worked on rather than
    after, and tinted the colour of something being wrong. A line that is only
    saying what the page is waiting for keeps the page's own colours. */
+/* Annotations about the document itself have nowhere on the page to point at.
+   They gather in the corner instead: under the row of chips for what is above
+   the window, inside the lane that runs down its right edge, and there at all
+   only when there are any. */
+#tinymist-doc-chips {
+  position: fixed;
+  top: 38px;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 4px;
+  max-width: 180px;
+  padding: 5px 6px;
+  border-radius: 10px;
+  border: 1px solid color-mix(in oklab, var(--tm-fg) 14%, transparent);
+  background: color-mix(in oklab, var(--tm-bg) 78%, transparent);
+  backdrop-filter: blur(6px);
+  pointer-events: auto;
+}
+
+#tinymist-marks .tm-doc-chip {
+  position: static;
+}
+
 /* What a window says instead of a reply field, when there is nothing to be
    done with what it is showing. */
 .tm-locked {
