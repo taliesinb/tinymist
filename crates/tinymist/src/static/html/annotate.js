@@ -16,9 +16,18 @@
   const BOX_ID = "tinymist-annot-box";
   const STATUS_ID = "tinymist-status";
   const TOGGLE_ID = "tinymist-annotate-toggle";
-  // Which face this page wears rides in the URL's first segment: `/a/` is the
+  // Which face this page wears rides in the mode's prefix: `/a/` is the
   // annotator, `/v/` a document served to be read, `/p/` an editor's preview.
-  const ANNOTATE = /^\/a(\/|$)/.test(location.pathname);
+  //
+  // Read from where the server says it is mounted rather than from the start of
+  // the address: published under a path — behind a proxy that strips it — the
+  // page is at `/nlab/a/…`, and a page that looked for `/a/` at the front would
+  // decide it was not the annotator and quietly show nothing.
+  const MOUNT = (() => {
+    const said = document.querySelector('meta[name="tm-mount"]');
+    return (said && said.content) || "/a/";
+  })();
+  const ANNOTATE = /\/a\/$/.test(MOUNT);
 
   // ---------------------------------------------------------------- palette
   // An annotation is coloured by its letter, not by its state: A is always the
