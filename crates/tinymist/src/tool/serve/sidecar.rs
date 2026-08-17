@@ -4,7 +4,7 @@
 //! the entry in the sidecar, the capture in the store — and a bug in any of them
 //! shows up as something missing somewhere else. This draws all three together:
 //! one card per annotation, its captures as pictures, its discussion in order,
-//! and the block an agent would be handed for it, exactly as `get_block` returns
+//! and the block an agent would be handed for it, exactly as `get_annotated_block` returns
 //! it.
 //!
 //! Deliberately plain. It is a debugging view, served beside the annotator
@@ -129,7 +129,7 @@ fn card(rec: &AnnotationRecord, annot: &Arc<dyn AnnotationServer>) -> String {
     // makes, so a wrong answer shows up here rather than only in a transcript.
     let block = match annot.block(&rec.uuid, false) {
         Ok(block) => block_fields(&block),
-        Err(err) => format!("<div class=\"block\">get_block failed: {}</div>", escape(&err)),
+        Err(err) => format!("<div class=\"block\">get_annotated_block failed: {}</div>", escape(&err)),
     };
 
     format!(

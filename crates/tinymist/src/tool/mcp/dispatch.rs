@@ -30,7 +30,7 @@ fn hub_tools() -> Value {
             "description": "The document servers running now: a short name for each, what it \
                             is serving, and the documents in it. Everything else takes one of \
                             these names as `server`. Start here. An empty list means nothing is \
-                            being served: open_document a path to start a server, or ask the \
+                            being served: launch_server on a path, or ask the \
                             person to start their own.",
             "inputSchema": {
                 "type": "object",
@@ -40,8 +40,8 @@ fn hub_tools() -> Value {
             },
         },
         {
-            "name": "open_document",
-            "title": "Open a document or directory",
+            "name": "launch_server",
+            "title": "Launch a server on a document or directory",
             "description": "Serves a file or directory, and returns the server's name. \
                             `state` says which happened: \"started\" for a server this call \
                             started, \"reused\" for one that was already serving that path. \
@@ -58,10 +58,10 @@ fn hub_tools() -> Value {
             },
         },
         {
-            "name": "close_document",
-            "title": "Close a document server",
-            "description": "Stops a server this session started. A server somebody is reading \
-                            in a browser is better left alone.",
+            "name": "kill_server",
+            "title": "Stop a document server",
+            "description": "Asks a server this session started to stop. A server somebody is \
+                            reading in a browser is better left alone.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -111,7 +111,7 @@ fn server_for(args: &Value) -> Result<ServerNote, String> {
     if asked.is_empty() {
         return match running.as_slice() {
             [only] => Ok(only.clone()),
-            [] => Err("no document server is running; open_document starts one".into()),
+            [] => Err("no document server is running; launch_server starts one".into()),
             many => {
                 let names: Vec<_> = many.iter().map(|note| note.server.as_str()).collect();
                 Err(format!("say which server: {}", names.join(", ")))
@@ -194,22 +194,25 @@ pub fn handle(request: Value) -> Option<Value> {
                              annotation is a question or a request left in the margin of one.\n\n\
                              Start with list_servers. Each server serves one file or one \
                              directory; pass its name as `server` to every other tool. An empty \
-                             list means nothing is being served yet: open_document a path to \
-                             start a server, or ask the person to start their own — they may \
+                             list means nothing is being served yet: launch_server on a path, \
+                             or ask the person to start their own — they may \
                              want it in a window they can see.\n\n\
-                             The usual sequence is wait_for_annotations, claim, get_block, \
-                             replace_block, reply, resolve. Every step after claim is optional. \
-                             Fixing the cause outside the document is a proper resolution: when \
-                             a document is generated from a script or a data file, the edit \
-                             belongs in what generates it, and replace_block refuses a file \
-                             that says it is generated. An annotation about a picture, a \
-                             layout or a number usually has no text to rewrite either. Claim \
-                             it, fix whatever is really wrong, then reply and resolve.\n\n\
+                             The usual sequence is wait_for_annotations, claim_annotation, \
+                             get_annotated_block, replace_annotated_block, \
+                             add_annotation_reply, resolve_annotation. Every step after \
+                             claim_annotation is optional. Fixing the cause outside the \
+                             document is a proper resolution: when a document is generated \
+                             from a script or a data file, the edit belongs in what generates \
+                             it, and replace_annotated_block refuses a file that says it is \
+                             generated. An annotation about a picture, a layout or a number \
+                             usually has no text to rewrite either. Claim it, fix whatever is \
+                             really wrong, then reply and resolve it.\n\n\
                              An annotation is named by its id or by the letter the reader sees \
                              on the page. Some are about the document rather than a place in \
-                             it, and have no block to rewrite: annotate leaves one of those, \
-                             audit reports the ones that lost their place, delete removes an \
-                             annotation outright (resolve is nearly always what is meant).\n\n\
+                             it, and have no block to rewrite: create_annotation leaves one of \
+                             those, check_annotations reports the ones that lost their place, \
+                             delete_annotation removes an annotation outright \
+                             (resolve_annotation is nearly always what is meant).\n\n\
                              The document is rebuilt on its own whenever anything it is made \
                              of changes — the file, what it imports, the data it reads, the \
                              pictures it embeds. Nothing has to ask for that; document_status \
@@ -294,7 +297,7 @@ fn call(name: &str, args: &Value) -> Value {
             let servers: Vec<Value> = registry::running_servers().iter().map(server_json).collect();
             result(json!({ "servers": servers }), false)
         }
-        "open_document" => {
+        "launch_server" => {
             let Some(path) = args.get("path").and_then(Value::as_str) else {
                 return result(json!({ "error": "which path? pass path" }), true);
             };
@@ -323,7 +326,7 @@ fn call(name: &str, args: &Value) -> Value {
                 Err(err) => result(json!({ "error": err }), true),
             }
         }
-        "close_document" => match server_for(args) {
+        "kill_server" => match server_for(args) {
             Ok(note) => {
                 // Asked to stop, not killed: it has a site to clear up and a
                 // note to withdraw.

@@ -133,7 +133,7 @@ fn tools() -> Vec<Tool> {
             schema: || schema(json!({ "uuid": string(ID_DESC) }), &["uuid"]),
         },
         Tool {
-            name: "claim",
+            name: "claim_annotation",
             title: "Claim an annotation",
             description: "Marks an annotation as being worked on, so that the reader and other \
                           agents can see it is taken. Do this before rewriting anything. \
@@ -141,14 +141,14 @@ fn tools() -> Vec<Tool> {
             schema: || schema(json!({ "uuid": string(ID_DESC) }), &["uuid"]),
         },
         Tool {
-            name: "release",
+            name: "release_annotation",
             title: "Release an annotation",
             description: "Puts a claimed annotation back to open, for work that was abandoned. \
                           Better than leaving it claimed. Example: {\"uuid\": \"g\"}",
             schema: || schema(json!({ "uuid": string(ID_DESC) }), &["uuid"]),
         },
         Tool {
-            name: "get_block",
+            name: "get_annotated_block",
             title: "Get the block an annotation is in",
             description: "Returns the piece of Typst source an annotation points into: the \
                           smallest thing that can be rewritten whole, such as a paragraph, a \
@@ -170,7 +170,7 @@ fn tools() -> Vec<Tool> {
             },
         },
         Tool {
-            name: "replace_block",
+            name: "replace_annotated_block",
             title: "Replace a block",
             description: "Rewrites the block an annotation is in, waits for the document to \
                           compile, and reports whether it did. Refused if the block has changed \
@@ -185,7 +185,7 @@ fn tools() -> Vec<Tool> {
                 schema(
                     json!({
                         "uuid": string(ID_DESC),
-                        "blockId": string("The id from get_block, which says which text you are replacing."),
+                        "blockId": string("The id from get_annotated_block, which says which text you are replacing."),
                         "text": string("The new Typst source for the whole block."),
                         "anchors": optional_string(
                             "What to do with anchors the new text drops: keep (default, refuses), \
@@ -200,7 +200,7 @@ fn tools() -> Vec<Tool> {
             },
         },
         Tool {
-            name: "get_capture",
+            name: "get_annotation_capture",
             title: "See what an annotation points at",
             description: "Returns an image of what a graphical annotation is about — a plot, a \
                           diagram, a framed drawing — together with anything the reader drew on \
@@ -224,7 +224,7 @@ fn tools() -> Vec<Tool> {
             },
         },
         Tool {
-            name: "annotate",
+            name: "create_annotation",
             title: "Annotate the document",
             description: "Adds an annotation about the document as a whole — something noticed \
                           while reading that is not about one place. It appears in the corner of \
@@ -285,7 +285,7 @@ fn tools() -> Vec<Tool> {
             },
         },
         Tool {
-            name: "audit",
+            name: "check_annotations",
             title: "Audit the annotations",
             description: "Reports what the document and its sidecar say about each other: how \
                           many annotations and anchors there are, anchors nothing points at any \
@@ -300,15 +300,15 @@ fn tools() -> Vec<Tool> {
             },
         },
         Tool {
-            name: "delete",
+            name: "delete_annotation",
             title: "Delete an annotation",
-            description: "Deletes an annotation. Prefer resolve, which keeps what was said and \
+            description: "Deletes an annotation. Prefer resolve_annotation, which keeps what was said and \
                           what was done about it; use this for one that should not have been \
                           made. Example: {\"uuid\": \"g\"}",
             schema: || schema(json!({ "uuid": string(ID_DESC) }), &["uuid"]),
         },
         Tool {
-            name: "reply",
+            name: "add_annotation_reply",
             title: "Reply to an annotation",
             description: "Adds a message to an annotation's discussion, where the reader sees \
                           it. Example: {\"uuid\": \"g\", \"text\": \"Rewritten; the totals now \
@@ -325,7 +325,7 @@ fn tools() -> Vec<Tool> {
             },
         },
         Tool {
-            name: "resolve",
+            name: "resolve_annotation",
             title: "Resolve an annotation",
             description: "Says what was done and marks the annotation resolved, which ends the \
                           thread and releases the claim. Example: {\"uuid\": \"g\", \"text\": \
@@ -613,22 +613,22 @@ async fn call_tool(site: &Arc<dyn DocumentSite>, name: &str, args: &Value) -> Re
                 .ok_or_else(|| format!("no annotation {uuid}"))?;
             Ok(record_json(&record, excerpt_of(&annot, &uuid)))
         }
-        "claim" | "release" => {
+        "claim_annotation" | "release_annotation" => {
             let (_, doc) = document_of(site, args).await?;
             let annot = annot_of(&doc).await?;
             let uuid = identify(&annot, &uuid()?)?;
-            let claimed = name == "claim";
+            let claimed = name == "claim_annotation";
             annot.set_flags(&uuid, Some(claimed), None)?;
             Ok(json!({ "uuid": uuid, "claimed": claimed }))
         }
-        "delete" => {
+        "delete_annotation" => {
             let (_, doc) = document_of(site, args).await?;
             let annot = annot_of(&doc).await?;
             let uuid = identify(&annot, &uuid()?)?;
             annot.remove(&uuid)?;
             Ok(json!({ "ok": true, "uuid": uuid }))
         }
-        "annotate" => {
+        "create_annotation" => {
             let said = text("text").ok_or("what should it say? pass text")?;
             let (_, doc) = document_of(site, args).await?;
             let annot = annot_of(&doc).await?;
@@ -649,7 +649,7 @@ async fn call_tool(site: &Arc<dyn DocumentSite>, name: &str, args: &Value) -> Re
                 .unwrap_or_default();
             Ok(json!({ "ok": true, "uuid": uuid, "letter": letter }))
         }
-        "audit" => {
+        "check_annotations" => {
             let (_, doc) = document_of(site, args).await?;
             let annot = annot_of(&doc).await?;
             annot.audit()
@@ -666,7 +666,7 @@ async fn call_tool(site: &Arc<dyn DocumentSite>, name: &str, args: &Value) -> Re
             let annot = annot_of(&doc).await?;
             annot.render_snippet(&source, &format)
         }
-        "get_block" => {
+        "get_annotated_block" => {
             let context = args
                 .get("context")
                 .and_then(Value::as_bool)
@@ -703,7 +703,7 @@ async fn call_tool(site: &Arc<dyn DocumentSite>, name: &str, args: &Value) -> Re
                 })),
             }
         }
-        "replace_block" => {
+        "replace_annotated_block" => {
             let uuid = uuid()?;
             let block_id = text("blockId").ok_or("which block? pass blockId")?;
             let new_text = text("text").ok_or("what should it say? pass text")?;
@@ -725,7 +725,7 @@ async fn call_tool(site: &Arc<dyn DocumentSite>, name: &str, args: &Value) -> Re
                 "block": block,
             }))
         }
-        "get_capture" => {
+        "get_annotation_capture" => {
             use crate::tool::serve::capture;
             let (_, doc) = document_of(site, args).await?;
             let annot = annot_of(&doc).await?;
@@ -794,7 +794,7 @@ async fn call_tool(site: &Arc<dyn DocumentSite>, name: &str, args: &Value) -> Re
                 "height": chosen.height,
             }))
         }
-        "reply" => {
+        "add_annotation_reply" => {
             let said = text("text").ok_or("what should it say? pass text")?;
             let (_, doc) = document_of(site, args).await?;
             let annot = annot_of(&doc).await?;
@@ -802,7 +802,7 @@ async fn call_tool(site: &Arc<dyn DocumentSite>, name: &str, args: &Value) -> Re
             annot.reply(&uuid, &said, text("author").as_deref())?;
             Ok(json!({ "uuid": uuid, "replied": true }))
         }
-        "resolve" => {
+        "resolve_annotation" => {
             let (_, doc) = document_of(site, args).await?;
             let annot = annot_of(&doc).await?;
             let uuid = identify(&annot, &uuid()?)?;

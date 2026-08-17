@@ -28,7 +28,7 @@
 //                       // fmt is how it is stored ("svg" today); width and height
 //                       // are its size on the page in CSS pixels; markup is what
 //                       // the reader drew on top, as inline SVG. Ask the MCP tool
-//                       // `get_capture` for the picture itself.
+//                       // `get_annotation_capture` for the picture itself.
 //     discussion: (),   // ordered replies, each:
 //                       // (author: str, time: str, content: str)
 //   )) <anno.7C42>
