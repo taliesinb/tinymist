@@ -104,14 +104,30 @@ impl<'a> Mapper<'a> {
         self.nodes.get(uid).and_then(|node| node.range)
     }
 
-    /// Gives a node the range its contents cover, for an element whose own span
-    /// says nothing. A container built by the exporter — the body of a term, a
-    /// list item — carries no position of its own, but what is inside it does.
+    /// Gives a node the range its contents cover.
+    ///
+    /// A container built by the exporter — the body of a term, a list item —
+    /// carries no position of its own, but what is inside it does. A block that
+    /// does carry one carries the span of the first thing in it, which is not
+    /// where the block ends: a paragraph of several runs would otherwise end
+    /// where its first run does, and a label written after the paragraph would
+    /// not be found to belong to it. Anything smaller than a block keeps the
+    /// range it has, which is the text it is made of.
     pub fn cover(&mut self, uid: &str, range: SrcRange) {
-        if let Some(node) = self.nodes.get_mut(uid) {
-            if node.range.is_none() {
-                node.range = Some(range);
-            }
+        let Some(node) = self.nodes.get_mut(uid) else {
+            return;
+        };
+        let Some(known) = node.range else {
+            node.range = Some(range);
+            return;
+        };
+        let holds = node.kind.is_block() || node.kind == NodeKind::Group;
+        if holds && known.file == range.file {
+            node.range = Some(SrcRange {
+                file: known.file,
+                start: known.start.min(range.start),
+                end: known.end.max(range.end),
+            });
         }
     }
 

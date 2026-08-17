@@ -79,12 +79,19 @@ impl Store {
     /// Writing the same rendering twice is not an error and does nothing: a
     /// document that compiles to what it compiled to before has the same render
     /// id, which is why the id is derived from the rendering.
+    ///
+    /// The id is derived from the HTML alone, though, and the map is not in the
+    /// HTML: a renderer that learns to record something new produces the same
+    /// id with a different map, and what is stored has to be replaced or the
+    /// old map is what everything is answered from.
     pub fn put(&self, render: &StoredRender) -> Result<(), String> {
         let Some(path) = self.path_of(&render.map.render) else {
             return Err("a rendering with no id cannot be stored".into());
         };
-        if path.exists() {
-            return Ok(());
+        if let Some(known) = self.get(&render.map.render) {
+            if known.map == render.map && known.text == render.text {
+                return Ok(());
+            }
         }
         std::fs::create_dir_all(&self.dir)
             .map_err(|err| format!("cannot make {}: {err}", self.dir.display()))?;

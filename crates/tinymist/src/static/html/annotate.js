@@ -886,16 +886,18 @@
         const box = caretBox(loc.ref.ref, loc.ref.pos);
         return box ? { scope: "point", boxes: [box], caret: box } : null;
       }
-      case "pos.v":
-      case "span.v": {
-        const el = elementOf(kind === "pos.v" ? loc.ref : loc.begin);
+      case "pos.v": {
+        const el = elementOf(loc.ref);
         if (!el) return null;
-        // The ink rather than the border box, as a region mark uses: a block is
-        // as wide as the column whatever is in it.
-        const box = blockBox(el);
-        const side = kind === "pos.v" ? loc.ref.side : loc.begin.side;
-        const edge = edgeCaretBox(box, side === "top" ? "top" : "bottom", el);
+        const edge = edgeOf(el, loc.ref.side);
         return { scope: "edge", boxes: [edge], caret: edge, el };
+      }
+      case "span.v": {
+        const from = elementOf(loc.begin);
+        const to = elementOf(loc.end);
+        if (!from || !to) return null;
+        const box = sidelineBox(edgeOf(from, loc.begin.side), edgeOf(to, loc.end.side));
+        return { scope: "sideline", boxes: [box], caret: box, el: from };
       }
       case "math":
       case "link":
@@ -1175,6 +1177,24 @@
       }
       return;
     }
+    if (scope === "sideline") {
+      const el = mark(host, key + ":sideline", "tm-mark tm-over");
+      el.style.opacity = opacity;
+      const box = boxes[0];
+      drawSideline(el, plain, dim);
+      if (state === "pending") el.classList.add("tm-hurry");
+      place(el, box.left, box.top, box.width, box.height);
+      const glyph = mark(host, key + ":letter", "tm-glyph tm-over");
+      glyph.style.opacity = opacity;
+      drawLetter(glyph, pin);
+      place(glyph, box.left - 16, box.top - 2);
+      if (!dim) {
+        const hit = mark(host, key + ":hit", "tm-hit");
+        place(hit, box.left - 6, box.top, 14, box.height);
+        openFor(hit, pin);
+      }
+      return;
+    }
     if (scope === "edge") {
       const el = mark(host, key + ":edge-caret", "tm-mark tm-over");
       el.style.opacity = opacity;
@@ -1352,6 +1372,38 @@
   // that it is read as lying between two blocks rather than underlining one.
   const EDGE_W = 34;
   const EDGE_GAP = 3;
+
+  // The caret a location's reference names.
+  const edgeOf = (el, side) =>
+    edgeCaretBox(blockBox(el), side === "top" ? "top" : "bottom", el);
+
+  // The stretch between two places between blocks, drawn as a line down the
+  // left of everything it covers: an underline turned on its side, on the outer
+  // edge of the leftmost of the two carets it runs between.
+  const SIDE_W = 2;
+  const sidelineBox = (from, to) => {
+    const left = Math.min(from.left, to.left);
+    const top = Math.min(from.top, to.top);
+    const bottom = Math.max(from.bottom, to.bottom);
+    return { left, right: left + SIDE_W, top, bottom, width: SIDE_W, height: bottom - top };
+  };
+  const drawSideline = (el, color, crawling) => {
+    el.innerHTML = "";
+    el.style.borderRadius = "1px";
+    if (crawling) {
+      crawlLine(el, color, true);
+    } else {
+      el.style.background = color;
+      el.style.boxShadow = `0 0 0 1.5px ${darkTint(color)}`;
+    }
+  };
+  const previewSideline = (box) => {
+    clearHover();
+    const host = marksHost();
+    const el = hoverMark(host, "tm-mark");
+    drawSideline(el, nextColor(), true);
+    place(el, box.left, box.top, box.width, box.height);
+  };
 
   // The same caret, lying down: a line along a block's edge for a position
   // between blocks.
@@ -2322,6 +2374,14 @@
   const onMouseDown = (ev) => {
     if (!annotating || ev.button !== 0 || onOverlay(ev)) return;
     if (openUuid !== null || composeActive) return; // this click only dismisses
+    // Held down, the modifier drags from one place between blocks to another,
+    // which is the stretch of document between them.
+    if (ev.ctrlKey) {
+      const spot = positionAt(ev.clientX, ev.clientY);
+      if (!spot || !spot.edge) return;
+      vdrag = { from: { x: ev.clientX, y: ev.clientY }, start: spot.edge, moved: false };
+      return;
+    }
     const caret = caretAt(ev.clientX, ev.clientY);
     if (!caret) return;
     drag = { from: { x: ev.clientX, y: ev.clientY }, start: caret, moved: false };
@@ -2329,6 +2389,7 @@
   // A mouse reports its position far more often than the page is drawn, and
   // every report would otherwise measure the page again. The last one before
   // the next frame is the only one that matters.
+  let vdrag = null;
   let hovering = null;
   let hoverFrame = 0;
   const hoverSoon = (ev) => {
@@ -2346,6 +2407,17 @@
   };
   const onMouseMove = (ev) => {
     if (!annotating) return;
+    if (vdrag) {
+      if (!vdrag.moved && Math.hypot(ev.clientX - vdrag.from.x, ev.clientY - vdrag.from.y) < 4) {
+        return;
+      }
+      vdrag.moved = true;
+      const spot = positionAt(ev.clientX, ev.clientY);
+      if (!spot || !spot.edge) return;
+      vdrag.end = spot.edge;
+      previewSideline(sidelineBox(vdrag.start.box, vdrag.end.box));
+      return;
+    }
     if (!drag) {
       if (openUuid !== null || composeActive || onOverlay(ev)) {
         hovering = null;
@@ -2379,6 +2451,26 @@
     );
   };
   const onMouseUp = (ev) => {
+    if (vdrag) {
+      const dragged = vdrag;
+      vdrag = null;
+      clearHover();
+      if (!dragged.moved || !dragged.end) return;
+      const { start, end } = dragged;
+      // Two names for the same place are one place, and a span needs two.
+      if (start.block.uid === end.block.uid && start.side === end.side) return;
+      ev.preventDefault();
+      ev.stopImmediatePropagation();
+      swallowClick = true;
+      const [above, below] =
+        start.box.top <= end.box.top ? [start, end] : [end, start];
+      compose("blocks", {
+        type: "span.v",
+        begin: { type: "node_cursor", ref: above.block.uid, side: above.side },
+        end: { type: "node_cursor", ref: below.block.uid, side: below.side },
+      });
+      return;
+    }
     if (!annotating || !drag) return;
     const d = drag;
     drag = null;
