@@ -22,6 +22,13 @@ use crate::tool::serve::annotations::{AnchorPolicy, AnnotationServer};
 
 use crate::tool::serve::{DocServices, DocumentSite};
 
+/// How every tool describes the annotation it works on. An annotation has an
+/// id, which is what tools pass around, and a letter, which is what a reader
+/// sees on the page and therefore what a person quotes at an agent.
+const ID_DESC: &str = "The annotation, by id or by letter: \"82989169e6fbef9b\" or \"g\". \
+                       The letter is what the reader sees on the page and what a person will \
+                       quote; the id is what these tools return.";
+
 /// What this server calls itself to an agent.
 const SERVER_NAME: &str = "talimist";
 
@@ -55,26 +62,37 @@ fn schema(properties: Value, required: &[&str]) -> Value {
 }
 
 /// Every tool an agent can call, in the order it will want them.
+///
+/// Descriptions are read by a model, so they say what the tool does, what it
+/// returns and when to use it, in plain sentences. Each carries an example
+/// call, and a second one where a tool is called in two substantially
+/// different ways. The examples assume the usual case — one file, served with
+/// `talimist serve --anno FILE.typ --mcp` — so none of them passes `document`.
 fn tools() -> Vec<Tool> {
     vec![
         Tool {
             name: "list_documents",
             title: "List documents",
-            description: "The documents this server holds: name, title, path, and how many \
-                          annotations each has, by status. A server of one document lists one.",
+            description: "Lists the documents this server holds: name, title, path, and the \
+                          number of annotations by status. A server of one document lists one. \
+                          Example: {}",
             schema: || schema(json!({}), &[]),
         },
         Tool {
             name: "list_annotations",
             title: "List annotations",
-            description: "The annotations on a document, with a one-line excerpt of what each \
-                          points at — enough to decide which to work on without reading the \
-                          document. Filter by status to find work: \"created\" is unclaimed.",
+            description: "Lists a document's annotations with a one-line excerpt of what each \
+                          points at, which is enough to choose one without reading the document. \
+                          Each entry has an id, a letter (what the reader sees on the page), a \
+                          status, and a location saying what it is about: a word, a paragraph, a \
+                          drawing, a position between two things, or the document itself. Use it \
+                          to find work. Examples: {\"status\": \"open\"} for what nobody has \
+                          taken; {} for everything.",
             schema: || {
                 schema(
                     json!({
                         "document": optional_string("Which document, when the server holds several. Its name in the URL."),
-                        "status": optional_string("Only these: created | ongoing | resolved."),
+                        "status": optional_string("Only these: open (nobody has it), claimed (somebody is on it), resolved (done)."),
                         "author": optional_string("Only annotations by this author."),
                     }),
                     &[],
@@ -84,11 +102,14 @@ fn tools() -> Vec<Tool> {
         Tool {
             name: "wait_for_annotations",
             title: "Wait for annotations",
-            description: "Waits for something to happen and reports it: annotations added, \
-                          replied to, resolved or deleted, files changed, documents compiled. \
-                          Pass the cursor from the last call to hear everything since — \
-                          including what arrived while you were thinking. Returns as soon as \
-                          there is anything, or empty when the wait runs out.",
+            description: "Blocks until something happens, then reports it: an annotation added, \
+                          replied to, claimed, resolved, reopened or deleted; a file changed; a \
+                          document compiled. Returns as soon as there is anything, or an empty \
+                          list when the wait runs out. Pass the cursor from the previous call to \
+                          get everything since, including what happened while you were working. \
+                          Examples: {} on the first call, which starts from now; {\"cursor\": \
+                          41, \"timeout\": 120} on every call after that, using the cursor the \
+                          previous call returned.",
             schema: || {
                 schema(
                     json!({
@@ -102,38 +123,46 @@ fn tools() -> Vec<Tool> {
         Tool {
             name: "get_annotation",
             title: "Get an annotation",
-            description: "One annotation in full: what was said, by whom, its status, its \
-                          discussion, and what it is anchored to.",
-            schema: || schema(json!({ "uuid": string("The annotation's id, e.g. 7C42.") }), &["uuid"]),
+            description: "Returns one annotation in full: what it says, who wrote it, its \
+                          status, its discussion, and its location. A location names anchors, \
+                          which are labels written into the document; several annotations can \
+                          share one anchor, because a Typst element carries at most one label. A \
+                          location of type \"document\" means the annotation is about the whole \
+                          document, either because it was written that way or because the place \
+                          it pointed at has been edited away. Example: {\"uuid\": \"g\"}",
+            schema: || schema(json!({ "uuid": string(ID_DESC) }), &["uuid"]),
         },
         Tool {
             name: "claim",
             title: "Claim an annotation",
-            description: "Marks an annotation as being worked on, so that a human reading the \
-                          document — and any other agent — can see that somebody has it. Do \
-                          this before rewriting anything.",
-            schema: || schema(json!({ "uuid": string("The annotation's id.") }), &["uuid"]),
+            description: "Marks an annotation as being worked on, so that the reader and other \
+                          agents can see it is taken. Do this before rewriting anything. \
+                          Example: {\"uuid\": \"g\"}",
+            schema: || schema(json!({ "uuid": string(ID_DESC) }), &["uuid"]),
         },
         Tool {
             name: "release",
             title: "Release an annotation",
-            description: "Puts a claimed annotation back to \"created\", for when the work is \
-                          abandoned. Better than leaving it claimed forever.",
-            schema: || schema(json!({ "uuid": string("The annotation's id.") }), &["uuid"]),
+            description: "Puts a claimed annotation back to open, for work that was abandoned. \
+                          Better than leaving it claimed. Example: {\"uuid\": \"g\"}",
+            schema: || schema(json!({ "uuid": string(ID_DESC) }), &["uuid"]),
         },
         Tool {
             name: "get_block",
             title: "Get the block an annotation is in",
-            description: "The piece of Typst source the annotation points into: the smallest \
-                          thing that can be rewritten whole — a paragraph, a list item, a \
-                          heading, a figure. Comes with its id (for rewriting it), the \
-                          headings above it, and every anchor inside it with its offset, which \
-                          a rewrite must carry across. Works even when the document does not \
-                          compile.",
+            description: "Returns the piece of Typst source an annotation points into: the \
+                          smallest thing that can be rewritten whole, such as a paragraph, a \
+                          list item, a heading or a figure. The reply has the block's id (needed \
+                          to rewrite it), the headings above it, and every anchor inside it with \
+                          its offset, which a rewrite must preserve. Works even when the \
+                          document does not compile. An annotation about the document, or one \
+                          whose anchor is gone, has no block; the reply says so and gives the \
+                          text it was written against. Examples: {\"uuid\": \"g\"}; {\"uuid\": \
+                          \"g\", \"context\": true} to see the blocks either side as well.",
             schema: || {
                 schema(
                     json!({
-                        "uuid": string("The annotation's id."),
+                        "uuid": string(ID_DESC),
                         "context": {"type": "boolean", "description": "Also return the blocks either side."},
                     }),
                     &["uuid"],
@@ -143,20 +172,26 @@ fn tools() -> Vec<Tool> {
         Tool {
             name: "replace_block",
             title: "Replace a block",
-            description: "Rewrites the block an annotation is in, then waits for the document \
-                          to compile and reports whether it did. Refused if the block has \
-                          changed since you read it (read it again), if the new text drops an \
-                          anchor (keep them, or say so), or if it invents one. The reply says \
-                          what the block is now.",
+            description: "Rewrites the block an annotation is in, waits for the document to \
+                          compile, and reports whether it did. Refused if the block has changed \
+                          since you read it (read it again), if the new text drops an anchor \
+                          without saying so, or if it invents one. The reply includes the block \
+                          as it now stands, with a fresh id. Examples: {\"uuid\": \"g\", \
+                          \"blockId\": \"3f9a2c…\", \"text\": \"The rewritten paragraph<anno.A100>\"} \
+                          keeps the anchor where it was; add {\"anchors\": \"reattach\"} when the \
+                          rewrite has no room for it and the annotation should stay on the \
+                          block.",
             schema: || {
                 schema(
                     json!({
-                        "uuid": string("The annotation whose block this is."),
+                        "uuid": string(ID_DESC),
                         "blockId": string("The id from get_block, which says which text you are replacing."),
                         "text": string("The new Typst source for the whole block."),
                         "anchors": optional_string(
                             "What to do with anchors the new text drops: keep (default, refuses), \
-                             reattach (puts them at the start), drop (deletes those annotations).",
+                             reattach (puts them back at the start of the block), drop (accepts \
+                             it; the annotations that pointed at them become annotations about \
+                             the document, and are not deleted).",
                         ),
                     }),
                     &["uuid", "blockId", "text"],
@@ -166,16 +201,17 @@ fn tools() -> Vec<Tool> {
         Tool {
             name: "get_capture",
             title: "See what an annotation points at",
-            description: "Returns a picture of the thing a graphical annotation is about — a \
-                          plot, a diagram, a framed drawing — as an image you can look at, \
-                          together with anything the reader drew on top of it. The document is \
-                          source, so this is the only way to see what they saw. Defaults to the \
-                          most recent capture; earlier ones are the same drawing before it \
-                          changed.",
+            description: "Returns an image of what a graphical annotation is about — a plot, a \
+                          diagram, a framed drawing — together with anything the reader drew on \
+                          top of it. The document is source, so this is the only way to see what \
+                          the reader saw. Defaults to the most recent capture; earlier ones show \
+                          the same drawing before it changed. Examples: {\"uuid\": \"q\"}; \
+                          {\"uuid\": \"q\", \"markup\": false} for the drawing without what the \
+                          reader drew on it.",
             schema: || {
                 schema(
                     json!({
-                        "uuid": string("The annotation's id, e.g. G001 — the same id as everywhere else. Its captures are listed on the annotation."),
+                        "uuid": string("The annotation, by id or letter. Its captures are listed on the annotation."),
                         "index": {"type": "integer", "description": "Which capture: 0 is the most recent, 1 the one before it. Default 0."},
                         "hash": optional_string("A capture's hash, when you want that exact one."),
                         "markup": {"type": "boolean", "description": "Include what the reader drew on top. Default true; pass false to see the drawing bare."},
@@ -187,14 +223,59 @@ fn tools() -> Vec<Tool> {
             },
         },
         Tool {
-            name: "reply",
-            title: "Reply to an annotation",
-            description: "Adds a message to an annotation's discussion, which is where the \
-                          author reads it.",
+            name: "annotate",
+            title: "Annotate the document",
+            description: "Adds an annotation about the document as a whole — something noticed \
+                          while reading that is not about one place. It appears in the corner of \
+                          the reader's page. Annotations about a particular word or block are \
+                          made by the reader, who points at one; this tool cannot point. \
+                          Example: {\"text\": \"Section 3 and section 5 give different totals.\", \
+                          \"kind\": \"question\"}",
             schema: || {
                 schema(
                     json!({
-                        "uuid": string("The annotation's id."),
+                        "text": string("What to say."),
+                        "kind": optional_string("What sort of remark: comment (default), question, request."),
+                        "author": optional_string("Who is saying it. Say who you are; the default is whoever is running the server."),
+                        "document": optional_string("Which document, when the server holds several."),
+                    }),
+                    &["text"],
+                )
+            },
+        },
+        Tool {
+            name: "audit",
+            title: "Audit the annotations",
+            description: "Reports what the document and its sidecar say about each other: how \
+                          many annotations and anchors there are, anchors nothing points at any \
+                          more, and annotations whose anchor is gone. The last of these are the \
+                          ones the reader cannot see in place; they are about the document until \
+                          an anchor comes back. Example: {}",
+            schema: || {
+                schema(
+                    json!({ "document": optional_string("Which document, when the server holds several.") }),
+                    &[],
+                )
+            },
+        },
+        Tool {
+            name: "delete",
+            title: "Delete an annotation",
+            description: "Deletes an annotation. Prefer resolve, which keeps what was said and \
+                          what was done about it; use this for one that should not have been \
+                          made. Example: {\"uuid\": \"g\"}",
+            schema: || schema(json!({ "uuid": string(ID_DESC) }), &["uuid"]),
+        },
+        Tool {
+            name: "reply",
+            title: "Reply to an annotation",
+            description: "Adds a message to an annotation's discussion, where the reader sees \
+                          it. Example: {\"uuid\": \"g\", \"text\": \"Rewritten; the totals now \
+                          agree.\", \"author\": \"claude\"}",
+            schema: || {
+                schema(
+                    json!({
+                        "uuid": string(ID_DESC),
                         "text": string("What to say."),
                         "author": optional_string("Who is saying it. Say who you are; the default is whoever is running the server."),
                     }),
@@ -205,13 +286,14 @@ fn tools() -> Vec<Tool> {
         Tool {
             name: "resolve",
             title: "Resolve an annotation",
-            description: "Says what was done and marks the annotation resolved, which is how a \
-                          thread ends.",
+            description: "Says what was done and marks the annotation resolved, which ends the \
+                          thread and releases the claim. Example: {\"uuid\": \"g\", \"text\": \
+                          \"Fixed in the summary table.\", \"author\": \"claude\"}",
             schema: || {
                 schema(
                     json!({
-                        "uuid": string("The annotation's id."),
-                        "text": optional_string("What was done. Said in the discussion first."),
+                        "uuid": string(ID_DESC),
+                        "text": optional_string("What was done. Added to the discussion first."),
                         "author": optional_string("Who did it. Say who you are; the default is whoever is running the server."),
                     }),
                     &["uuid"],
@@ -317,10 +399,50 @@ fn record_json(rec: &crate::tool::serve::annotations::AnnotationRecord, excerpt:
     value
 }
 
+/// The annotation a caller named, by id or by letter.
+///
+/// A person reads letters off the page and says "look at g"; a tool passes ids
+/// around. Both arrive as the same argument, and an id is tried first since it
+/// cannot be mistaken for anything else.
+fn identify(annot: &Arc<dyn AnnotationServer>, given: &str) -> Result<String, String> {
+    let records = annot.records()?;
+    if records.iter().any(|rec| rec.uuid == given) {
+        return Ok(given.to_owned());
+    }
+    let wanted = given.trim().to_ascii_lowercase();
+    let found: Vec<&crate::tool::serve::AnnotationRecord> = records
+        .iter()
+        .filter(|rec| rec.letter.to_ascii_lowercase() == wanted)
+        .collect();
+    match found.as_slice() {
+        [one] => Ok(one.uuid.clone()),
+        [] => Err(format!("no annotation {given}")),
+        several => Err(format!(
+            "{given} names {} annotations; pass one of {}",
+            several.len(),
+            several
+                .iter()
+                .map(|rec| rec.uuid.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
 /// A line of what an annotation points at, for deciding whether to open it.
 fn excerpt_of(annot: &Arc<dyn AnnotationServer>, uuid: &str) -> Option<String> {
-    let block = annot.block(uuid, false).ok()?;
-    let text = block.text.split_whitespace().collect::<Vec<_>>().join(" ");
+    // What it points at — or, for one about the document and one whose place
+    // has been edited away, what it was about when it was written.
+    let text = match annot.block(uuid, false) {
+        Ok(block) => block.text,
+        Err(_) => annot
+            .records()
+            .ok()?
+            .into_iter()
+            .find(|rec| rec.uuid == uuid)?
+            .snapshot?,
+    };
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
     Some(if text.chars().count() > 160 {
         format!("{}…", text.chars().take(160).collect::<String>())
     } else {
@@ -412,9 +534,9 @@ async fn call_tool(site: &Arc<dyn DocumentSite>, name: &str, args: &Value) -> Re
             Ok(json!({ "events": events, "cursor": next }))
         }
         "get_annotation" => {
-            let uuid = uuid()?;
             let (_, doc) = document_of(site, args).await?;
             let annot = annot_of(&doc).await?;
+            let uuid = identify(&annot, &uuid()?)?;
             let record = annot
                 .records()?
                 .into_iter()
@@ -423,23 +545,82 @@ async fn call_tool(site: &Arc<dyn DocumentSite>, name: &str, args: &Value) -> Re
             Ok(record_json(&record, excerpt_of(&annot, &uuid)))
         }
         "claim" | "release" => {
-            let uuid = uuid()?;
             let (_, doc) = document_of(site, args).await?;
             let annot = annot_of(&doc).await?;
+            let uuid = identify(&annot, &uuid()?)?;
             let claimed = name == "claim";
             annot.set_flags(&uuid, Some(claimed), None)?;
             Ok(json!({ "uuid": uuid, "claimed": claimed }))
         }
+        "delete" => {
+            let (_, doc) = document_of(site, args).await?;
+            let annot = annot_of(&doc).await?;
+            let uuid = identify(&annot, &uuid()?)?;
+            annot.remove(&uuid)?;
+            Ok(json!({ "ok": true, "uuid": uuid }))
+        }
+        "annotate" => {
+            let said = text("text").ok_or("what should it say? pass text")?;
+            let (_, doc) = document_of(site, args).await?;
+            let annot = annot_of(&doc).await?;
+            let uuid = annot.annotate(crate::tool::serve::AnnotateRequest {
+                location: tinymist_annos::HtmlLocation::Document,
+                render: String::new(),
+                text: said,
+                kind: text("kind"),
+                color: None,
+                snapshot: None,
+                author: text("author"),
+            })?;
+            let letter = annot
+                .records()?
+                .into_iter()
+                .find(|rec| rec.uuid == uuid)
+                .map(|rec| rec.letter)
+                .unwrap_or_default();
+            Ok(json!({ "ok": true, "uuid": uuid, "letter": letter }))
+        }
+        "audit" => {
+            let (_, doc) = document_of(site, args).await?;
+            let annot = annot_of(&doc).await?;
+            annot.audit()
+        }
         "get_block" => {
-            let uuid = uuid()?;
             let context = args
                 .get("context")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
             let (_, doc) = document_of(site, args).await?;
             let annot = annot_of(&doc).await?;
-            let block = annot.block(&uuid, context)?;
-            serde_json::to_value(block).map_err(|err| err.to_string())
+            let uuid = identify(&annot, &uuid()?)?;
+            let record = annot
+                .records()?
+                .into_iter()
+                .find(|rec| rec.uuid == uuid)
+                .ok_or_else(|| format!("no annotation {uuid}"))?;
+            // Two annotations have no block, and neither is a failure: one
+            // about the document was never about a place, and one whose anchor
+            // has been edited away is about the document now. An agent asked
+            // what this is about, and there is an answer.
+            match annot.block(&uuid, context) {
+                Ok(block) => serde_json::to_value(block).map_err(|err| err.to_string()),
+                Err(_) if record.location.kind() == "document" => Ok(json!({
+                    "block": null,
+                    "about": "the document",
+                    "note": "About the document as a whole; there is no block to read or rewrite.",
+                    "snapshot": record.snapshot,
+                })),
+                Err(err) => Ok(json!({
+                    "block": null,
+                    "about": "a place that is gone",
+                    "note": format!(
+                        "The place this pointed at is gone: {err}. It is about the document \
+                         until an anchor comes back."
+                    ),
+                    "snapshot": record.snapshot,
+                    "location": record.location,
+                })),
+            }
         }
         "replace_block" => {
             let uuid = uuid()?;
@@ -448,6 +629,7 @@ async fn call_tool(site: &Arc<dyn DocumentSite>, name: &str, args: &Value) -> Re
             let policy = AnchorPolicy::parse(text("anchors").unwrap_or_default().as_str())?;
             let (_, doc) = document_of(site, args).await?;
             let annot = annot_of(&doc).await?;
+            let uuid = identify(&annot, &uuid)?;
             let was = annot.compile_revision();
             let dropped = annot.replace_block(&uuid, &block_id, &new_text, policy)?;
             let report = compile_report(&annot, was).await;
@@ -463,9 +645,9 @@ async fn call_tool(site: &Arc<dyn DocumentSite>, name: &str, args: &Value) -> Re
         }
         "get_capture" => {
             use crate::tool::serve::capture;
-            let uuid = uuid()?;
             let (_, doc) = document_of(site, args).await?;
             let annot = annot_of(&doc).await?;
+            let uuid = identify(&annot, &uuid()?)?;
             let record = annot
                 .records()?
                 .into_iter()
@@ -531,17 +713,17 @@ async fn call_tool(site: &Arc<dyn DocumentSite>, name: &str, args: &Value) -> Re
             }))
         }
         "reply" => {
-            let uuid = uuid()?;
             let said = text("text").ok_or("what should it say? pass text")?;
             let (_, doc) = document_of(site, args).await?;
             let annot = annot_of(&doc).await?;
+            let uuid = identify(&annot, &uuid()?)?;
             annot.reply(&uuid, &said, text("author").as_deref())?;
             Ok(json!({ "uuid": uuid, "replied": true }))
         }
         "resolve" => {
-            let uuid = uuid()?;
             let (_, doc) = document_of(site, args).await?;
             let annot = annot_of(&doc).await?;
+            let uuid = identify(&annot, &uuid()?)?;
             if let Some(said) = text("text") {
                 annot.reply(&uuid, &said, text("author").as_deref())?;
             }

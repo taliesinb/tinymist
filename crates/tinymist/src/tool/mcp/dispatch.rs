@@ -186,13 +186,14 @@ pub fn handle(request: Value) -> Option<Value> {
                 "title": "Talimist documents",
                 "version": env!("CARGO_PKG_VERSION"),
             },
-            "instructions": "Typst documents being read and annotated by a person. Each server \
-                             serves one file or one directory; call list_servers first, then \
-                             pass that name as `server` to everything else. Annotations are \
-                             questions and requests left in the margin: claim one, read the \
-                             block it points at, rewrite that block, then say what you did and \
-                             resolve it. wait_for_annotations blocks until there is something \
-                             to do.",
+            "instructions": "Typst documents that a person is reading and annotating. Each \
+                             server serves one file or one directory. Call list_servers first, \
+                             then pass that name as `server` to every other tool. An annotation \
+                             is a question or a request left in the margin. The usual sequence \
+                             is: wait_for_annotations, claim, get_block, replace_block, reply, \
+                             resolve. An annotation is named by its id or by the letter the \
+                             reader sees on the page. Some annotations are about the document \
+                             rather than a place in it, and have no block to rewrite.",
         })),
         "ping" => Ok(json!({})),
         "tools/list" => {

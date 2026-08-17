@@ -147,6 +147,12 @@ pub trait AnnotationServer: Send + Sync {
         Err("this server cannot read blocks".into())
     }
 
+    /// What the document and its sidecar say about each other: anchors nothing
+    /// points at, annotations pointing at anchors that are gone.
+    fn audit(&self) -> Result<serde_json::Value, String> {
+        Err("this server cannot audit annotations".into())
+    }
+
     /// Rewrites that block, returning the annotations whose anchors the
     /// rewrite deliberately dropped.
     fn replace_block(
@@ -640,7 +646,9 @@ pub enum AnchorPolicy {
     Keep,
     /// Missing anchors are put back at the head of the block.
     Reattach,
-    /// Missing anchors are meant, and their annotations go with them.
+    /// Missing anchors are meant. What pointed at them is kept, and becomes an
+    /// annotation about the document: somebody wrote it, and the rewrite says
+    /// nothing about whether it still has something to say.
     Drop,
 }
 
@@ -663,8 +671,8 @@ pub struct BlockEdit {
     pub path: PathBuf,
     /// Its content afterwards.
     pub content: String,
-    /// The annotations whose anchors the rewrite dropped, to be deleted with
-    /// it.
+    /// The anchors the rewrite dropped. What pointed at them is now about the
+    /// document.
     pub dropped: Vec<String>,
 }
 
@@ -820,6 +828,46 @@ impl DiskAnnotationServer {
 }
 
 impl DiskAnnotationServer {
+    /// Writes an annotation about the document as a whole.
+    ///
+    /// Nothing is resolved and nothing is written into the document: the
+    /// location names no anchor, so there is no place to find and none to make.
+    fn annotate_document(&self, req: &AnnotateRequest) -> Result<String, String> {
+        let art = self.art()?;
+        let document = document_path(&art).ok_or("cannot determine the document path")?;
+        let sidecar_path = tinymist_annos::sidecar_path(&document);
+        let now = tinymist_project::iso_now();
+        let record = Annotation {
+            uuid: fresh_uuid(&req.text),
+            letter: String::new(),
+            location: tinymist_annos::TypstLocation::Document,
+            snapshot: req.snapshot.clone(),
+            kind: req.kind.clone().unwrap_or_else(|| "comment".to_owned()),
+            color: req.color.clone().unwrap_or_default(),
+            author: author_or_local(req.author.as_deref()),
+            time: now.clone(),
+            mtime: now,
+            claimed: false,
+            resolved: false,
+            content: req.text.clone(),
+            discussion: vec![],
+            captures: vec![],
+        };
+        let uuid = record.uuid.clone();
+        let record = revise(&sidecar_path, |sidecar| {
+            let mut record = record;
+            record.letter = sidecar.next_letter();
+            sidecar.put(record.clone());
+            Ok(record)
+        })?;
+        self.push_pins();
+        self.emit(
+            "annotation_added",
+            &[("value", serde_json::to_value(&record).unwrap_or_default())],
+        );
+        Ok(uuid)
+    }
+
     /// The document, its sidecar, and the rendering a request refers to.
     fn context(&self, render: &str) -> Result<(PathBuf, PathBuf, tinymist_annos::StoredRender), String> {
         let art = self.art()?;
@@ -833,6 +881,12 @@ impl DiskAnnotationServer {
 
 impl crate::tool::serve::AnnotationServer for DiskAnnotationServer {
     fn annotate(&self, req: AnnotateRequest) -> Result<String, String> {
+        // About the document rather than a place in it: nothing to resolve, no
+        // anchor to write, and no rendering to do either of those against. An
+        // agent can leave one without a page ever having been open.
+        if matches!(req.location, tinymist_annos::HtmlLocation::Document) {
+            return self.annotate_document(&req);
+        }
         let (document, sidecar_path, stored) = self.context(&req.render)?;
         let text = std::fs::read_to_string(&document)
             .map_err(|err| format!("cannot read {}: {err}", document.display()))?;
@@ -1016,24 +1070,19 @@ impl crate::tool::serve::AnnotationServer for DiskAnnotationServer {
         let edit = prepare_block_replace(&art, uuid, block_id, new_text, policy)?;
         std::fs::write(&edit.path, &edit.content)
             .map_err(|err| format!("cannot write {}: {err}", edit.path.display()))?;
-        // The anchors the rewrite dropped were dropped on purpose, so every
-        // annotation that pointed at one goes too: a record with nothing to
-        // point at cannot be drawn or acted on.
+        // The anchors the rewrite dropped were dropped on purpose. What
+        // pointed at them is not: it is about the document now, which is where
+        // an annotation goes when the place it was about is gone.
         if let Some(sidecar_path) = sidecar_path(&art) {
             let _ = revise(&sidecar_path, |sidecar| {
-                let gone: Vec<String> = sidecar
-                    .annotations
-                    .iter()
-                    .filter(|record| {
-                        record
-                            .labels()
-                            .iter()
-                            .any(|label| edit.dropped.iter().any(|lost| lost == label))
-                    })
-                    .map(|record| record.uuid.clone())
-                    .collect();
-                for uuid in &gone {
-                    sidecar.remove(uuid);
+                for record in &mut sidecar.annotations {
+                    let lost = record
+                        .labels()
+                        .iter()
+                        .any(|label| edit.dropped.iter().any(|gone| gone == label));
+                    if lost {
+                        record.location = tinymist_annos::TypstLocation::Document;
+                    }
                 }
                 Ok(())
             });
@@ -1047,6 +1096,44 @@ impl crate::tool::serve::AnnotationServer for DiskAnnotationServer {
             ],
         );
         Ok(edit.dropped)
+    }
+
+    fn audit(&self) -> Result<serde_json::Value, String> {
+        let art = self.art()?;
+        let document = document_path(&art).ok_or("cannot determine the document path")?;
+        let sidecar_path = tinymist_annos::sidecar_path(&document);
+        let text = std::fs::read_to_string(&document)
+            .map_err(|err| format!("cannot read {}: {err}", document.display()))?;
+        let source = typst::syntax::Source::detached(text);
+        let sidecar = read_sidecar(&sidecar_path);
+        let anchors = tinymist_annos::anchor::anchors_in(&source);
+        let names: Vec<String> = anchors.iter().map(|anchor| anchor.name()).collect();
+        let report = tinymist_annos::audit::audit(names.iter().map(String::as_str), &sidecar);
+        let dangling = tinymist_annos::audit::dangling(&sidecar, &report);
+        Ok(serde_json::json!({
+            "document": document.display().to_string(),
+            "annotations": sidecar.annotations.len(),
+            "anchors": anchors.len(),
+            // Anchors nothing points at any more: the next collection removes
+            // them, and they are not a problem.
+            "unusedAnchors": report.unused,
+            // Annotations naming an anchor the document does not have: these
+            // are the ones nobody can see, and they are about the document
+            // until an anchor comes back.
+            "missingAnchors": report.missing,
+            "orphaned": dangling
+                .iter()
+                .map(|(record, lost)| {
+                    serde_json::json!({
+                        "uuid": record.uuid,
+                        "letter": record.letter,
+                        "content": record.content,
+                        "snapshot": record.snapshot,
+                        "lostAnchors": lost,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        }))
     }
 
     fn compile_revision(&self) -> u64 {
