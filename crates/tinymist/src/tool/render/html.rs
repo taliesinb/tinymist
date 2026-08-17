@@ -171,6 +171,11 @@ pub fn html_document(art: &LspCompiledArtifact) -> Result<String, String> {
 pub struct HtmlFragment {
     /// The document's title, if it declared one.
     pub title: String,
+    /// The styles the exporter put in the head: the rules an equation needs to
+    /// be laid out, and whatever else Typst decides a document cannot do
+    /// without. The page has to carry these itself, since it takes the body and
+    /// leaves the head behind.
+    pub style: String,
     /// Everything between `<body>` and `</body>`.
     pub body: String,
 }
@@ -183,8 +188,28 @@ pub fn fragment(html: &str) -> HtmlFragment {
         let end = html[start..].find(close)? + start;
         Some(html[start..end].to_owned())
     };
+    // Every style block in the head, in the order the exporter wrote them.
+    let head_end = html.find("</head>").unwrap_or(html.len());
+    let head = &html[..head_end];
+    let mut style = String::new();
+    let mut at = 0;
+    while let Some(open) = head[at..].find("<style") {
+        let open = at + open;
+        let Some(start) = head[open..].find('>').map(|to| open + to + 1) else {
+            break;
+        };
+        let Some(end) = head[start..].find("</style>").map(|to| start + to) else {
+            break;
+        };
+        if !style.is_empty() {
+            style.push('\n');
+        }
+        style.push_str(&head[start..end]);
+        at = end;
+    }
     HtmlFragment {
         title: between("<title", "</title>").unwrap_or_default(),
+        style,
         body: between("<body", "</body>").unwrap_or_else(|| html.to_owned()),
     }
 }

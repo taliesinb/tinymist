@@ -3117,6 +3117,28 @@
     });
   };
 
+  // The styles the exporter put in the document's own head: the rules an
+  // equation needs, and whatever else Typst decides a document cannot do
+  // without. They sit after this page's own stylesheet, which is about the page
+  // rather than the document, and before a stylesheet the server was told to
+  // put in front of documents, which is meant to win.
+  const DOC_STYLE_ID = "tinymist-typst-style";
+  const applyDocumentStyle = (css) => {
+    let el = document.getElementById(DOC_STYLE_ID);
+    if (!css) {
+      if (el) el.remove();
+      return;
+    }
+    if (!el) {
+      el = document.createElement("style");
+      el.id = DOC_STYLE_ID;
+      const theirs = document.querySelector('link[data-tm-injected="css"]');
+      if (theirs) theirs.before(el);
+      else document.head.appendChild(el);
+    }
+    if (el.textContent !== css) el.textContent = css;
+  };
+
   // What to call the document: the file it was rendered from, by name.
   const documentName = (res) => {
     const path = res.map && res.map.files && res.map.files[0] && res.map.files[0].path;
@@ -3146,6 +3168,7 @@
         nodeKinds = {};
         const nodes = (res.map && res.map.nodes) || {};
         for (const uid of Object.keys(nodes)) nodeKinds[uid] = nodes[uid].kind;
+        applyDocumentStyle(res.style || "");
         if (shownBody !== res.body) {
           shownBody = res.body;
           doc.innerHTML = res.body;

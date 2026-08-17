@@ -356,8 +356,11 @@ pub fn entries_in(dir: &Path) -> Vec<DocEntry> {
             // Not read at all: every `.typ` file is a document, and its name is
             // what it is called.
             if !introspect() {
+                // No title: nothing was read, so there is nothing to say. A
+                // file name repeated as a title is a column of the same words
+                // twice.
                 return Some(DocEntry {
-                    title: slug.clone(),
+                    title: String::new(),
                     slug,
                     modified: std::fs::metadata(&path).and_then(|meta| meta.modified()).ok(),
                     annotations: annotation_count(&path),

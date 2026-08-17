@@ -820,6 +820,10 @@ pub async fn make_http_server(
                                         "ok": true,
                                         "render": map.render,
                                         "title": frag.title,
+                                        // What the exporter put in the head,
+                                        // which the page has to carry since it
+                                        // takes only the body.
+                                        "style": frag.style,
                                         "body": frag.body,
                                         "map": map,
                                     })

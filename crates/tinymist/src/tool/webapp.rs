@@ -217,7 +217,7 @@ pub fn mode_head(html: &str, identity: &WebAppIdentity, port: u16, listing: bool
         .flatten()
         .map(|_| {
             format!(
-                "<link rel=\"stylesheet\" href=\"{}\">",
+                "<link rel=\"stylesheet\" data-tm-injected=\"css\" href=\"{}\">",
                 public_path(CSS_ROUTE)
             )
         })
