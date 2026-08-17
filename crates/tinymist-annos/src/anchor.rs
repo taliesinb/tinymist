@@ -100,9 +100,10 @@ pub enum Refusal {
     /// The position is inside a string, a comment or a raw block, where a label
     /// would be read as text.
     NotMarkup,
-    /// The position is inside code, where a label is not valid syntax. The
-    /// enclosing expression can be annotated instead; its range is given.
-    InsideCode(Range<usize>),
+    /// A label at the position would not mean what it says: inside code it is
+    /// not valid syntax, and inside a heading it ends the heading. The
+    /// enclosing element can be annotated instead; its range is given.
+    Coarsen(Range<usize>),
 }
 
 /// Where an anchor for a position would be written.
@@ -124,20 +125,96 @@ pub fn place(source: &Source, offset: usize) -> Result<usize, Refusal> {
         None => return Ok(offset),
     };
 
+    // A label inside a heading ends it: `== What<anno.X> are annotations?` is a
+    // heading that says "What" followed by a paragraph. Only the end of the
+    // heading can carry one, and that names the whole heading.
+    if let Some(heading) = enclosing_heading(text, &leaf) {
+        if heading.end > offset {
+            return Err(Refusal::Coarsen(heading));
+        }
+    }
+
     match leaf.kind() {
         // Markup text: snap to a word boundary so the label does not split a
         // word.
         SyntaxKind::Text | SyntaxKind::MathText => Ok(word_end(text, offset)),
         // Whitespace and paragraph breaks are markup, and a label may go
-        // directly there.
-        SyntaxKind::Space | SyntaxKind::Parbreak | SyntaxKind::SmartQuote => Ok(offset),
+        // directly there — unless nothing precedes it, in which case the label
+        // would attach to whatever is outside: written as `== <anno.X>Title`
+        // the heading loses its text. The next word takes the anchor instead,
+        // and the position is recorded as being to that word's left.
+        SyntaxKind::Space | SyntaxKind::Parbreak | SyntaxKind::SmartQuote => {
+            if opens_content(text, &root, offset) {
+                let mut at = offset;
+                while text[at..].starts_with(char::is_whitespace) {
+                    at += text[at..].chars().next().map_or(0, char::len_utf8);
+                }
+                Ok(word_end(text, at))
+            } else {
+                Ok(offset)
+            }
+        }
         SyntaxKind::Str | SyntaxKind::LineComment | SyntaxKind::BlockComment | SyntaxKind::Raw => {
             Err(Refusal::NotMarkup)
         }
         // Anything else came from code. The expression containing it is what
         // can be annotated.
-        _ => Err(Refusal::InsideCode(expression_around(text, &leaf))),
+        _ => Err(Refusal::Coarsen(expression_around(text, &leaf))),
     }
+}
+
+/// The content of the heading a node is in, if it is in one.
+///
+/// The range ends where the heading's text does, so an anchor for it goes
+/// there: written after the text and before the line ends, which is where a
+/// heading's label belongs.
+fn enclosing_heading(text: &str, node: &LinkedNode) -> Option<Range<usize>> {
+    let mut cursor = node.clone();
+    loop {
+        if cursor.kind() == SyntaxKind::Heading {
+            let mut range = cursor.range();
+            // Trailing whitespace is not part of the heading's text.
+            let written = &text[range.clone()];
+            range.end -= written.len() - written.trim_end().len();
+            return Some(range);
+        }
+        cursor = cursor.parent()?.clone();
+    }
+}
+
+/// Whether a position has nothing before it that a label could attach to: the
+/// start of a heading, of a list item, of a bracketed block, of a paragraph.
+///
+/// A label attaches to what precedes it, so one written at the start of a
+/// paragraph names the paragraph before, which may already carry a label of its
+/// own. The first word of the paragraph takes it instead.
+fn opens_content(text: &str, root: &LinkedNode, offset: usize) -> bool {
+    let mut at = offset;
+    while let Some(prev) = text[..at].chars().next_back() {
+        if !prev.is_whitespace() {
+            break;
+        }
+        at -= prev.len_utf8();
+    }
+    if at == 0 {
+        return true;
+    }
+    // A blank line between: what precedes is another block.
+    if text[at..offset].matches('\n').count() >= 2 {
+        return true;
+    }
+    let Some(leaf) = root.leaf_at(at - 1, typst_syntax::Side::After) else {
+        return true;
+    };
+    matches!(
+        leaf.kind(),
+        SyntaxKind::HeadingMarker
+            | SyntaxKind::ListMarker
+            | SyntaxKind::EnumMarker
+            | SyntaxKind::TermMarker
+            | SyntaxKind::LeftBracket
+            | SyntaxKind::Colon
+    )
 }
 
 /// The end of the word containing a position.

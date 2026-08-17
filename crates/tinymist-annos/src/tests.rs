@@ -857,8 +857,11 @@ fn a_span_across_two_places_writes_two_anchors() {
         panic!("wrong variant")
     };
     assert_ne!(begin.label, end.label);
-    assert_eq!(begin.side, HSide::Right);
-    assert_eq!(end.side, HSide::Left);
+    // The span begins in front of a word, so its anchor went after that word
+    // and the position is to the anchor's left; it ends where a label may be
+    // written, so that anchor sits at the position itself.
+    assert_eq!(begin.side, HSide::Left);
+    assert_eq!(end.side, HSide::Right);
     let written = crate::anchor::apply(text, &out.edits);
     assert!(written.contains("beta<anno."), "{written}");
 }

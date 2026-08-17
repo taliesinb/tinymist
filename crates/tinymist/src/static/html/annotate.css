@@ -192,6 +192,10 @@ math {
      one pixel of darker red so that it stays visible on any background. Drawn
      as a 5x5 PNG so the pixels are the pixels. */
   cursor: url("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAUAAAAFCAYAAACNbyblAAAAI0lEQVR42mNgAIIKBob/MMyALPBfQwMhAROAYbgghkpsZgIAH50i97zicgIAAAAASUVORK5CYII=") 2 2, crosshair;
+  /* Dragging across words means "annotate this span", so the browser must not
+     also read it as selecting text. Selection comes back with the checkbox. */
+  user-select: none;
+  -webkit-user-select: none;
 }
 
 /* A link is something to annotate, not to follow — but it still has to be

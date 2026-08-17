@@ -2266,31 +2266,14 @@
 
   // The insertion point the pointer sits at: where a chevron would go, and the
   // source offset a point anchor would use (the end of the word to its left).
+  // The start of a run is a position of its own: in front of the first word,
+  // where a label cannot be written but which the resolver expresses as being
+  // to the left of the anchor it writes after that word.
   const gapAt = (caret) => {
-    let run = caret.run;
+    const run = caret.run;
     let at = Math.min(caret.at, run.text.length);
     while (at > 0 && /\s/.test(run.text[at - 1])) at -= 1;
-    if (at === 0) {
-      // The space after an inline element belongs to the run that follows it,
-      // which has nothing to its left to anchor to. The word on the left is the
-      // end of the previous run.
-      const before = runBefore(run);
-      if (!before) return null;
-      run = before;
-      at = run.text.length;
-      while (at > 0 && /\s/.test(run.text[at - 1])) at -= 1;
-      if (at === 0) return null;
-    }
     return { run, at, box: gapBox(run.node, at) };
-  };
-
-  /// The run before this one that has something in it.
-  const runBefore = (run) => {
-    const at = runs.indexOf(run);
-    for (let i = at - 1; i >= 0; i -= 1) {
-      if (runs[i].text && runs[i].text.trim()) return runs[i];
-    }
-    return null;
   };
 
   // Whether the pointer is inside the box of a run's text, line boxes and all.

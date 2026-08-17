@@ -132,6 +132,9 @@ impl Context<'_> {
 struct Anchored {
     /// The label as a location refers to it, prefix included.
     label: String,
+    /// Where it ended up. A label may only be written where a label is valid,
+    /// so an anchor for a position inside a word goes after that word.
+    at: usize,
     /// Set when the anchor could not go where it was asked for and marks an
     /// enclosing expression instead.
     coarsened: bool,
@@ -141,7 +144,7 @@ fn anchor_at(ctx: &Context, offset: usize, used: &mut Vec<Edit>) -> Result<Ancho
     // Snap to a position where a label is valid.
     let (at, coarsened) = match anchor::place(ctx.source, offset) {
         Ok(at) => (at, false),
-        Err(Refusal::InsideCode(range)) => (range.end, true),
+        Err(Refusal::Coarsen(range)) => (range.end, true),
         Err(Refusal::NotMarkup) => return Err(Failure::Unwritable),
     };
 
@@ -150,6 +153,7 @@ fn anchor_at(ctx: &Context, offset: usize, used: &mut Vec<Edit>) -> Result<Ancho
     if let Some(anchor) = anchor::at_position(ctx.source, at) {
         return Ok(Anchored {
             label: anchor.name(),
+            at,
             coarsened,
         });
     }
@@ -163,6 +167,7 @@ fn anchor_at(ctx: &Context, offset: usize, used: &mut Vec<Edit>) -> Result<Ancho
             .to_owned();
         return Ok(Anchored {
             label,
+            at,
             coarsened,
         });
     }
@@ -172,6 +177,7 @@ fn anchor_at(ctx: &Context, offset: usize, used: &mut Vec<Edit>) -> Result<Ancho
     used.push(edit.clone());
     Ok(Anchored {
         label: crate::anchor_label(&id),
+        at,
         coarsened,
     })
 }
@@ -187,6 +193,30 @@ pub fn resolve(ctx: &Context, location: &HtmlLocation) -> Result<Resolution, Fai
         let anchored = anchor_at(ctx, offset, &mut edits)?;
         coarsened |= anchored.coarsened;
         Ok(anchored.label)
+    };
+
+    // A label may only be written where a label is valid, so an anchor for a
+    // position in front of a word goes after that word. The side records that:
+    // the position is to the left of what the label attaches to, rather than at
+    // the label itself. A position inside a word is not in front of it and
+    // cannot be said either way, so it stays with the anchor.
+    let cursor_anchor = |ctx: &Context,
+                         edits: &mut Vec<Edit>,
+                         uid: &str,
+                         char_at: usize|
+     -> Result<(String, HSide, bool), Failure> {
+        let offset = ctx.offset_of_char(uid, char_at)?;
+        let anchored = anchor_at(ctx, offset, edits)?;
+        let text = ctx.source.text();
+        let jumped = text[offset..anchored.at].chars().any(|ch| !ch.is_whitespace());
+        // One word, and only one: a position that was in front of a word is to
+        // the left of the anchor written after it. An anchor that had to travel
+        // further than that — past a whole heading, out of a call — is not at
+        // that position at all, and the position stays with the anchor.
+        let whole = text[offset..anchored.at].split_whitespace().count() == 1
+            && anchor::word_start(text, anchored.at) >= offset;
+        let side = if jumped && whole { HSide::Left } else { HSide::Right };
+        Ok((anchored.label, side, anchored.coarsened))
     };
 
     let location = match location {
@@ -208,26 +238,27 @@ pub fn resolve(ctx: &Context, location: &HtmlLocation) -> Result<Resolution, Fai
             },
         },
         Location::PosH { reference } => {
-            let label = text_anchor(&reference.node, reference.pos)?;
-            // The label sits at the position, so the position is to its right.
+            let (label, side, moved) =
+                cursor_anchor(ctx, &mut edits, &reference.node, reference.pos)?;
+            coarsened |= moved;
             Location::PosH {
-                reference: TypstTextCursorRef {
-                    label,
-                    side: HSide::Right,
-                },
+                reference: TypstTextCursorRef { label, side },
             }
         }
         Location::SpanH { begin, end } => {
-            let from = text_anchor(&begin.node, begin.pos)?;
-            let to = text_anchor(&end.node, end.pos)?;
+            let (from, from_side, from_moved) =
+                cursor_anchor(ctx, &mut edits, &begin.node, begin.pos)?;
+            let (to, to_side, to_moved) =
+                cursor_anchor(ctx, &mut edits, &end.node, end.pos)?;
+            coarsened |= from_moved || to_moved;
             Location::SpanH {
                 begin: TypstTextCursorRef {
                     label: from,
-                    side: HSide::Right,
+                    side: from_side,
                 },
                 end: TypstTextCursorRef {
                     label: to,
-                    side: HSide::Left,
+                    side: to_side,
                 },
             }
         }
@@ -342,9 +373,16 @@ pub fn project(ctx: &Context, location: &TypstLocation) -> Result<HtmlLocation, 
     };
     let cursor_ref = |cursor: &TypstTextCursorRef| -> Result<crate::location::HtmlTextCursorRef, Failure> {
         let (uid, at) = ctx.rendered_position(&cursor.label)?;
+        // A position to the label's left is in front of the word the label
+        // attaches to, which is where it was asked for before the label was
+        // moved to somewhere a label may be written.
+        let pos = match cursor.side {
+            HSide::Right => at,
+            HSide::Left => ctx.word_before(uid, at).0,
+        };
         Ok(crate::location::HtmlTextCursorRef {
             node: uid.to_owned(),
-            pos: at,
+            pos,
             l: None,
             r: None,
         })
