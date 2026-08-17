@@ -1071,7 +1071,7 @@
     const paint = (el, vertical) => {
       if (dim) {
         crawlLine(el, plain, vertical);
-        if (state === "pending") el.classList.add("tm-hurry");
+        if (state === "pending" && !pin.error) el.classList.add("tm-hurry");
       } else {
         el.style.background = plain;
         el.style.boxShadow = `0 0 0 1.5px ${darkTint(plain)}`;
@@ -1095,7 +1095,7 @@
       const el = mark(host, key + ":box", "tm-box");
       if (dim) {
         crawlBox(el, plain);
-        if (state === "pending") el.classList.add("tm-hurry");
+        if (state === "pending" && !pin.error) el.classList.add("tm-hurry");
       } else {
         el.style.border = `2px solid ${plain}`;
         el.style.boxShadow = haloRing(plain);
@@ -1161,7 +1161,7 @@
           el.style.borderRadius = ring.round + "px";
           if (dim) {
             crawlBox(el, plain);
-            if (state === "pending") el.classList.add("tm-hurry");
+            if (state === "pending" && !pin.error) el.classList.add("tm-hurry");
           } else {
             el.style.border = `2px solid ${plain}`;
             el.style.boxShadow = haloRing(plain);
@@ -1224,7 +1224,7 @@
       el.style.opacity = opacity;
       const box = boxes[0];
       drawSideline(el, plain, dim);
-      if (state === "pending") el.classList.add("tm-hurry");
+      if (state === "pending" && !pin.error) el.classList.add("tm-hurry");
       place(el, box.left, box.top, box.width, box.height);
       const glyph = mark(host, key + ":letter", "tm-glyph tm-over");
       glyph.style.opacity = opacity;
@@ -1242,7 +1242,7 @@
       el.style.opacity = opacity;
       const box = boxes[0];
       drawEdgeCaret(el, plain, box, dim);
-      if (state === "pending") el.classList.add("tm-hurry");
+      if (state === "pending" && !pin.error) el.classList.add("tm-hurry");
       place(el, box.left, box.top, box.width, EDGE_H);
       const glyph = mark(host, key + ":letter", "tm-glyph tm-over");
       glyph.style.opacity = opacity;
@@ -1259,7 +1259,7 @@
       const el = mark(host, key + ":point", "tm-mark tm-over");
       el.style.opacity = opacity;
       drawCaret(el, plain, boxes[0], dim);
-      if (state === "pending") el.classList.add("tm-hurry");
+      if (state === "pending" && !pin.error) el.classList.add("tm-hurry");
       const caretX = boxes[0].left - CARET_W / 2;
       const caretY = boxes[0].top - (el.__h - boxes[0].height) / 2;
       place(el, caretX, caretY);
@@ -1870,14 +1870,13 @@
       document.removeEventListener("keydown", escHandler, true);
       escHandler = null;
     }
-    // This draft is being thrown away, so there is nothing to take up again.
-    if (composeActive) forgetComposing();
     composeActive = false;
     if (composing) dropLocal(composing);
     composing = null;
     openUuid = null;
     openSig = null;
     render();
+    keepHeld();
     return true;
   };
 
@@ -2052,8 +2051,26 @@
     // Sent, and not answered for yet. It can be read but not changed: the
     // server has a copy of these words, and a second version of them here
     // would be a third thing that is neither what was sent nor what is on the
-    // page. Waiting is the only thing to do with it.
-    const parts = shell(pin.letter || "?", "sending comment", []);
+    // page. Waiting is the only thing to do with it — unless the server has
+    // said no, which is a thing to be told and then to throw away.
+    const parts = shell(
+      pin.letter || "?",
+      pin.error ? "unplaced comment" : "sending comment",
+      pin.error
+        ? [
+            [
+              "discard",
+              () => {
+                dropDraft(pin.draft);
+                dropLocal(pin.uuid);
+                closeBox(true);
+                keepHeld();
+                render();
+              },
+            ],
+          ]
+        : [],
+    );
     if (!parts) return;
     openUuid = pin.uuid;
     openSig = null;
@@ -2061,9 +2078,11 @@
     parts.content.append(msgRow(hue, "you", pin.time || new Date().toISOString(), pin.content, true));
     const note = document.createElement("div");
     note.className = "tm-locked";
-    note.textContent = online
-      ? "Waiting for the server."
-      : "Waiting for the connection; it is kept here until then.";
+    note.textContent = pin.error
+      ? `Not placed: ${pin.error}. It is kept here and in this browser.`
+      : online
+        ? "Waiting for the server."
+        : "Waiting for the connection; it is kept here until then.";
     parts.content.append(note);
     render();
   };
@@ -2172,8 +2191,8 @@
         send(held);
       }
       dropLocal(draftUuid);
-      forgetComposing();
       closeBox(true);
+      keepHeld();
     };
     const parts = shell(letter, `draft ${existing && existing.kind ? existing.kind : "comment"}`, [
       ["save", () => submit(document.querySelector(`#${BOX_ID} textarea`))],
@@ -2185,25 +2204,14 @@
     parts.content.append(wrap);
     // From the moment a place is picked, not from the first word: choosing
     // where a comment goes is most of the work of writing one.
-    const remember = () =>
-      keepComposing({
-        kind,
-        location,
-        letter,
-        color,
-        uuid: draftUuid,
-        render: renderId,
-        text: ta.value,
-        at_: [ta.selectionStart, ta.selectionEnd],
-      });
     for (const event of ["input", "keyup", "click", "select"]) {
-      ta.addEventListener(event, remember);
+      ta.addEventListener(event, touchHeld);
     }
     if (existing && existing.content) {
       ta.value = existing.content;
       ta.dispatchEvent(new Event("input"));
     }
-    remember();
+    touchHeld();
     // A draft the window was opened on, with nothing done to it yet, is
     // deleted by backspace: the annotation was made by a click and this undoes
     // that click. Anything else — a keystroke, a click in the window — makes it
@@ -2223,9 +2231,9 @@
           e.stopImmediatePropagation();
           dropLocal(draftUuid);
           composing = null;
-          forgetComposing();
           closeBox(true);
           render();
+          keepHeld();
           return;
         }
         if (e.key.length === 1 || e.key === "Enter" || e.key === "Delete") touched();
@@ -2267,12 +2275,16 @@
         // nothing drawn.
         pin.waiting = res.uuid;
         dropDraft(pin.draft);
+        keepHeld();
         return refresh();
       }
       // A refusal is about this annotation and will not fix itself; no
-      // connection is about the page and will.
+      // connection is about the page and will. Either way it stays on the page:
+      // an annotation that disappears and leaves a line of text behind is one
+      // somebody has to be told about twice.
       keepDraft(pin.draft, res && res.error, online);
-      if (online) dropLocal(held);
+      if (online) pin.error = (res && res.error) || "the server refused it";
+      keepHeld();
       render();
     });
   };
@@ -2281,7 +2293,12 @@
   // back: what this page is still holding, and what a previous visit left in
   // the browser.
   const flush = () => {
-    for (const pin of local.filter((waiting) => waiting.state === "pending")) {
+    // Only what the server has never taken: one that was accepted before the
+    // page reloaded is waiting for its own copy to come back, and sending it
+    // again would make two of it.
+    for (const pin of local.filter(
+      (held) => held.state === "pending" && !held.waiting && !held.error,
+    )) {
       send(pin.uuid);
     }
     sendStored();
@@ -2327,33 +2344,70 @@
     return entry ? (entry.el.textContent || "").trim().slice(0, 60) : undefined;
   };
 
-  // What is being written right now: the place it is about, the words so far,
-  // and where the cursor is in them. The page reloads itself when the server's
-  // assets change, and a comment half written when that happens would otherwise
-  // be gone — as would the work of having chosen where it goes.
-  const COMPOSING = `tinymist-html-composing:${BASE}`;
-  const COMPOSING_KEEP = 3600 * 1000;
-  const keepComposing = (state) => {
+  // Everything this page is holding: the annotations the server does not have,
+  // which of them is open, what is being typed into it, and where the page was
+  // left. The page reloads itself whenever the server's assets change, and all
+  // of that would otherwise go with it — including the work of having chosen
+  // where a comment goes, which is most of the work of writing one.
+  //
+  // One store for drafts and pending annotations alike, since they are the same
+  // thing at different stages and differ only in whether they have been sent.
+  const HELD = `tinymist-html-held:${BASE}`;
+  const HELD_FIELDS = [
+    "uuid",
+    "state",
+    "letter",
+    "color",
+    "location",
+    "content",
+    "time",
+    "draft",
+    "waiting",
+    "error",
+    "held",
+  ];
+  let heldTimer = null;
+  // Nothing is written until what was held has been read: the page reads it
+  // once the document and the annotations are in, and everything that happens
+  // before then — the first refresh, the browser restoring a scroll position —
+  // would otherwise write an empty page over it.
+  let resumed = false;
+  // Called from everything that changes what is held, which is a lot of small
+  // changes in a row while somebody types.
+  const touchHeld = () => {
+    clearTimeout(heldTimer);
+    heldTimer = setTimeout(keepHeld, 150);
+  };
+  const keepHeld = () => {
+    clearTimeout(heldTimer);
+    if (!resumed) return;
     try {
-      sessionStorage.setItem(COMPOSING, JSON.stringify({ ...state, at: Date.now() }));
+      const box = document.getElementById(BOX_ID);
+      const ta = box && box.querySelector("textarea");
+      const open = local.some((pin) => pin.uuid === openUuid) ? openUuid : composing;
+      const record = {
+        pins: local.map((pin) => {
+          const kept = {};
+          for (const field of HELD_FIELDS) {
+            if (pin[field] !== undefined) kept[field] = pin[field];
+          }
+          return kept;
+        }),
+        open: open || null,
+        // What is in the field is not in the draft until the window is closed.
+        typing: ta && composing ? { text: ta.value, at: [ta.selectionStart, ta.selectionEnd] } : null,
+        // Only used when nothing is open: with something open, that is where
+        // the page should be looking.
+        scroll: window.scrollY,
+        at: Date.now(),
+      };
+      if (!record.pins.length && !record.open) localStorage.removeItem(HELD);
+      else localStorage.setItem(HELD, JSON.stringify(record));
     } catch (err) {}
   };
-  const forgetComposing = () => {
+  const takeHeld = () => {
     try {
-      sessionStorage.removeItem(COMPOSING);
-    } catch (err) {}
-  };
-  const takeComposing = () => {
-    try {
-      const held = JSON.parse(sessionStorage.getItem(COMPOSING) || "null");
-      if (!held || !held.location) return null;
-      // Something written an hour ago and never finished is not what the page
-      // is for; it is not restored, and the words are still in the drafts.
-      if (!held.at || Date.now() - held.at > COMPOSING_KEEP) {
-        forgetComposing();
-        return null;
-      }
-      return held;
+      return JSON.parse(localStorage.getItem(HELD) || "null");
     } catch (err) {
       return null;
     }
@@ -2931,10 +2985,16 @@
   const refresh = () => Promise.all([loadDocument(), loadPins()]).then(() => {
     // A pending annotation the server has now sent back is the server's; drop
     // this page's copy of it.
+    // A pending annotation the server has sent back is the server's now. It is
+    // recognised by the id the server gave it, or — after a reload, when that
+    // id was never learned — by saying the same thing.
     local = local.filter(
-      (pin) => pin.state !== "pending" || !pins.some((known) => known.uuid === pin.waiting),
+      (pin) =>
+        pin.state !== "pending" ||
+        !pins.some((known) => known.uuid === pin.waiting || known.content === pin.content),
     );
     render();
+    keepHeld();
     refreshOpen();
   });
 
@@ -3241,27 +3301,52 @@
   // The panel wraps differently at a different width, so its height is not a
   // thing to measure once.
   window.addEventListener("resize", measureStatus);
-  // A comment that was being written when the page reloaded is opened again,
-  // where it was, with the words and the cursor where they were left.
-  const resumeComposing = () => {
+  // What the page was holding when it last stopped: the annotations the server
+  // does not have, the one that was open, and — if none was — where the page
+  // was scrolled to.
+  const resumeHeld = () => {
     if (!ANNOTATE || composeActive || openUuid !== null) return;
-    const held = takeComposing();
-    if (!held) return;
-    compose(held.kind || "comment", held.location, {
-      uuid: held.uuid,
-      letter: held.letter,
-      color: held.color,
-      content: held.text || "",
-      at_: held.at_,
-    });
+    const held = takeHeld();
+    resumed = true;
+    if (!held || !held.pins) return;
+    local = held.pins
+      .filter((pin) => pin.location)
+      // One the server has taken while this page was away is the server's.
+      .filter(
+        (pin) =>
+          pin.state !== "pending" ||
+          !pins.some((known) => known.uuid === pin.waiting || known.content === pin.content),
+      );
+    // Ids are handed out in order, and the ones just restored are already
+    // taken.
+    drafted = local.length;
+    render();
+    const open = held.open && local.find((pin) => pin.uuid === held.open);
+    if (open && open.state === "draft") {
+      const kind = open.location.type === "word" ? "comment" : open.location.type;
+      compose(kind, open.location, {
+        ...open,
+        content: (held.typing && held.typing.text) || open.content || "",
+        at_: held.typing && held.typing.at,
+      });
+    } else if (open) {
+      showLocal(open);
+    } else if (held.scroll) {
+      window.scrollTo(0, held.scroll);
+    }
+    // Anything that never reached the server goes again.
+    flush();
   };
 
   watchConnection();
   setInterval(beat, BEAT);
   refresh()
     .then(() => sendStored())
-    .then(resumeComposing)
+    .then(resumeHeld)
     .then(listen);
+  // Where the page is looking is part of what is held, for a reload with
+  // nothing open.
+  document.addEventListener("scroll", touchHeld, { capture: true, passive: true });
   // Fonts and images settle after the first paint and move everything below
   // them; a slow tick keeps the marks on their text without watching for it.
   setInterval(render, 1000);

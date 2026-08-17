@@ -97,9 +97,15 @@ body {
   text-align: center;
 }
 
+/* Typst writes a picture twice over: its pixel size as `width` and `height`
+   attributes, and the width it is laid out at as a style. The attribute height
+   then fights the style width, and a picture asked to fill the column is drawn
+   at the column's width and its own height — squashed, and spilling out of the
+   column when the column is narrow. The height follows the width instead. */
 .tm-doc img,
 .tm-doc svg {
   max-width: 100%;
+  height: auto;
 }
 
 /* Drawings are laid out the paged way and embedded as SVG, so they arrive in
