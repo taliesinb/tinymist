@@ -744,7 +744,28 @@
     el.dataset.seen = "1";
     return el;
   };
+  // Where the overlay's own corner sits in the coordinates everything is
+  // measured in. It is fixed to the viewport, so this is zero — except in a
+  // browser that counts client coordinates from the visual viewport while
+  // placing fixed elements against the layout one, which is what a hiding
+  // toolbar or a pinch zoom does. Measured rather than assumed, so a mark lands
+  // where the text it names is either way.
+  let originAt = null;
+  const forgetOrigin = () => {
+    originAt = null;
+  };
+  const origin = () => {
+    if (originAt) return originAt;
+    const host = document.getElementById(MARKS_ID);
+    if (!host) return { x: 0, y: 0 };
+    const box = host.getBoundingClientRect();
+    originAt = { x: box.left, y: box.top };
+    return originAt;
+  };
   const place = (el, x, y, w, h) => {
+    const from = origin();
+    x -= from.x;
+    y -= from.y;
     el.style.left = x + "px";
     el.style.top = y + "px";
     if (w != null) el.style.width = Math.max(w, 1) + "px";
@@ -833,17 +854,30 @@
     return known;
   };
   const forget = () => measures.clear();
-  const page = (b) => ({
-    top: b.top + window.scrollY,
-    bottom: b.bottom + window.scrollY,
-    left: b.left + window.scrollX,
-    right: b.right + window.scrollX,
-  });
+  // How far the document has been scrolled, read from the document rather than
+  // from `scrollY`. The two disagree while a page is bouncing at its end, and
+  // in a browser whose client coordinates follow the visual viewport rather
+  // than the layout one; a measurement kept in page coordinates would then be
+  // wrong by that difference for as long as it is kept.
+  const scrolled = () => {
+    const root = document.documentElement.getBoundingClientRect();
+    return { x: -root.left, y: -root.top };
+  };
+  const page = (b) => {
+    const by = scrolled();
+    return {
+      top: b.top + by.y,
+      bottom: b.bottom + by.y,
+      left: b.left + by.x,
+      right: b.right + by.x,
+    };
+  };
   const viewport = (b) => {
-    const top = b.top - window.scrollY;
-    const bottom = b.bottom - window.scrollY;
-    const left = b.left - window.scrollX;
-    const right = b.right - window.scrollX;
+    const by = scrolled();
+    const top = b.top - by.y;
+    const bottom = b.bottom - by.y;
+    const left = b.left - by.x;
+    const right = b.right - by.x;
     return { top, bottom, left, right, width: right - left, height: bottom - top };
   };
 
@@ -2974,6 +3008,9 @@
   // until the page settles and the pointer moves again.
   let scrolling = null;
   const onScroll = () => {
+    // The overlay's corner moves with a toolbar that hides as the page
+    // scrolls, so where a mark has to be put to land on its text moves too.
+    forgetOrigin();
     if (!scrolling) clearHover();
     clearTimeout(scrolling);
     scrolling = setTimeout(() => {
@@ -2984,7 +3021,18 @@
   document.addEventListener("scroll", onScroll, { capture: true, passive: true });
   // A new width lays the page out again, so nothing that was measured holds.
   window.addEventListener("resize", forget);
+  window.addEventListener("resize", forgetOrigin);
   window.addEventListener("resize", render);
+  // Zooming and a toolbar sliding away move the visible part of the page
+  // without scrolling the document.
+  if (window.visualViewport) {
+    for (const event of ["resize", "scroll"]) {
+      window.visualViewport.addEventListener(event, () => {
+        forgetOrigin();
+        render();
+      });
+    }
+  }
   // The panel wraps differently at a different width, so its height is not a
   // thing to measure once.
   window.addEventListener("resize", measureStatus);
