@@ -2702,13 +2702,37 @@
   // rewriting it drops the selection, and every compile would otherwise
   // flicker the page.
   let shownBody = null;
+  // Failing to load is only worth saying once it has lasted. The page asks for
+  // the document as soon as it opens, which is often before the first compile
+  // has landed, and a notice that is followed a moment later by the document
+  // itself says nothing except that the page was early.
+  const LOAD_GRACE = 3000;
+  let loadWait = null;
+  const cannotLoad = (res) => {
+    // The server has nothing yet and knows it; the compile will say when it
+    // does. The status panel already carries a compile's own errors.
+    if ((res && res.waiting) || compileErrors) return;
+    if (shownBody) return void showBanner("Cannot load the document");
+    if (loadWait) return;
+    loadWait = setTimeout(() => {
+      loadWait = null;
+      if (!shownBody && !compileErrors) showBanner("Cannot load the document");
+    }, LOAD_GRACE);
+  };
+  const loaded = () => {
+    clearTimeout(loadWait);
+    loadWait = null;
+    showBanner(null);
+  };
+
   const loadDocument = () =>
     getJson("/dev/html/doc")
       .then((res) => {
         if (!res || !res.ok) {
-          if (!compileErrors) showBanner("Cannot load the document");
+          cannotLoad(res);
           return;
         }
+        loaded();
         const doc = document.getElementById(DOC_ID);
         if (!doc) return;
         // The rendering and its map arrive together, so the ids in one always
@@ -2725,9 +2749,7 @@
         // did not, and the index is what everything else looks things up in.
         indexDocument();
       })
-      .catch(() => {
-        if (!compileErrors) showBanner("Cannot load the document");
-      });
+      .catch(() => cannotLoad(null));
 
   const loadPins = () =>
     getJson("/dev/html/pins").then((res) => {

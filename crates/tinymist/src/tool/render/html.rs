@@ -598,6 +598,11 @@ pub trait HtmlBody: Send + Sync {
     }
 }
 
+/// What the server says when it has nothing to serve yet. The page asks for the
+/// document as soon as it loads, which is often before the first compile has
+/// landed: that is something to wait for, not something to report.
+pub const NOT_COMPILED: &str = "nothing compiled yet";
+
 /// Holds the last compiled artifact, so both answers come from one document.
 pub struct ArtifactHtmlServer {
     /// The most recent successful compile.
@@ -611,7 +616,7 @@ impl HtmlBody for ArtifactHtmlServer {
     }
 
     fn rendering(&self) -> Result<(String, tinymist_annos::RenderMap), String> {
-        let art = self.last_art.lock().clone().ok_or("nothing compiled yet")?;
+        let art = self.last_art.lock().clone().ok_or(NOT_COMPILED)?;
         html_document_with_map(&art)
     }
 

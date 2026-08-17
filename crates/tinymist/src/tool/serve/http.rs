@@ -672,7 +672,11 @@ pub async fn make_http_server(
                                         "map": map,
                                     })
                                 }
-                                Err(err) => serde_json::json!({"ok": false, "error": err}),
+                                Err(err) => serde_json::json!({
+                                    "ok": false,
+                                    "waiting": err == crate::tool::render::html::NOT_COMPILED,
+                                    "error": err,
+                                }),
                             };
                             (payload.to_string(), "application/json")
                         }
