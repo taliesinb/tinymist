@@ -239,6 +239,11 @@
     return el.getAttribute("data-uid") || (el.localName === "svg" ? el.getAttribute("id") : null);
   };
 
+  // Whether an element holds anything a reader can see: words, or a picture.
+  const SEEN_INSIDE = "img,svg,math,table,hr,canvas,video,iframe";
+  const hasSubstance = (el) =>
+    !!el.textContent.trim() || !!el.querySelector(SEEN_INSIDE);
+
   const indexDocument = () => {
     forget();
     runs = [];
@@ -264,6 +269,10 @@
     // both means two frames around the same thing, one of them the width of
     // the column.
     blocks = blocks.filter((block) => {
+      // A block with nothing in it is not a place. The exporter writes the
+      // space between two paragraphs as an empty div, and offering it means a
+      // frame can be drawn around a gap.
+      if (!hasSubstance(block.el)) return false;
       const kids = [...block.el.children];
       if (kids.length !== 1 || block.el.childNodes.length !== 1) return true;
       const inner = byUid.get(uidOf(kids[0]));
