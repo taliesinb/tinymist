@@ -97,6 +97,35 @@
     color: color-mix(in oklab, var(--tm-fg) 55%, transparent);
   }
 
+  /* Browsing a big directory is reading a list of names rather than a page of
+     documents, so everything is a little smaller and a little closer: more of
+     it is in view, which is the point of the mode. */
+  .tm-browsing .tm-find input,
+  .tm-browsing .tm-letters button,
+  .tm-browsing .tm-file,
+  .tm-browsing .tm-name,
+  .tm-browsing .tm-when,
+  .tm-browsing .tm-notes,
+  .tm-browsing .tm-more {
+    font-size: 0.73rem;
+  }
+
+  .tm-browsing .tm-find input {
+    padding: 0.35rem 0.5rem;
+  }
+
+  .tm-browsing .tm-listing a,
+  .tm-browsing #tm-docs a {
+    padding: 0.4rem 0.6rem;
+  }
+
+  /* What is not being shown, between the beginning of the run and its end. */
+  .tm-more {
+    padding: 0.35rem 0.6rem;
+    color: color-mix(in oklab, var(--tm-fg) 45%, transparent);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+
   /* A directory of thousands is not a list to scroll: it is looked into. The
      search field and the letters are how, and they are there only when a
      directory is big enough to need them. */
@@ -224,7 +253,8 @@
     // How many rows are drawn at once. A directory of twenty thousand files is
     // not a list to scroll: it is looked into, so the page shows a screenful
     // and leaves the rest to the search field and the letters.
-    const PAGE = 16;
+    const HEAD = 13;
+    const TAIL = 2;
     // Below this a directory is just a list, and chrome for finding things in
     // it is chrome in the way.
     const BROWSE_FROM = 16;
@@ -338,15 +368,25 @@
             : letterOf(row) === letter);
         }
       }
-      const drawn = shown.slice(0, browsing ? PAGE : shown.length);
       docs.textContent = "";
-      for (const row of drawn) drawRow(row);
+      document.querySelector(".tm-listing").classList.toggle("tm-browsing", browsing);
+      // The first of them, then the last two, with what was skipped said in
+      // between: the end of a run is worth seeing — it says how far the letter
+      // reaches — and a page that stops at thirteen looks like a page that
+      // found thirteen.
+      const cut = browsing && shown.length > HEAD + TAIL + 1;
+      if (cut) {
+        for (const row of shown.slice(0, HEAD)) drawRow(row);
+        const li = document.createElement("li");
+        li.className = "tm-more";
+        li.textContent = `… ${shown.length - HEAD - TAIL} more`;
+        docs.append(li);
+        for (const row of shown.slice(-TAIL)) drawRow(row);
+      } else {
+        for (const row of shown) drawRow(row);
+      }
       empty.hidden = shown.length > 0;
-      count.textContent = browsing
-        ? shown.length > drawn.length
-          ? `${drawn.length} of ${shown.length}`
-          : `${shown.length}`
-        : "";
+      count.textContent = browsing ? `${shown.length}` : "";
     };
 
     const drawLetters = () => {
