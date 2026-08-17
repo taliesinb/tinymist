@@ -116,6 +116,15 @@ pub struct ServeArgs {
     #[clap(long = "icon-color", value_name = "HEX")]
     pub icon_color: Option<String>,
 
+    /// Publish this server on a tailnet, at `host` or `host/path`: the machine
+    /// is told to proxy that path to this server, the address to share is
+    /// printed, and the proxy is taken down again when this server stops.
+    /// Without a path, the server's own name is used — `--root-name`, or the
+    /// name of what is being served.
+    #[cfg(feature = "tailscale")]
+    #[clap(long = "tailscale-host", value_name = "HOST[/PATH]")]
+    pub tailscale_host: Option<String>,
+
     /// An origin to accept besides loopback, e.g. `http://typst` when this
     /// server is reached through `tailscale serve`. Without it the browser's
     /// `Origin` on the annotation websocket does not match the address this
@@ -365,6 +374,19 @@ pub fn derive_port(canonical: &Path, role: IconRole, salt: Option<&str>) -> u16 
 /// afterwards: a cache outliving the process that made it is litter.
 struct SiteGuard(std::sync::Arc<tinymist::tool::serve::SiteCache>);
 
+/// Takes the tailnet proxy down when this server stops.
+#[cfg(feature = "tailscale")]
+struct TailnetGuard(tinymist_tailscale::Mount);
+
+#[cfg(feature = "tailscale")]
+impl Drop for TailnetGuard {
+    fn drop(&mut self) {
+        if let Err(err) = tinymist_tailscale::withdraw(&self.0) {
+            log::warn!("cannot take down the tailnet proxy: {err}");
+        }
+    }
+}
+
 /// Withdraws this server's note when it stops.
 struct RegistryGuard(u16);
 
@@ -441,6 +463,17 @@ pub fn serve_main(args: ServeArgs) -> Result<()> {
     } else {
         args.port_salt.clone()
     };
+    // Published on a tailnet, the machine's name is what tells one server from
+    // another: two documents published from the same machine are two paths, and
+    // two machines publishing the same document are two servers.
+    #[cfg(feature = "tailscale")]
+    let salt = match (&args.tailscale_host, salt) {
+        (Some(host), None) => Some(host.split('/').next().unwrap_or(host).to_owned()),
+        (Some(host), Some(salt)) => {
+            Some(format!("{salt}{}", host.split('/').next().unwrap_or(host)))
+        }
+        (None, salt) => salt,
+    };
     let port = args
         .port
         .unwrap_or_else(|| derive_port(&canonical, role, salt.as_deref()));
@@ -498,6 +531,7 @@ pub fn serve_main(args: ServeArgs) -> Result<()> {
     };
     let root = args.root.clone().unwrap_or(root);
 
+    let mut allowed_origins = args.allowed_origins.clone();
     let name = args.root_name.clone().or_else(|| {
         tinymist::tool::serve::document_title(&entry).or_else(|| {
             canonical
@@ -505,6 +539,44 @@ pub fn serve_main(args: ServeArgs) -> Result<()> {
                 .map(|n| n.to_string_lossy().into_owned())
         })
     });
+
+    // Published on a tailnet: the proxy is set up before anything is served,
+    // since a reader given the address should find something at it, and taken
+    // down again on the way out.
+    #[cfg(feature = "tailscale")]
+    let _tailnet = match &args.tailscale_host {
+        Some(spec) => {
+            let called = args
+                .root_name
+                .clone()
+                .or_else(|| name.clone())
+                .unwrap_or_else(|| tinymist::tool::serve::slug_for(&canonical));
+            let mount = tinymist_tailscale::Mount::parse(spec, &called)
+                .map_err(|err| error_once!("cannot publish on the tailnet", err: err))?;
+            tinymist_tailscale::publish(&mount, port)
+                .map_err(|err| error_once!("cannot publish on the tailnet", err: err))?;
+            // Everything a page names is named from the reader's side of the
+            // proxy, which is under the path rather than at the root.
+            tinymist::tool::webapp::set_public_base(&mount.path);
+            for origin in mount.origins() {
+                allowed_origins.push(origin);
+            }
+            eprintln!("  shared    {}", mount.url());
+            if let Some(full) = mount.full_url() {
+                eprintln!("            {full}");
+            }
+            // Taken down however this server stops: a guard covers the ordinary
+            // way out, and this covers being told to stop.
+            let held = mount.clone();
+            tinymist::tool::serve::at_shutdown(move || {
+                if let Err(err) = tinymist_tailscale::withdraw(&held) {
+                    log::warn!("cannot take down the tailnet proxy: {err}");
+                }
+            });
+            Some(TailnetGuard(mount))
+        }
+        None => None,
+    };
 
     // What the document server needs, said once: no command line to format and
     // parse back, and nothing about a page renderer this mode does not use.
@@ -521,7 +593,7 @@ pub fn serve_main(args: ServeArgs) -> Result<()> {
             ..Default::default()
         },
         annotate: args.anno,
-        allowed_origins: args.allowed_origins.clone(),
+        allowed_origins: allowed_origins.clone(),
         data_plane_host: format!("{}:{port}", args.host),
         identity: tinymist::tool::webapp::WebAppIdentity {
             role,

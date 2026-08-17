@@ -67,6 +67,7 @@ strum.workspace = true
 sync-ls = { workspace = true, features = ["lsp", "server", "system"] }
 tinymist = { workspace = true, default-features = false, features = ["system"] }
 tinymist-annos.workspace = true
+tinymist-tailscale = { workspace = true, optional = true }
 tinymist-assets = { workspace = true }
 tinymist-debug.workspace = true
 tinymist-l10n.workspace = true
@@ -98,6 +99,10 @@ walkdir.workspace = true
 dapts.workspace = true
 
 [features]
+# Publishing a served document on a tailnet, which means running the
+# `tailscale` command. On by default and inert unless asked for.
+tailscale = ["dep:tinymist-tailscale"]
+
 default = [
     "cli",
     "battery",
@@ -108,6 +113,7 @@ default = [
     "open",
     "preview",
     "serve",
+    "tailscale",
     "trace",
     "embed-fonts",
     "no-content-hint",

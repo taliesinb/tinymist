@@ -1,0 +1,15 @@
+[package]
+name = "tinymist-tailscale"
+description = "Publishing a local tinymist server on a tailnet."
+authors.workspace = true
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+homepage.workspace = true
+repository.workspace = true
+
+[dependencies]
+log.workspace = true
+
+[lints]
+workspace = true

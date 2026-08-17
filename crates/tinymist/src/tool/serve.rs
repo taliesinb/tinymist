@@ -165,14 +165,40 @@ pub trait DocumentSite: Send + Sync + 'static {
     ) -> futures::future::BoxFuture<'a, Option<Arc<DocServices>>>;
 }
 
+/// Something to do on the way out, whatever asks the server to stop.
+///
+/// A guard on the stack runs when the stack unwinds, and a process killed with
+/// a signal does not unwind. This is where anything that must happen anyway
+/// goes: taking down a proxy, clearing a cache.
+static ON_SHUTDOWN: std::sync::Mutex<Vec<Box<dyn FnOnce() + Send>>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Adds something to do on the way out.
+pub fn at_shutdown(task: impl FnOnce() + Send + 'static) {
+    if let Ok(mut held) = ON_SHUTDOWN.lock() {
+        held.push(Box::new(task));
+    }
+}
+
 /// What a server does on its way out, however it was asked: withdraw its note
-/// from the register, clear up what it rendered, and go.
+/// from the register, take down anything it put up, clear up what it rendered,
+/// and go.
 pub fn shutdown() -> ! {
+    run_shutdown_tasks();
+    std::process::exit(0);
+}
+
+/// The same, without exiting: for a caller that is on its way out anyway.
+pub fn run_shutdown_tasks() {
     if let Some(port) = crate::tool::registry::my_port() {
         crate::tool::registry::withdraw_server(port);
     }
+    if let Ok(mut held) = ON_SHUTDOWN.lock() {
+        for task in held.drain(..) {
+            task();
+        }
+    }
     cache::drop_site_cache();
-    std::process::exit(0);
 }
 
 /// The extensions a directory hands over as they are.

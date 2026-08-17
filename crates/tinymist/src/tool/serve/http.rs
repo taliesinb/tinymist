@@ -295,7 +295,7 @@ pub async fn make_http_server(
                         // for a stylesheet inside a directory. A document's own
                         // page keeps the relative name, since there the tail
                         // after the document *is* the endpoint.
-                        let prefix = crate::tool::webapp::role_prefix(role);
+                        let prefix = crate::tool::webapp::public_prefix(role);
                         let page = super::listing_html()
                             .replace("href=\"dev/", &format!("href=\"{prefix}dev/"))
                             .replace("src=\"dev/", &format!("src=\"{prefix}dev/"));
@@ -919,7 +919,7 @@ pub async fn make_http_server(
                     }
                     let target = format!(
                         "{}{}",
-                        crate::tool::webapp::role_prefix(identity.role),
+                        crate::tool::webapp::public_prefix(identity.role),
                         raw_path.trim_start_matches('/')
                     );
                     let res = hyper::Response::builder()

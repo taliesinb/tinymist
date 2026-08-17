@@ -100,6 +100,42 @@ pub fn build_stamp() -> String {
 /// annotator, whatever document it names, so a document opened from a listing
 /// lands in the same app as one opened directly. The document is the rest of
 /// the path, which is how one server comes to serve a whole directory.
+/// What this server's addresses look like from outside it.
+///
+/// A server binds loopback and is read there, so a page can name things from
+/// the root: `/a/`, `/icon/anno-192.png`. Published under a path on a tailnet —
+/// `tailscale serve --set-path=/report` — the proxy strips that path before
+/// passing the request on, so the server still sees `/a/`, while the browser is
+/// at `/report/a/` and would resolve a root-relative name to the wrong place.
+/// This is the prefix to write in front of the names a page is given.
+static PUBLIC_BASE: std::sync::RwLock<String> = std::sync::RwLock::new(String::new());
+
+/// Says that this server is reached under a path.
+pub fn set_public_base(base: &str) {
+    let base = base.trim_end_matches('/').to_owned();
+    if let Ok(mut held) = PUBLIC_BASE.write() {
+        *held = base;
+    }
+}
+
+/// The prefix, empty unless this server is published under a path.
+pub fn public_base() -> String {
+    PUBLIC_BASE
+        .read()
+        .map(|held| held.clone())
+        .unwrap_or_default()
+}
+
+/// A path as a page should name it: the public base, then the path.
+pub fn public_path(path: &str) -> String {
+    format!("{}{path}", public_base())
+}
+
+/// A mode's prefix as a page should name it.
+pub fn public_prefix(role: IconRole) -> String {
+    public_path(role_prefix(role))
+}
+
 pub fn role_prefix(role: IconRole) -> &'static str {
     match role {
         IconRole::Lsp => "/p/",
@@ -133,13 +169,13 @@ pub fn role_of_path(path: &str) -> Option<(IconRole, &str)> {
 /// and treats in-scope links as belonging to that app — which is what the
 /// per-mode prefix is for.
 pub fn mode_head(html: &str, identity: &WebAppIdentity, port: u16) -> String {
-    let prefix = role_prefix(identity.role);
+    let prefix = public_prefix(identity.role);
     let manifest = format!("{prefix}manifest.webmanifest");
-    let (manifest, icon) = match identity.role {
-        IconRole::Lsp => (manifest.as_str(), "/icon/lsp-192.png"),
-        IconRole::Serve => (manifest.as_str(), "/icon/serve-192.png"),
-        IconRole::Annotate => (manifest.as_str(), "/icon/anno-192.png"),
-    };
+    let icon = public_path(match identity.role {
+        IconRole::Lsp => "/icon/lsp-192.png",
+        IconRole::Serve => "/icon/serve-192.png",
+        IconRole::Annotate => "/icon/anno-192.png",
+    });
     let title = identity.title(port);
     // Where this page is mounted, said by the server rather than guessed by the
     // page: the same page is served under `/a/` when it is annotated and `/v/`
@@ -240,14 +276,14 @@ pub fn web_manifest(path: &str, port: u16, identity: &WebAppIdentity) -> Option<
     // scope is the prefix and every document under it belongs to that app.
     let (identity, start, scope) = match role_of_path(path) {
         Some((role, "manifest.webmanifest")) => {
-            let prefix = role_prefix(role);
-            (identity.with_role(role), prefix, prefix)
+            let prefix = public_prefix(role);
+            (identity.with_role(role), prefix.clone(), prefix)
         }
         // The bare one names whatever this server is, for a browser that asks
         // before being redirected into a prefix.
         _ if path == "/manifest.webmanifest" => {
-            let prefix = role_prefix(identity.role);
-            (identity.clone(), prefix, prefix)
+            let prefix = public_prefix(identity.role);
+            (identity.clone(), prefix.clone(), prefix)
         }
         _ => return None,
     };
@@ -260,6 +296,7 @@ pub fn web_manifest(path: &str, port: u16, identity: &WebAppIdentity) -> Option<
     let background = format!("#{:02x}{:02x}{:02x}", bg[0], bg[1], bg[2]);
     let name = identity.title(port);
     let short = identity.short_title(port);
+    let base = public_base();
     Some(format!(
         r##"{{
   "name": "{name}",
@@ -269,8 +306,8 @@ pub fn web_manifest(path: &str, port: u16, identity: &WebAppIdentity) -> Option<
   "display": "standalone",
   "background_color": "{background}",
   "icons": [
-    {{ "src": "/icon/{icon}-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable" }},
-    {{ "src": "/icon/{icon}-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }}
+    {{ "src": "{base}/icon/{icon}-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable" }},
+    {{ "src": "{base}/icon/{icon}-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }}
   ]
 }}
 "##
