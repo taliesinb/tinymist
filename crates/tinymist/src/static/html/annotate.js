@@ -1619,8 +1619,14 @@
     const marked = [];
     takenBlocks.clear();
     for (const pin of list) {
-      const geom = geometryOf(pin);
+      const geom = geometryOf(pin) || heldGeometry(pin);
       if (!geom || !geom.boxes.length) continue;
+      // An annotation the server has not sent back yet is drawn where it was
+      // put, even once the rendering it was put against has been replaced: the
+      // ids in a new rendering are new, so its location stops meaning anything
+      // until the server's own copy of it arrives. It would otherwise vanish
+      // for as long as that takes.
+      if (pin.state) holdGeometry(pin, geom);
       const on = (geom.block && geom.block.el) || geom.el;
       if (on) {
         let kinds = takenBlocks.get(on);
@@ -1638,6 +1644,20 @@
     for (const el of [...host.children]) {
       if (!el.dataset.seen && !el.classList.contains(HOVER_CLASS)) el.remove();
     }
+  };
+
+  // The last place a pin was drawn, in page coordinates so that it stays with
+  // the text it was put on while the page scrolls.
+  const holdGeometry = (pin, geom) => {
+    pin.held = {
+      scope: geom.scope,
+      boxes: geom.boxes.map((b) => page(b)),
+    };
+  };
+  const heldGeometry = (pin) => {
+    if (!pin.held) return null;
+    const boxes = pin.held.boxes.map((b) => viewport(b));
+    return { scope: pin.held.scope, boxes, caret: boxes[0] };
   };
 
   // ------------------------------------------------------- hover previews
