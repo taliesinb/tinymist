@@ -6880,6 +6880,7 @@ dependencies = [
  "tinymist-query",
  "tinymist-render",
  "tinymist-std",
+ "tinymist-tailscale",
  "tinymist-task",
  "tokio",
  "tokio-util",
@@ -7203,6 +7204,13 @@ dependencies = [
  "wasm-bindgen",
  "web-time",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "tinymist-tailscale"
+version = "0.15.4-rc1"
+dependencies = [
+ "log",
 ]
 
 [[package]]
