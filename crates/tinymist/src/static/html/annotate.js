@@ -198,8 +198,17 @@
     }
     return out;
   };
+  // The letters this page has given out as well as the ones the server has: a
+  // second draft written before the first is sent would otherwise be given the
+  // same letter, and the two would be told apart by nothing.
   const nextLetter = () =>
-    indexLetter(Math.max(0, ...pins.map((p) => letterIndex(p.letter))) + 1);
+    indexLetter(
+      Math.max(
+        0,
+        ...pins.map((p) => letterIndex(p.letter)),
+        ...local.map((p) => letterIndex(p.letter)),
+      ) + 1,
+    );
 
   // ------------------------------------------------------------- the index
   // Every part of the rendering that can be referred to carries `data-uid`, and
@@ -1100,7 +1109,6 @@
       drawLetter(glyph, pin);
       glyph.style.opacity = opacity;
       place(glyph, x + w - glyph.__w - 3, y + h - glyph.__h - 2);
-      if (dim) return;
       // The left side reaches out into the margin: there is nothing there to
       // hit by mistake, and a mark that has to be hit within five pixels is a
       // mark that gets missed.
@@ -1163,7 +1171,7 @@
           const glyph = mark(host, key + ":letter", "tm-glyph");
           drawLetter(glyph, pin);
           place(glyph, ring.left - 4 - glyph.__w, ring.top + ring.height / 2 - glyph.__h / 2);
-          if (!dim) {
+          {
             const hit = mark(host, key + ":hit", "tm-hit");
             place(
               hit,
@@ -1180,7 +1188,7 @@
         el.style.opacity = opacity;
         drawBubble(el, pin, "right", dim, state === "pending");
         place(el, line.point - CHIP_GAP - el.__w, line.mid - el.__h / 2);
-        if (!dim) {
+        {
           const hit = mark(host, key + ":hit", "tm-hit");
           place(hit, line.left, line.top, line.width, line.height);
           openFor(hit, pin);
@@ -1204,7 +1212,7 @@
       drawLetter(glyph, pin);
       // Right-aligned against the strip, so the letter reads as its label.
       place(glyph, left - 3 - glyph.__w, (top + bot) / 2 - glyph.__h / 2);
-      if (!dim) {
+      {
         const hit = mark(host, key + ":hit", "tm-hit");
         place(hit, left - 12, top, 12 + STRIP_W + 5, Math.max(bot - top, 4));
         openFor(hit, pin);
@@ -1222,7 +1230,7 @@
       glyph.style.opacity = opacity;
       drawLetter(glyph, pin);
       place(glyph, box.left - 16, box.top - 2);
-      if (!dim) {
+      {
         const hit = mark(host, key + ":hit", "tm-hit");
         place(hit, box.left - 6, box.top, 14, box.height);
         openFor(hit, pin);
@@ -1240,7 +1248,7 @@
       glyph.style.opacity = opacity;
       drawLetter(glyph, pin);
       place(glyph, box.right + 4, box.top - 6);
-      if (!dim) {
+      {
         const hit = mark(host, key + ":hit", "tm-hit");
         place(hit, box.left - 20, box.top - 6, box.width + 40, 14);
         openFor(hit, pin);
@@ -1262,7 +1270,7 @@
       glyph.style.opacity = opacity;
       drawLetter(glyph, pin);
       place(glyph, caretX + CARET_W + 2, boxes[0].bottom + 1);
-      if (!dim) {
+      {
         // Down over the caret and its letter, not merely over the line above
         // them: what the eye takes for the annotation is what the pointer has
         // to be able to reach.
@@ -1286,7 +1294,6 @@
       paint(el, false);
       el.style.opacity = opacity;
       place(el, b.left, b.bottom + 1, b.width, 2);
-      if (dim) return;
       // Down to the underline, not just to the text: the mark is part of the
       // annotation, and pointing at it must open that annotation rather than
       // offer a second one over the same words.
@@ -1603,8 +1610,14 @@
   // server's, and their state says how: `draft` while it is being written,
   // `pending` while the server has it and the answer has not arrived.
   let local = [];
-  // The id the annotation being written goes under, which is never a uuid.
+  // The id a page-held annotation goes under, which is never one of the
+  // server's. Each one gets its own: several may be waiting to be sent, and
+  // several may be half written.
   const DRAFT_ID = "tinymist-draft";
+  let drafted = 0;
+  const draftId = () => `${DRAFT_ID}:${++drafted}:${Date.now()}`;
+  // The draft the window is open on, if it is open on one.
+  let composing = null;
   const dropLocal = (id) => {
     local = local.filter((pin) => pin.uuid !== id);
   };
@@ -1836,7 +1849,7 @@
     if (box && composeActive && !force) {
       const ta = box.querySelector("textarea");
       const text = ta ? ta.value.trim() : "";
-      const draft = local.find((pin) => pin.uuid === DRAFT_ID);
+      const draft = local.find((pin) => pin.uuid === composing);
       if (text && draft) {
         draft.content = text;
         box.remove();
@@ -1845,6 +1858,7 @@
           escHandler = null;
         }
         composeActive = false;
+        composing = null;
         openUuid = null;
         openSig = null;
         render();
@@ -1856,10 +1870,11 @@
       document.removeEventListener("keydown", escHandler, true);
       escHandler = null;
     }
-    // The draft is being thrown away, so there is nothing to take up again.
+    // This draft is being thrown away, so there is nothing to take up again.
     if (composeActive) forgetComposing();
     composeActive = false;
-    dropLocal(DRAFT_ID);
+    if (composing) dropLocal(composing);
+    composing = null;
     openUuid = null;
     openSig = null;
     render();
@@ -2032,7 +2047,25 @@
     if (pin.state === "draft") {
       const kind = pin.location && pin.location.type === "word" ? "comment" : pin.location.type;
       compose(kind, pin.location, pin);
+      return;
     }
+    // Sent, and not answered for yet. It can be read but not changed: the
+    // server has a copy of these words, and a second version of them here
+    // would be a third thing that is neither what was sent nor what is on the
+    // page. Waiting is the only thing to do with it.
+    const parts = shell(pin.letter || "?", "sending comment", []);
+    if (!parts) return;
+    openUuid = pin.uuid;
+    openSig = null;
+    const hue = letterColor(pin.letter);
+    parts.content.append(msgRow(hue, "you", pin.time || new Date().toISOString(), pin.content, true));
+    const note = document.createElement("div");
+    note.className = "tm-locked";
+    note.textContent = online
+      ? "Waiting for the server."
+      : "Waiting for the connection; it is kept here until then.";
+    parts.content.append(note);
+    render();
   };
 
   const showAnnot = (pin, restore) => {
@@ -2113,6 +2146,10 @@
   const compose = (kind, location, existing) => {
     const letter = existing ? existing.letter : nextLetter();
     const color = existing ? existing.color : nextColor();
+    // Writing an annotation that was left half written takes up that draft;
+    // writing a new one starts one of its own. Either way the window is open on
+    // exactly one, and the others stay on the page.
+    const draftUuid = (existing && existing.uuid) || draftId();
     const submit = (field) => {
       const text = field.value.trim();
       if (text) {
@@ -2121,7 +2158,7 @@
         // The mark stays where it was put while the server has it, so that
         // pressing return does not make the annotation disappear and come back
         // a moment later. It travels at twice the speed until then.
-        const held = `${DRAFT_ID}:${Date.now()}`;
+        const held = draftId();
         local.push({
           uuid: held,
           state: "pending",
@@ -2129,10 +2166,12 @@
           color,
           location,
           content: text,
+          time: new Date().toISOString(),
           draft,
         });
         send(held);
       }
+      dropLocal(draftUuid);
       forgetComposing();
       closeBox(true);
     };
@@ -2152,6 +2191,7 @@
         location,
         letter,
         color,
+        uuid: draftUuid,
         render: renderId,
         text: ta.value,
         at_: [ta.selectionStart, ta.selectionEnd],
@@ -2164,6 +2204,34 @@
       ta.dispatchEvent(new Event("input"));
     }
     remember();
+    // A draft the window was opened on, with nothing done to it yet, is
+    // deleted by backspace: the annotation was made by a click and this undoes
+    // that click. Anything else — a keystroke, a click in the window — makes it
+    // an ordinary backspace over the text.
+    let untouched = true;
+    const touched = () => {
+      untouched = false;
+    };
+    parts.box.addEventListener("mousedown", touched);
+    ta.addEventListener("input", touched);
+    ta.addEventListener(
+      "keydown",
+      (e) => {
+        if (!untouched) return;
+        if (e.key === "Backspace") {
+          e.preventDefault();
+          e.stopImmediatePropagation();
+          dropLocal(draftUuid);
+          composing = null;
+          forgetComposing();
+          closeBox(true);
+          render();
+          return;
+        }
+        if (e.key.length === 1 || e.key === "Enter" || e.key === "Delete") touched();
+      },
+      true,
+    );
     ta.focus();
     if (existing && existing.at_) {
       const [from, to] = existing.at_;
@@ -2171,9 +2239,10 @@
         ta.setSelectionRange(from, to);
       } catch (err) {}
     }
-    dropLocal(DRAFT_ID);
+    dropLocal(draftUuid);
+    composing = draftUuid;
     local.push({
-      uuid: DRAFT_ID,
+      uuid: draftUuid,
       state: "draft",
       letter,
       color,
@@ -3179,6 +3248,7 @@
     const held = takeComposing();
     if (!held) return;
     compose(held.kind || "comment", held.location, {
+      uuid: held.uuid,
       letter: held.letter,
       color: held.color,
       content: held.text || "",
