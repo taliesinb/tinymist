@@ -21,6 +21,43 @@ use crate::tool::registry::{self, ServerNote};
 /// point of a derived port is that a document keeps the URL it had yesterday.
 pub const HUB_PORT: u16 = 25000;
 
+/// Where the hub keeps a record of what it was asked to do.
+///
+/// One file per hub, named by its process id, beside the register and the
+/// captures: a client starts a hub of its own per session, so a file per
+/// process is a file per session, and a session that is still running is the
+/// file still being written to.
+fn log_path() -> Option<&'static std::path::Path> {
+    static PATH: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| {
+        let dir = registry::registry_dir()
+            .parent()?
+            .join("mcp")
+            .join("logs");
+        std::fs::create_dir_all(&dir).ok()?;
+        Some(dir.join(format!("{}.jsonl", std::process::id())))
+    })
+    .as_deref()
+}
+
+/// Writes one line of the record.
+///
+/// Best effort: a hub that cannot write its log is a hub that still answers.
+fn note(kind: &str, fields: &[(&str, Value)]) {
+    let Some(path) = log_path() else {
+        return;
+    };
+    use std::io::Write;
+    let line = tinymist_project::event_line(kind, fields);
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(file, "{line}");
+    }
+}
+
+/// The number the two lines of a call share, so that a call and what came of
+/// it can be read as one thing.
+static NEXT_CALL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// The tools the hub owns, as opposed to those it forwards.
 fn hub_tools() -> Value {
     json!([
@@ -266,7 +303,32 @@ pub fn handle(request: Value) -> Option<Value> {
                 .unwrap_or_default()
                 .to_owned();
             let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
-            Ok(call(&name, &args))
+            // What was asked, and afterwards how long it took and whether it
+            // worked. Not what came back: an answer may be a picture, and a
+            // record nobody can read through is a record nobody reads.
+            let call_id = NEXT_CALL.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            note(
+                "tool_call",
+                &[
+                    ("id", call_id.into()),
+                    ("cmd", name.clone().into()),
+                    ("args", args.clone()),
+                ],
+            );
+            let began = std::time::Instant::now();
+            let answer = call(&name, &args);
+            note(
+                "tool_call_result",
+                &[
+                    ("id", call_id.into()),
+                    ("taken", began.elapsed().as_secs_f64().into()),
+                    (
+                        "ok",
+                        (!answer.get("isError").and_then(Value::as_bool).unwrap_or(false)).into(),
+                    ),
+                ],
+            );
+            Ok(answer)
         }
         other => Err(format!("no such method: {other}")),
     };
@@ -391,6 +453,13 @@ fn shellexpand(path: &str) -> String {
 /// to have been listening already.
 pub fn serve_stdio() -> std::io::Result<()> {
     use std::io::{BufRead, Write};
+    note(
+        "initialized",
+        &[
+            ("pid", std::process::id().into()),
+            ("version", env!("CARGO_PKG_VERSION").into()),
+        ],
+    );
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
     for line in stdin.lock().lines() {
@@ -419,6 +488,8 @@ pub fn serve_stdio() -> std::io::Result<()> {
             stdout.flush()?;
         }
     }
+    // Stdin closed, which is how a client says it is finished with its hub.
+    note("shutdown", &[("reason", "the client closed the connection".into())]);
     Ok(())
 }
 

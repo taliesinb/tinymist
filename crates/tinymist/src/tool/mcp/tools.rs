@@ -203,13 +203,16 @@ fn tools() -> Vec<Tool> {
             name: "get_annotation_capture",
             title: "See what an annotation points at",
             description: "Returns an image of what a graphical annotation is about — a plot, a \
-                          diagram, a framed drawing — together with anything the reader drew on \
-                          top of it. The document is source, so this is the only way to see what \
-                          the reader saw. Whatever the reader scribbled on it — a stroke round \
-                          the part they mean, a cross where they mean it — is drawn on top. \
+                          diagram, a framed drawing — with whatever the reader scribbled on it \
+                          drawn on top: a stroke around the part they mean, a ring around a \
+                          place. The document is source, so this is the only way to see what \
+                          the reader saw. The scribbles are drawn in red at half opacity, so \
+                          that what is under them can still be read; that is not the colour the \
+                          reader drew in, which is the annotation's own and means nothing here. \
                           Defaults to the most recent capture; earlier ones show the same \
                           drawing before it changed. Examples: {\"uuid\": \"q\"}; {\"uuid\": \
-                          \"q\", \"scribbles\": false} for the drawing bare.",
+                          \"q\", \"scribbles\": false} for the picture bare; {\"uuid\": \"q\", \
+                          \"ink\": \"own\", \"opacity\": 1} to see them as the reader did.",
             schema: || {
                 schema(
                     json!({
@@ -217,6 +220,8 @@ fn tools() -> Vec<Tool> {
                         "index": {"type": "integer", "description": "Which capture: 0 is the most recent, 1 the one before it. Default 0."},
                         "hash": optional_string("A capture's hash, when you want that exact one."),
                         "scribbles": {"type": "boolean", "description": "Draw what the reader scribbled on it. Default true; pass false to see the picture bare."},
+                        "ink": optional_string("What colour to draw the scribbles in: a CSS colour, or \"own\" for the colour the reader drew in. Default red."),
+                        "opacity": {"type": "number", "description": "How solid the scribbles are, from 0 to 1. Default 0.5, so that what is under them can be read."},
                         "scale": {"type": "number", "description": "Size, as a multiple of the drawing's own. Default is half size, or less when that would still be over 1000px on the long edge."},
                         "document": optional_string("Which document, when the server holds several."),
                     }),
@@ -783,15 +788,34 @@ async fn call_tool(site: &Arc<dyn DocumentSite>, name: &str, args: &Value) -> Re
             };
             let marks = marks.as_slice();
             let scale = args.get("scale").and_then(Value::as_f64).map(|s| s as f32);
+            // How the scribbles are painted onto it. Red and half solid by
+            // default, which is not what the reader saw: on the page a
+            // scribble is in its annotation's colour, and here what matters is
+            // that the picture under it can still be read.
+            let asked = text("ink");
+            let ink = capture::Ink {
+                color: match asked.as_deref() {
+                    Some("own") => None,
+                    Some(color) => Some(color),
+                    None => Some("#ff0000"),
+                },
+                opacity: args
+                    .get("opacity")
+                    .and_then(Value::as_f64)
+                    .map(|value| value as f32)
+                    .unwrap_or(0.5),
+            };
             // A capture the page rasterised is already a picture, so the marks
             // are drawn over it rather than into it, and the size it was taken
             // at is the size it is read at.
             let png = match chosen.fmt.as_str() {
-                "png" => capture::png_with_marks(&source, marks, chosen.width, chosen.height)?,
+                "png" => {
+                    capture::png_with_marks(&source, marks, chosen.width, chosen.height, ink)?
+                }
                 "svg" => {
                     let svg = String::from_utf8(source)
                         .map_err(|_| "the capture is not text".to_owned())?;
-                    let drawn = capture::with_marks(&svg, marks, chosen.width, chosen.height);
+                    let drawn = capture::with_marks(&svg, marks, chosen.width, chosen.height, ink);
                     capture::png(&drawn, scale)?
                 }
                 other => return Err(format!("captures stored as {other} cannot be rendered")),

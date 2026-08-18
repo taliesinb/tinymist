@@ -105,17 +105,43 @@ pub fn read(hash: &str, fmt: &str) -> Option<Vec<u8>> {
 
 
 
-/// The reader's marks, as SVG to paint over a capture.
+/// How a scribble is painted onto a capture, for whoever is being handed it.
+///
+/// Not as the reader saw it. On the page a scribble is in its annotation's own
+/// colour and solid, which is what tells one annotation's marks from another's;
+/// a capture is one annotation's picture, so the colour is free, and what
+/// matters instead is that the picture underneath can still be read. Hence red
+/// and half-transparent, and a ring rather than a cross for a place: a cross
+/// sits on the letter it means, and a ring goes round it.
+#[derive(Debug, Clone, Copy)]
+pub struct Ink<'a> {
+    /// What colour to draw them in, or `None` for the colour they were drawn
+    /// in.
+    pub color: Option<&'a str>,
+    /// How solid, from 0 to 1.
+    pub opacity: f32,
+}
+
+impl Default for Ink<'_> {
+    fn default() -> Self {
+        Self {
+            color: Some("#ff0000"),
+            opacity: 0.5,
+        }
+    }
+}
+
+/// The marks of some scribbles, as SVG to paint over a capture.
 ///
 /// The file holds shapes and nothing else, so everything about how a mark looks
 /// is decided here: round joins and caps, because a pen has them, and a clip to
 /// the picture, because a mark that ran past the edge of what it was drawn on
 /// is about the picture only as far as the picture goes.
-pub fn marks_svg(marks: &[tinymist_annos::Mark], width: u32, height: u32) -> String {
+pub fn marks_svg(marks: &[tinymist_annos::Mark], width: u32, height: u32, ink: Ink) -> String {
     use tinymist_annos::Mark;
     let mut out = String::new();
     for mark in marks {
-        let color = escape(mark.color());
+        let color = escape(ink.color.unwrap_or_else(|| mark.color()));
         match mark {
             Mark::Path { .. } => {
                 let points = mark.points();
@@ -130,25 +156,15 @@ pub fn marks_svg(marks: &[tinymist_annos::Mark], width: u32, height: u32) -> Str
                     mark.width(),
                 ));
             }
-            // A cross, which is what a hand makes when it means "here": a dot
-            // is easily read as part of the picture, and two strokes are not.
-            Mark::Point { x, y, width, .. } => {
-                let reach = width;
-                out.push_str(&format!(
-                    "<path d=\"M{:.1} {:.1} L{:.1} {:.1} M{:.1} {:.1} L{:.1} {:.1}\" \
-                     fill=\"none\" stroke=\"{color}\" stroke-width=\"{:.2}\" \
-                     stroke-linecap=\"round\"/>",
-                    x - reach,
-                    y - reach,
-                    x + reach,
-                    y + reach,
-                    x - reach,
-                    y + reach,
-                    x + reach,
-                    y - reach,
-                    width * 0.55,
-                ));
-            }
+            // A ring around the place rather than a cross on it: what a reader
+            // means by a point is usually the thing under it. Drawn thinner
+            // than the pen would, so that the ring encloses rather than fills.
+            Mark::Point { x, y, width, .. } => out.push_str(&format!(
+                "<circle cx=\"{x:.1}\" cy=\"{y:.1}\" r=\"{:.2}\" fill=\"none\" \
+                 stroke=\"{color}\" stroke-width=\"{:.2}\"/>",
+                width,
+                (width * 0.55 - 1.5).max(1.0),
+            )),
         }
     }
     if out.is_empty() {
@@ -156,8 +172,82 @@ pub fn marks_svg(marks: &[tinymist_annos::Mark], width: u32, height: u32) -> Str
     }
     format!(
         "<clipPath id=\"tm-marks\"><rect x=\"0\" y=\"0\" width=\"{width}\" \
-         height=\"{height}\"/></clipPath><g clip-path=\"url(#tm-marks)\">{out}</g>"
+         height=\"{height}\"/></clipPath><g clip-path=\"url(#tm-marks)\" \
+         opacity=\"{:.2}\">{out}</g>",
+        ink.opacity.clamp(0.0, 1.0),
     )
+}
+
+/// What a colour may contain, so that a value from a page cannot close the
+/// attribute it is written into.
+fn escape(color: &str) -> String {
+    color
+        .chars()
+        .filter(|ch| {
+            ch.is_ascii_alphanumeric() || matches!(ch, '#' | '(' | ')' | ',' | '.' | '%' | ' ')
+        })
+        .collect()
+}
+
+/// Puts a scribble's marks on top of a capture that is SVG.
+///
+/// They are in the drawing's own coordinates, so they go in just before the
+/// drawing ends, which is what "on top" means in SVG.
+pub fn with_marks(
+    svg: &str,
+    marks: &[tinymist_annos::Mark],
+    width: u32,
+    height: u32,
+    ink: Ink,
+) -> String {
+    let drawn = marks_svg(marks, width, height, ink);
+    if drawn.is_empty() {
+        return svg.to_owned();
+    }
+    match svg.rfind("</svg>") {
+        Some(at) => format!("{}{drawn}{}", &svg[..at], &svg[at..]),
+        None => svg.to_owned(),
+    }
+}
+
+/// Draws a scribble's marks over a capture that is already a picture.
+///
+/// A capture the page rasterised is PNG, so the marks cannot be put inside it
+/// the way they are put inside an SVG. They are rendered over it instead, at
+/// the size the picture was taken at, which is the size their coordinates are
+/// in.
+pub fn png_with_marks(
+    png: &[u8],
+    marks: &[tinymist_annos::Mark],
+    width: u32,
+    height: u32,
+    ink: Ink,
+) -> Result<Vec<u8>, String> {
+    let mut pixmap = resvg::tiny_skia::Pixmap::decode_png(png)
+        .map_err(|err| format!("cannot read the capture as PNG: {err}"))?;
+    let (w, h) = (width.max(1), height.max(1));
+    let drawn = marks_svg(marks, w, h, ink);
+    if drawn.is_empty() {
+        return pixmap
+            .encode_png()
+            .map_err(|err| format!("cannot encode the capture as PNG: {err}"));
+    }
+    let svg = format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{w}\" height=\"{h}\" \
+         viewBox=\"0 0 {w} {h}\">{drawn}</svg>"
+    );
+    let tree = resvg::usvg::Tree::from_str(&svg, &resvg::usvg::Options::default())
+        .map_err(|err| format!("cannot read the marks as SVG: {err}"))?;
+    // The picture was rasterised at whatever the reader's screen does, so it
+    // is not the size the marks are measured in; the marks are scaled to it.
+    let scale = resvg::tiny_skia::Transform::from_scale(
+        pixmap.width() as f32 / w as f32,
+        pixmap.height() as f32 / h as f32,
+    );
+    resvg::render(&tree, scale, &mut pixmap.as_mut());
+    pixmap
+        .encode_png()
+        .map_err(|err| format!("cannot encode the capture as PNG: {err}"))
 }
 
 /// A curve through the points a stroke was drawn through.
@@ -189,75 +279,6 @@ fn curve_through(points: &[(f32, f32)]) -> String {
     path
 }
 
-/// What a colour may contain, so that a value from a page cannot close the
-/// attribute it is written into.
-fn escape(color: &str) -> String {
-    color
-        .chars()
-        .filter(|ch| {
-            ch.is_ascii_alphanumeric() || matches!(ch, '#' | '(' | ')' | ',' | '.' | '%' | ' ')
-        })
-        .collect()
-}
-
-/// Puts a scribble's marks on top of a capture that is SVG.
-///
-/// They are in the drawing's own coordinates, so they go in just before the
-/// drawing ends, which is what "on top" means in SVG.
-pub fn with_marks(
-    svg: &str,
-    marks: &[tinymist_annos::Mark],
-    width: u32,
-    height: u32,
-) -> String {
-    let drawn = marks_svg(marks, width, height);
-    if drawn.is_empty() {
-        return svg.to_owned();
-    }
-    match svg.rfind("</svg>") {
-        Some(at) => format!("{}{drawn}{}", &svg[..at], &svg[at..]),
-        None => svg.to_owned(),
-    }
-}
-
-/// Draws a scribble's marks over a capture that is already a picture.
-///
-/// A capture the page rasterised is PNG, so the marks cannot be put inside it
-/// the way they are put inside an SVG. They are rendered over it instead, at
-/// the size the picture was taken at, which is the size their coordinates are
-/// in.
-pub fn png_with_marks(
-    png: &[u8],
-    marks: &[tinymist_annos::Mark],
-    width: u32,
-    height: u32,
-) -> Result<Vec<u8>, String> {
-    let mut pixmap = resvg::tiny_skia::Pixmap::decode_png(png)
-        .map_err(|err| format!("cannot read the capture as PNG: {err}"))?;
-    let (w, h) = (width.max(1), height.max(1));
-    let drawn = marks_svg(marks, w, h);
-    if drawn.is_empty() {
-        return pixmap
-            .encode_png()
-            .map_err(|err| format!("cannot encode the capture as PNG: {err}"));
-    }
-    let svg = format!(
-        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{w}\" height=\"{h}\" \
-         viewBox=\"0 0 {w} {h}\">{drawn}</svg>"
-    );
-    let tree = resvg::usvg::Tree::from_str(&svg, &resvg::usvg::Options::default())
-        .map_err(|err| format!("cannot read the marks as SVG: {err}"))?;
-    // The picture was rasterised at whatever the reader's screen does, so it
-    // is not the size the marks are measured in; the marks are scaled to it.
-    let scale = resvg::tiny_skia::Transform::from_scale(
-        pixmap.width() as f32 / w as f32,
-        pixmap.height() as f32 / h as f32,
-    );
-    resvg::render(&tree, scale, &mut pixmap.as_mut());
-    pixmap
-        .encode_png()
-        .map_err(|err| format!("cannot encode the capture as PNG: {err}"))
-}
 
 /// How big a capture is rasterised, by default: half of its natural size,
 /// unless that is still over the ceiling below.
