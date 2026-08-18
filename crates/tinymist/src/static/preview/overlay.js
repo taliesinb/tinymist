@@ -273,7 +273,7 @@
         url: location.pathname + location.search,
         time: new Date().toISOString(),
       });
-      fetch("/dev/clientlog", { method: "POST", body: line, keepalive: true }).catch(
+      fetch("/api/clientlog", { method: "POST", body: line, keepalive: true }).catch(
         () => {},
       );
     } catch (e) {}
@@ -631,11 +631,11 @@
   };
   if (ANNOTATE) {
     const script = document.createElement("script");
-    script.src = "/dev/annotations.js";
+    script.src = "/api/annotations.js";
     document.body.appendChild(script);
   }
   const connect = () => {
-    const es = new EventSource("/dev/diagnostics");
+    const es = new EventSource("/api/diagnostics");
     es.onmessage = (ev) => {
       try {
         const data = JSON.parse(ev.data);

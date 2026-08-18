@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<link rel="stylesheet" href="dev/html/annotate.css">
+<link rel="stylesheet" href="api/html/annotate.css">
 <style>
   /* The listing is its own page, so its layout lives here rather than in the
      annotator's stylesheet, which is about a document and the marks on it. */
@@ -228,7 +228,7 @@
   <p class="tm-empty" id="tm-empty" hidden>No documents here yet.</p>
 </main>
 <script>
-  // The listing is data plus this page: the server answers `dev/docs` with the
+  // The listing is data plus this page: the server answers `/api/docs` with the
   // directory as it is now, so a document added while the server runs is one
   // reload away rather than one restart.
   (() => {
@@ -268,6 +268,9 @@
       const said = document.querySelector('meta[name="tm-mount"]');
       return (said && said.content) || "/a/";
     };
+    // The site's root: the mount without the mode on the end, which is where
+    // the endpoints are.
+    const site = () => mount().replace(/[^/]+\/$/, "");
     const here = () => {
       const at = location.pathname.indexOf(mount());
       const rest = at < 0 ? "" : location.pathname.slice(at + mount().length);
@@ -488,10 +491,9 @@
     };
 
     const load = () =>
-      // Asked at the mount, not relative to this page: the endpoint belongs to
-      // the site, and a relative address at `/a/report/` would ask the site for
-      // a document called `report/dev`.
-      fetch(`${mount()}dev/docs?under=${encodeURIComponent(here())}`)
+      // Asked at the site's root, where the endpoints are: they sit above the
+      // modes and above the documents, so that a document may be called `api`.
+      fetch(`${site()}api/docs?under=${encodeURIComponent(here())}`)
         .then((r) => r.json())
         .then(render)
         .catch(() => {});

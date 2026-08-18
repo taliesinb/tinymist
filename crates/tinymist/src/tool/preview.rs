@@ -923,7 +923,7 @@ impl PreviewState {
                 };
                 // Served per request so the script can be edited in the
                 // source tree and picked up on a browser reload.
-                let script = "<script src=\"/dev/overlay.js\"></script>";
+                let script = "<script src=\"/api/overlay.js\"></script>";
                 if frontend_html.contains("</body>") {
                     frontend_html = frontend_html.replace("</body>", &format!("{script}</body>"));
                 } else {

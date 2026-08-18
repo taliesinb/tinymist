@@ -325,7 +325,7 @@ pub async fn preview_main(mut args: PreviewCliArgs) -> Result<()> {
             }
             None => format!("{early}{frontend_html}"),
         };
-        let script = "<script src=\"/dev/overlay.js\"></script>";
+        let script = "<script src=\"/api/overlay.js\"></script>";
         if frontend_html.contains("</body>") {
             frontend_html = frontend_html.replace("</body>", &format!("{script}</body>"));
         } else {

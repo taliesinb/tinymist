@@ -246,7 +246,7 @@ pub fn all_notes() -> Vec<(ServerNote, bool)> {
 
 /// Whether anything is listening on a port and answering as one of ours.
 pub fn answers(port: u16) -> bool {
-    get(port, "/dev/build").is_some()
+    get(port, "/api/build").is_some()
 }
 
 /// A plain GET against a loopback port, for probing and for the hub's own

@@ -117,10 +117,10 @@ pub fn render_main(args: RenderArgs) -> Result<()> {
             };
             html::shell_html()
                 .replace(
-                    "<link rel=\"stylesheet\" href=\"dev/html/annotate.css\" />",
+                    "<link rel=\"stylesheet\" href=\"api/html/annotate.css\" />",
                     &format!("<style>\n{}\n</style>", html::client_css()),
                 )
-                .replace("<script src=\"dev/html/annotate.js\"></script>", "")
+                .replace("<script src=\"api/html/annotate.js\"></script>", "")
                 .replace("<title>Typst</title>", &format!("<title>{title}</title>"))
                 .replace(
                     "<main id=\"tinymist-doc\" class=\"tm-doc\"></main>",

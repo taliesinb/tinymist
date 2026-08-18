@@ -104,7 +104,7 @@ pub struct DocEntry {
 /// knows which, since only the site knows what is on disk.
 #[derive(Debug, Clone)]
 pub enum Located {
-    /// A document, and what is being asked of it: `/dev/html/doc`, or nothing
+    /// A document, and what is being asked of it: `/api/html/doc`, or nothing
     /// for the page itself.
     Document {
         /// Its name, which is its path under the directory without `.typ`.

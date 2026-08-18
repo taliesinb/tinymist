@@ -80,15 +80,16 @@ fn card(rec: &AnnotationRecord, annot: &Arc<dyn AnnotationServer>) -> String {
             .captures
             .iter()
             .map(|capture| {
-                // Relative to the page, which sits under the document's own URL:
-                // the same path works for a directory server, where the document
-                // is named in front of it.
+                // Named from the site's root, where the captures are served:
+                // this page sits under the document's own URL, which is not
+                // where the endpoints are.
                 format!(
                     "<figure style=\"margin:0\">\
-                       <img src=\"dev/capture/{hash}.{fmt}\" alt=\"capture {hash}\" \
+                       <img src=\"{root}/api/capture/{hash}.{fmt}\" alt=\"capture {hash}\" \
                             width=\"{width}\" height=\"{height}\">\
                        <div class=\"cap\">{time} · {hash} · {width}×{height}{markup}</div>\
                      </figure>",
+                    root = crate::tool::webapp::public_base(),
                     hash = escape(&capture.hash),
                     fmt = escape(&capture.fmt),
                     width = capture.width,

@@ -2,7 +2,7 @@
 //! frontend.
 //!
 //! When `preview.errorOverlay` or `preview.cursorIndicator` is enabled, the
-//! preview http server exposes a `/dev/diagnostics` SSE endpoint and the
+//! preview http server exposes a `/api/diagnostics` SSE endpoint and the
 //! served frontend html gets a small script injected. On compile errors, the
 //! script highlights the error locations on the last successful render and
 //! shows the error messages in a floating panel. With the cursor indicator,
@@ -508,7 +508,7 @@ pub fn diagnostics_payload(
 /// The script injected into the frontend html when the error overlay or the
 /// cursor indicator is enabled.
 /// The overlay script, loaded from the source tree when available so it can
-/// be edited without rebuilding (served per request via `/dev/overlay.js`).
+/// be edited without rebuilding (served per request via `/api/overlay.js`).
 pub fn overlay_js() -> String {
     crate::tool::asset::dev_asset_in("preview", "overlay.js", include_str!("../../static/preview/overlay.js"))
 }

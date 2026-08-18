@@ -241,7 +241,7 @@ fn probe(host: &str, port: u16) -> Option<String> {
         };
         let _ = sock.set_read_timeout(Some(timeout));
         let _ = sock.set_write_timeout(Some(timeout));
-        let request = format!("GET /dev/build HTTP/1.0\r\nHost: {host}:{port}\r\n\r\n");
+        let request = format!("GET /api/build HTTP/1.0\r\nHost: {host}:{port}\r\n\r\n");
         if sock.write_all(request.as_bytes()).is_err() {
             continue;
         }
@@ -339,7 +339,7 @@ fn stop_server(host: &str, port: u16) {
             continue;
         };
         let _ = sock.set_write_timeout(Some(timeout));
-        let request = format!("GET /dev/stop HTTP/1.0\r\nHost: {host}:{port}\r\n\r\n");
+        let request = format!("GET /api/stop HTTP/1.0\r\nHost: {host}:{port}\r\n\r\n");
         let _ = sock.write_all(request.as_bytes());
         return;
     }

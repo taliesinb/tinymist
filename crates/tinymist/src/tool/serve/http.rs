@@ -170,7 +170,7 @@ pub async fn make_http_server(
                 );
                 // Which document this request is about, and what it asks of
                 // it. A directory names the document in the first segment
-                // after the mode's prefix — `/a/paper/dev/html/doc` — and a
+                // after the mode's prefix — `/a/paper/api/html/doc` — and a
                 // single document leaves it out, so the same dispatch serves
                 // both and every endpoint sits under the page that uses it.
                 // Read back from what a browser sent: a document called
@@ -198,11 +198,23 @@ pub async fn make_http_server(
                 // what is not a document may be a file to hand over or a
                 // directory to list.
                 let mut located = None;
+                // The endpoints live at the root, above the modes and above the
+                // documents: `/api/…` is never a document, so a document may be
+                // called `api` without taking the endpoints away from the page.
+                // Which document a call is about rides in the query, since the
+                // path no longer says.
+                let api = raw_path.strip_prefix("/api/").map(|rest| format!("/api/{rest}"));
                 let (page_role, slug, path) = match crate::tool::webapp::role_of_path(&raw_path) {
-                    // The site's own endpoints — the listing's data, chiefly —
-                    // are not a document called `dev`.
-                    Some((role, rest)) if listing && rest.starts_with("dev/") => {
-                        (Some(role), String::new(), format!("/{rest}"))
+                    _ if api.is_some() => {
+                        let asked = req
+                            .uri()
+                            .query()
+                            .and_then(|query| {
+                                query.split('&').find_map(|pair| pair.strip_prefix("doc="))
+                            })
+                            .map(|value| unescape(value, true))
+                            .unwrap_or_default();
+                        (None, asked, api.unwrap())
                     }
                     Some((role, rest)) if listing => {
                         let found = site.locate(rest);
@@ -224,7 +236,7 @@ pub async fn make_http_server(
                 // Building a document is compiling it, so it happens when one
                 // is asked for and not before: a directory of thirty papers is
                 // thirty compilers otherwise, to show a list of names.
-                let wants_doc = page_role.is_some() || path.starts_with("/dev/");
+                let wants_doc = page_role.is_some() || path.starts_with("/api/");
                 let doc = if wants_doc && !(listing && slug.is_empty()) {
                     site.services(&slug).await
                 } else {
@@ -342,8 +354,8 @@ pub async fn make_http_server(
                         // after the document *is* the endpoint.
                         let prefix = crate::tool::webapp::public_prefix(role);
                         let page = super::listing_html()
-                            .replace("href=\"dev/", &format!("href=\"{prefix}dev/"))
-                            .replace("src=\"dev/", &format!("src=\"{prefix}dev/"));
+                            .replace("href=\"api/", &format!("href=\"{prefix}api/"))
+                            .replace("src=\"api/", &format!("src=\"{prefix}api/"));
                         let body = crate::tool::webapp::mode_head(&page, &identity, port, true);
                         return Ok(hyper::Response::builder()
                             .header(hyper::header::CONTENT_TYPE, "text/html; charset=utf-8")
@@ -447,7 +459,7 @@ pub async fn make_http_server(
                             .unwrap(),
                     };
                     Ok(res)
-                } else if raw_path == "/dev/stop" {
+                } else if raw_path == "/api/stop" {
                     // Asked to stop, which is not the same as being killed: the
                     // rendered site is cleared up and the register is told.
                     // Loopback only, like everything else that writes here.
@@ -465,7 +477,7 @@ pub async fn make_http_server(
                         super::shutdown("asked to stop");
                     });
                     Ok(res)
-                } else if path == "/dev/events" {
+                } else if path == "/api/events" {
                     // What the server has said, with numbers on it. A client
                     // asks with the last id it saw and waits for the next: a
                     // loop is then the length of what happened, not of how
@@ -507,7 +519,7 @@ pub async fn make_http_server(
                         .body(Body::new(Full::<Bytes>::from(payload.to_string())))
                         .unwrap();
                     Ok(res)
-                } else if path == "/dev/docs" && listing {
+                } else if path == "/api/docs" && listing {
                     // What the listing page draws: the directory as it is now.
                     //
                     // The page asks again every few seconds, and saying so
@@ -563,7 +575,7 @@ pub async fn make_http_server(
                         .body(Body::new(Full::<Bytes>::from(body)))
                         .unwrap();
                     Ok(res)
-                } else if path == "/dev/diagnostics" && diag_rx.is_some() {
+                } else if path == "/api/diagnostics" && diag_rx.is_some() {
                     // Stream diagnostics updates as server-sent events.
                     let rx = diag_rx.unwrap();
                     let init = rx.borrow().clone();
@@ -576,7 +588,7 @@ pub async fn make_http_server(
                     // page it belongs to, so the page is its address without
                     // the endpoint on the end.
                     let page = raw_path
-                        .strip_suffix("dev/diagnostics")
+                        .strip_suffix("api/diagnostics")
                         .unwrap_or(&raw_path)
                         .to_owned();
                     let guard = ClientGuard(live.clone(), client.id, page.clone());
@@ -622,7 +634,7 @@ pub async fn make_http_server(
                         .body(Body::new(StreamBody::new(stream)))
                         .unwrap();
                     Ok(res)
-                } else if path == "/dev/overlay.js" && diag_rx.is_some() {
+                } else if path == "/api/overlay.js" && diag_rx.is_some() {
                     // Read from the source tree per request so overlay
                     // script edits apply on browser reload, no rebuild.
                     let res = hyper::Response::builder()
@@ -631,7 +643,7 @@ pub async fn make_http_server(
                         .body(Body::new(Full::<Bytes>::from(crate::tool::preview::overlay_js())))
                         .unwrap();
                     Ok(res)
-                } else if path == "/dev/build" {
+                } else if path == "/api/build" {
                     // Which build is answering. A server whose binary has been
                     // replaced is on its way out but still holds its socket for
                     // a moment; whoever is starting up needs to know that the
@@ -642,7 +654,7 @@ pub async fn make_http_server(
                         .body(Body::new(Full::<Bytes>::from(crate::tool::webapp::build_stamp())))
                         .unwrap();
                     Ok(res)
-                } else if path == "/dev/clientlog" {
+                } else if path == "/api/clientlog" {
                     // Frontend errors: logged to stderr and appended to a
                     // well-known file so they can be found after the fact.
                     use http_body_util::BodyExt;
@@ -697,7 +709,7 @@ pub async fn make_http_server(
                         .header(hyper::header::CACHE_CONTROL, "no-store")
                         .body(Body::new(Full::<Bytes>::from(body)))
                         .unwrap())
-                } else if let Some(name) = path.strip_prefix("/dev/capture/") {
+                } else if let Some(name) = path.strip_prefix("/api/capture/") {
                     // One stored capture, as it was stored. The page shows them
                     // as images, and an SVG is already one.
                     let stored = name.rsplit_once('.').and_then(|(hash, fmt)| {
@@ -751,7 +763,7 @@ pub async fn make_http_server(
                             .unwrap()
                     };
                     Ok(res)
-                } else if path == "/dev/html/annotate.js" || path == "/dev/html/annotate.css" {
+                } else if path == "/api/html/annotate.js" || path == "/api/html/annotate.css" {
                     // The client itself, which is the same for every document
                     // and for the listing: asked for without one, and read from
                     // the source tree per request so an edit applies on reload.
@@ -769,7 +781,7 @@ pub async fn make_http_server(
                         .body(Body::new(Full::<Bytes>::from(body)))
                         .unwrap();
                     Ok(res)
-                } else if path == "/dev/html/relocate" && annot.is_some() {
+                } else if path == "/api/html/relocate" && annot.is_some() {
                     // Locations a page is holding against a rendering that has
                     // been replaced, expressed against the one it is showing
                     // now. A page asks after a compile; what it holds is what
@@ -799,21 +811,21 @@ pub async fn make_http_server(
                         .body(Body::new(Full::<Bytes>::from(payload.to_string())))
                         .unwrap();
                     Ok(res)
-                } else if path.starts_with("/dev/html/") && html.is_some() {
+                } else if path.starts_with("/api/html/") && html.is_some() {
                     // HTML mode's own endpoints. The document arrives as a
                     // fragment with every piece labelled with the source range
                     // it came from; the annotations arrive as source offsets.
                     // Geometry is the browser's business here, so none is sent.
                     let html = html.unwrap();
                     let (body, mime) = match path {
-                        "/dev/html/annotate.js" => (
+                        "/api/html/annotate.js" => (
                             crate::tool::render::html::client_js(),
                             "application/javascript",
                         ),
-                        "/dev/html/annotate.css" => {
+                        "/api/html/annotate.css" => {
                             (crate::tool::render::html::client_css(), "text/css")
                         }
-                        "/dev/html/doc" => {
+                        "/api/html/doc" => {
                             // The rendering and its map together, in one
                             // answer: a page that fetched them separately could
                             // pair a body with the map of a different compile.
@@ -840,7 +852,7 @@ pub async fn make_http_server(
                             };
                             (payload.to_string(), "application/json")
                         }
-                        "/dev/html/pins" => {
+                        "/api/html/pins" => {
                             // Annotations are the server's, not the page's: a
                             // document rendered for an editor has none, and the
                             // client is content with an empty list.
@@ -866,10 +878,10 @@ pub async fn make_http_server(
                         .body(Body::new(Full::<Bytes>::from(body)))
                         .unwrap();
                     Ok(res)
-                } else if path.starts_with("/dev/annotate") && annot.is_some() {
-                    // Annotation endpoints: POST /dev/annotate creates an
+                } else if path.starts_with("/api/annotate") && annot.is_some() {
+                    // Annotation endpoints: POST /api/annotate creates an
                     // annotation at a clicked position; POST
-                    // /dev/annotate/delete removes one by id.
+                    // /api/annotate/delete removes one by id.
                     use http_body_util::BodyExt;
                     // A server started with a latency answers these slowly on
                     // purpose: what a page does while it waits — the mark that
@@ -920,7 +932,7 @@ pub async fn make_http_server(
                         markup: Option<String>,
                     }
                     let outcome = match path.as_str() {
-                        "/dev/annotate/capture" => serde_json::from_slice::<CaptureReq>(&body)
+                        "/api/annotate/capture" => serde_json::from_slice::<CaptureReq>(&body)
                             .map_err(|e| e.to_string())
                             .and_then(|req| {
                                 let bytes = match req.fmt.as_str() {
@@ -945,20 +957,20 @@ pub async fn make_http_server(
                                 };
                                 annot.add_capture(&req.uuid, capture).map(|()| hash)
                             }),
-                        "/dev/annotate" => serde_json::from_slice::<crate::tool::serve::AnnotateRequest>(&body)
+                        "/api/annotate" => serde_json::from_slice::<crate::tool::serve::AnnotateRequest>(&body)
                             .map_err(|e| e.to_string())
                             .and_then(|mut req| {
                                 req.author = author.clone();
                                 annot.annotate(req)
                             }),
-                        "/dev/annotate/delete" => parse_uuid()
+                        "/api/annotate/delete" => parse_uuid()
                             .and_then(|req| annot.remove(&req.uuid).map(|()| String::new())),
-                        "/dev/annotate/reply" => parse_uuid().and_then(|req| {
+                        "/api/annotate/reply" => parse_uuid().and_then(|req| {
                             annot
                                 .reply(&req.uuid, &req.text, author.as_deref())
                                 .map(|()| String::new())
                         }),
-                        "/dev/annotate/flags" => parse_uuid().and_then(|req| {
+                        "/api/annotate/flags" => parse_uuid().and_then(|req| {
                             annot
                                 .set_flags(&req.uuid, req.claimed, req.resolved)
                                 .map(|()| String::new())

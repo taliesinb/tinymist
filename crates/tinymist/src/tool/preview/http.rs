@@ -133,7 +133,7 @@ pub async fn make_http_server(
                         .body(Body::new(Full::<Bytes>::from(html)))
                         .unwrap();
                     Ok(res)
-                } else if path == "/dev/html/annotate.js" || path == "/dev/html/annotate.css" {
+                } else if path == "/api/html/annotate.js" || path == "/api/html/annotate.css" {
                     // The reading client, which is the annotator with nothing
                     // to annotate: an editor's preview has no sidecar, and it
                     // asks for none.
@@ -151,7 +151,7 @@ pub async fn make_http_server(
                         .body(Body::new(Full::<Bytes>::from(asset)))
                         .unwrap();
                     Ok(res)
-                } else if path == "/dev/html/pins" {
+                } else if path == "/api/html/pins" {
                     // Asked for by the same client; a preview has none.
                     let res = hyper::Response::builder()
                         .header(hyper::header::CONTENT_TYPE, "application/json")
@@ -160,7 +160,7 @@ pub async fn make_http_server(
                         )))
                         .unwrap();
                     Ok(res)
-                } else if path == "/dev/diagnostics" && diag_rx.is_some() {
+                } else if path == "/api/diagnostics" && diag_rx.is_some() {
                     // Stream diagnostics updates as server-sent events.
                     let rx = diag_rx.unwrap();
                     let init = rx.borrow().clone();
@@ -195,7 +195,7 @@ pub async fn make_http_server(
                         .body(Body::new(StreamBody::new(stream)))
                         .unwrap();
                     Ok(res)
-                } else if path == "/dev/overlay.js" && diag_rx.is_some() {
+                } else if path == "/api/overlay.js" && diag_rx.is_some() {
                     // Read from the source tree per request so overlay
                     // script edits apply on browser reload, no rebuild.
                     let res = hyper::Response::builder()

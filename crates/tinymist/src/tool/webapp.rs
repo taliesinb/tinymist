@@ -160,6 +160,12 @@ pub fn public_path(path: &str) -> String {
     format!("{}{path}", public_base())
 }
 
+/// Where the endpoints are, as a page should name them. Above the modes and
+/// above the documents, so that a document may be called `api`.
+pub fn api_root() -> String {
+    public_path("/api/")
+}
+
 /// A mode's prefix as a page should name it.
 pub fn public_prefix(role: IconRole) -> String {
     public_path(role_prefix(role))
@@ -231,6 +237,12 @@ pub fn mode_head(html: &str, identity: &WebAppIdentity, port: u16, listing: bool
          {their_css}"
     );
 
+    // The endpoints are at the site's root, so the page's own script and
+    // stylesheet are named from there: a page at `/a/paper/` cannot reach them
+    // by a relative address, and the root moves when the server is published
+    // under a path.
+    let html = html.replace("\"api/", &format!("\"{}", api_root()));
+    let html = html.as_str();
     // The bundled frontend ships its own title and icon; a browser takes the
     // last icon it is offered, so ours has to both replace theirs and come
     // last. Strip, then append at the end of the head.

@@ -77,7 +77,7 @@ fn hub_tools() -> Value {
 /// How a server describes itself to an agent.
 fn server_json(note: &ServerNote) -> Value {
     let documents = if note.directory {
-        registry::get(note.port, "/a/dev/docs")
+        registry::get(note.port, "/api/docs")
             .and_then(|body| serde_json::from_str::<Value>(&body).ok())
             .and_then(|listing| listing.get("docs").cloned())
             .map(|docs| {
@@ -330,7 +330,7 @@ fn call(name: &str, args: &Value) -> Value {
             Ok(note) => {
                 // Asked to stop, not killed: it has a site to clear up and a
                 // note to withdraw.
-                let stopped = registry::get(note.port, "/dev/stop").is_some();
+                let stopped = registry::get(note.port, "/api/stop").is_some();
                 result(json!({ "server": note.server, "stopped": stopped }), !stopped)
             }
             Err(err) => result(json!({ "error": err }), true),
@@ -456,7 +456,7 @@ pub async fn serve(port: u16) -> std::io::Result<()> {
                 let res = match (is_post, path.as_str()) {
                     // What a document server answers with, so that whoever is
                     // probing for one of ours finds this too.
-                    (false, "/dev/build") => answer(
+                    (false, "/api/build") => answer(
                         hyper::StatusCode::OK,
                         "text/plain",
                         crate::tool::webapp::build_stamp(),

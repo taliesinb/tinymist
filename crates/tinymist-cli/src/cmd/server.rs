@@ -147,7 +147,7 @@ impl DocumentSite for DirSite {
             return Located::Listing(self.dir.clone());
         }
         // Longest first: a document called `report/report` wins over the
-        // directory `report`, and `report/report/dev/html/doc` is that
+        // directory `report`, and `report/report/api/html/doc` is that
         // document being asked for its body.
         let parts: Vec<&str> = rest.split('/').collect();
         for take in (1..=parts.len()).rev() {

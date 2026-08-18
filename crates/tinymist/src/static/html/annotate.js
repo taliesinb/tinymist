@@ -8,7 +8,7 @@
 // geometry comes from DOM ranges.
 //
 // The two share the sidecar format, the anchor labels, and the mutation
-// endpoints (/dev/annotate*), which are about annotations rather than about
+// endpoints (/api/annotate*), which are about annotations rather than about
 // how a document is drawn. Nothing else.
 (() => {
   const DOC_ID = "tinymist-doc";
@@ -123,12 +123,27 @@
   const haloColor = () => (pageIsDark() ? "#0e0e0e" : "#ffffff");
 
   // ------------------------------------------------------------------- http
-  // Every endpoint sits under the page that uses it: one server can serve a
-  // whole directory, and `/a/paper/dev/html/doc` is that document's, while
-  // `/a/dev/html/doc` would be nobody's. The page's own URL ends in a slash, so
-  // it is the base to resolve them against.
+  // The page's own URL, which ends in a slash: what the held state is filed
+  // under, and where the document this page shows is named.
   const BASE = location.pathname.replace(/[^/]*$/, "");
-  const url = (path) => BASE + path.replace(/^\/?(dev\/)?/, "dev/");
+  // The endpoints sit at the site's root rather than under the page, so that a
+  // document called `api` is a document and not a set of endpoints. The root
+  // is the mount without the mode on the end — `/nlab/a/` is served from
+  // `/nlab/` — since the server may be published under a path.
+  const SITE = MOUNT.replace(/[^/]+\/$/, "");
+  // Which document this page shows, as the server names it: the part of the
+  // address below the mount. Empty when the server holds one document, which
+  // is then the one every call is about.
+  const SLUG = BASE.startsWith(MOUNT)
+    ? decodeURIComponent(BASE.slice(MOUNT.length).replace(/\/$/, ""))
+    : "";
+  // An endpoint, with the document it is about: the path no longer says which,
+  // so the query does.
+  const url = (path) => {
+    const [route, query] = path.replace(/^\/?(api\/)?/, "api/").split("?");
+    const asked = [query, SLUG && `doc=${encodeURIComponent(SLUG)}`].filter(Boolean);
+    return SITE + route + (asked.length ? `?${asked.join("&")}` : "");
+  };
   // Whether the server is answering. Everything that needs the server goes
   // through here, so one failed request is enough to know, and one that
   // succeeds is enough to know again.
@@ -2116,7 +2131,7 @@
     Object.assign(pin, flags);
     const held = { ...(flagged.get(pin.uuid) || {}), ...flags };
     flagged.set(pin.uuid, held);
-    post("/dev/annotate/flags", { uuid: pin.uuid, ...flags });
+    post("/api/annotate/flags", { uuid: pin.uuid, ...flags });
     showAnnot(pin, currentDraft());
     render();
   };
@@ -2193,7 +2208,7 @@
     acts.push([
       "delete",
       () => {
-        post("/dev/annotate/delete", { uuid: pin.uuid }).then(refresh);
+        post("/api/annotate/delete", { uuid: pin.uuid }).then(refresh);
         saveDraft(draftKey(pin), "");
         closeBox(true);
       },
@@ -2226,10 +2241,10 @@
       (field) => {
         const text = field.value.trim();
         if (!text) return;
-        post("/dev/annotate/reply", { uuid: pin.uuid, text }).then(refresh);
+        post("/api/annotate/reply", { uuid: pin.uuid, text }).then(refresh);
         // Answering a closed thread opens it again: the reply is the point,
         // and it would otherwise land somewhere nobody is looking.
-        if (pin.resolved) post("/dev/annotate/flags", { uuid: pin.uuid, resolved: false });
+        if (pin.resolved) post("/api/annotate/flags", { uuid: pin.uuid, resolved: false });
         field.value = "";
         field.dispatchEvent(new Event("input"));
         saveDraft(draftKey(pin), "");
@@ -2376,7 +2391,7 @@
     if (!pin || pin.sending) return Promise.resolve();
     pin.sending = true;
     render();
-    return post("/dev/annotate", pin.draft).then((res) => {
+    return post("/api/annotate", pin.draft).then((res) => {
       pin.sending = false;
       if (res && res.ok) {
         // Held until the server's own copy arrives, so there is no moment with
@@ -2447,7 +2462,7 @@
       const draft = rest[0];
       const onwards = (rest) =>
         online ? next(rest.slice(1)) : ((sending = false), undefined);
-      const place = (where) => post("/dev/annotate", { ...draft, location: where });
+      const place = (where) => post("/api/annotate", { ...draft, location: where });
       return place(draft.location).then((res) => {
         if (res && res.ok) {
           dropDraft(draft);
@@ -3237,7 +3252,7 @@
     heldMarks.delete(draftUuid);
     return held
       .reduce(
-        (queue, capture) => queue.then(() => post("/dev/annotate/capture", { ...capture, uuid })),
+        (queue, capture) => queue.then(() => post("/api/annotate/capture", { ...capture, uuid })),
         Promise.resolve(),
       )
       .then(() => refresh());
@@ -3279,7 +3294,7 @@
       showBanner("the marks go with the annotation when it is sent", "note");
       return;
     }
-    const res = await post("/dev/annotate/capture", { ...capture, uuid: sk.pin.uuid });
+    const res = await post("/api/annotate/capture", { ...capture, uuid: sk.pin.uuid });
     if (res && res.ok) {
       showBanner(`marked ${sk.pin.letter || "an annotation"}`, "note");
       refresh();
@@ -3721,7 +3736,7 @@
   const carryLocal = (was) => {
     const held = local.filter((pin) => pin.location);
     if (!held.length) return;
-    post("/dev/html/relocate", {
+    post("/api/html/relocate", {
       render: was,
       locations: held.map((pin) => pin.location),
     }).then((res) => {
@@ -3780,7 +3795,7 @@
   };
 
   const loadDocument = () =>
-    getJson("/dev/html/doc")
+    getJson("/api/html/doc")
       .then((res) => {
         if (!res || !res.ok) {
           cannotLoad(res);
@@ -3818,7 +3833,7 @@
       .catch(() => cannotLoad(null));
 
   const loadPins = () =>
-    getJson("/dev/html/pins").then((res) => {
+    getJson("/api/html/pins").then((res) => {
       if (res && res.ok) {
         pins = res.pins || [];
         applyFlags();
@@ -3845,7 +3860,7 @@
   let docVersion = null;
   let serverPid = null;
   const listen = () => {
-    const sse = new EventSource(url("/dev/diagnostics"));
+    const sse = new EventSource(url("/api/diagnostics"));
     sse.onmessage = (ev) => {
       setOnline(true);
       let data = null;
@@ -4000,7 +4015,7 @@
     if (flying || !online) return;
     const stop = new AbortController();
     const timer = setTimeout(() => stop.abort(), BEAT_WAIT);
-    fetch(url("/dev/build"), { signal: stop.signal })
+    fetch(url("/api/build"), { signal: stop.signal })
       .then((r) => setOnline(r.ok))
       .catch(() => setOnline(false))
       .finally(() => clearTimeout(timer));
@@ -4020,7 +4035,7 @@
       } else if (!retrying) {
         retrying = setInterval(() => {
           if (flying) return;
-          getJson("/dev/build");
+          getJson("/api/build");
         }, 3000);
       }
     });
@@ -4108,7 +4123,7 @@
         } else {
           // Back at once rather than at the next tick, so the ants start
           // moving as soon as the box is cleared.
-          getJson("/dev/build").then(refresh);
+          getJson("/api/build").then(refresh);
         }
       }),
     );
