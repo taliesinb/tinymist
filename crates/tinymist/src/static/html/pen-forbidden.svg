@@ -1,0 +1,33 @@
+<!-- The pointer where the pen cannot draw: the ordinary pen, at its ordinary
+     size, with a prohibition sign below and to the right of it — the badge an
+     operating system puts on a pointer that is over somewhere it will not act.
+
+     `data-hotspot` is where in this drawing the pointer actually is, in the
+     coordinates of the viewBox: the pen's point. The drawing is read on every
+     request, so editing it and reloading the page is enough; the size and the
+     hotspot are taken from here. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"
+     data-hotspot="1 15">
+  <!-- The pen. `paint-order` puts the outline behind the fill, so the outline
+       reads as an edge rather than as half the shape. -->
+  <g stroke="#101014" stroke-width="2.2" stroke-linejoin="round" paint-order="stroke">
+    <!-- the barrel -->
+    <path d="M3.4 10.8 L10.2 4 L13 6.8 L6.2 13.6 Z" fill="#8b8b93"/>
+    <!-- the nib -->
+    <path d="M1 15 L3.4 10.8 L6.2 13.6 Z" fill="#f4f4f6"/>
+    <!-- the point itself -->
+    <path d="M1 15 L2.6 12.6 L4.2 14.2 Z" fill="#8b8b93" stroke="none"/>
+  </g>
+  <!-- The badge: red, since no annotation is, and outlined so that it reads on
+       a dark page and a light one. -->
+  <g fill="none" stroke-linecap="round">
+    <g stroke="#101014" stroke-width="3.4">
+      <circle cx="17" cy="17" r="5.6"/>
+      <path d="M13 13 L21 21"/>
+    </g>
+    <g stroke="#e2483a" stroke-width="1.8">
+      <circle cx="17" cy="17" r="5.6"/>
+      <path d="M13 13 L21 21"/>
+    </g>
+  </g>
+</svg>

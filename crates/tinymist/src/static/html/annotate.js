@@ -201,6 +201,24 @@
     return Math.floor(h / 24) + "d";
   };
 
+  // The same in words, for reading rather than for glancing at.
+  const longAgo = (iso) => {
+    const then = Date.parse(iso);
+    if (isNaN(then)) return iso;
+    const s = Math.max(Math.floor((Date.now() - then) / 1000), 0);
+    const of = (count, unit) => `${count} ${unit}${count === 1 ? "" : "s"} ago`;
+    if (s < 45) return "just now";
+    const m = Math.round(s / 60);
+    if (m < 60) return of(Math.max(m, 1), "minute");
+    const h = Math.round(m / 60);
+    if (h < 24) return of(h, "hour");
+    const d = Math.round(h / 24);
+    if (d < 30) return of(d, "day");
+    const months = Math.round(d / 30);
+    if (months < 12) return of(months, "month");
+    return of(Math.round(months / 12), "year");
+  };
+
   // Display letters (bijective base 26), mirroring the server's assignment so
   // a compose window can name itself before the annotation exists.
   const letterIndex = (str) => {
@@ -840,10 +858,20 @@
   // quieter shape and is kept here in case the rectangle proves too loud.
   // Items are not affected either way: they wear a chip beside their marker.
   const REGION_SHAPE = "box"; // "box" | "strip"
-  // How far a region's rectangle stands off the text. Less than the strips
-  // keep, because two rectangles on consecutive paragraphs have only the
-  // paragraph spacing to share between them.
-  const BOX_INSET = 5;
+  // How far below a line of annotated text its own mark reaches: the underline
+  // sits a pixel under the text and the letter hangs below that, and a pointer
+  // aimed at either is aimed at the annotation. About a descender's depth.
+  const TEXT_HIT_BELOW = 16;
+  // How far a region's rectangle stands off what it frames. Everything framed
+  // ends where its ink ends — a paragraph's last line, a heading's letters, a
+  // drawing's edge — so a frame drawn any closer is a frame drawn on it.
+  const BOX_INSET = 9;
+  // What counts as a picture inside a region, which is how a figure of a
+  // diagram comes to have an edge of its own — and to be drawable. A table
+  // counts as well: its content is text an agent can read, but where a mark
+  // falls in the grid is not, and pointing at a cell is the whole reason for
+  // drawing on one.
+  const PICTURE_INSIDE = "img,svg,math,canvas,video,table";
   // How an item is marked: a ring around its own marker — a circle around a
   // bullet, a rectangle around an enumerator — or the pointer chip beside it,
   // which is what it was before and is kept in case the ring reads worse.
@@ -1028,6 +1056,123 @@
   // stylesheet fixes that at 1.5em so this is a measurement rather than a
   // guess — and it sits on the first line of the item, whatever the item's
   // height.
+  // What the reader drew on a picture, drawn again over the picture.
+  //
+  // The marks are kept in the coordinates of the capture they were made on, so
+  // putting them back means undoing that: a drawing's own units go through the
+  // element's own transform, and a raster's pixels are measured from its
+  // corner and scale with it.
+  const drawMarks = (host, pin, geom) => {
+    const el = (geom.block && geom.block.el) || geom.el;
+    if (!el) return;
+    // What the server has, drawn solid, and what is still waiting to be sent,
+    // drawn dotted: a scribble is part of a remark, and a remark nobody has
+    // sent yet is a draft whichever way it was made.
+    const waiting = pendingFor(pin.uuid);
+    const drawn = (pin.scribbles || []).map((scribble) => ({ scribble, dotted: false }));
+    if (waiting) {
+      drawn.push({
+        scribble: { id: waiting.id, ...waiting.at, shapes: waiting.shapes },
+        dotted: true,
+      });
+    }
+    const key = pin.uuid + ":marks";
+    const found = host.querySelector(`[data-key="${CSS.escape(key)}"]`);
+    if (!drawn.length) {
+      if (found) found.remove();
+      return;
+    }
+    const box = el.getBoundingClientRect();
+    const mark = found || (() => {
+      const made = document.createElement("div");
+      made.dataset.key = key;
+      made.className = "tm-drawn";
+      made.innerHTML = "<svg></svg>";
+      host.appendChild(made);
+      return made;
+    })();
+    mark.dataset.seen = "1";
+    mark.style.left = "0px";
+    mark.style.top = "0px";
+    const svg = mark.firstElementChild;
+    svg.setAttribute("width", window.innerWidth);
+    svg.setAttribute("height", window.innerHeight);
+    const from = origin();
+    // The marks are kept in the coordinates of the picture they were drawn on,
+    // so putting them back means undoing that: a drawing's own units go
+    // through the element's own transform, and a raster's pixels are measured
+    // from its corner and scale with it.
+    const painter = (scribble) => {
+      if (scribble.fmt === "svg") {
+        const inner = el.matches("svg") ? el : el.querySelector("svg");
+        const ctm = inner && inner.getScreenCTM();
+        if (!ctm) return null;
+        return {
+          at: (x, y) => {
+            const point = new DOMPoint(x, y).matrixTransform(ctm);
+            return { x: point.x - from.x, y: point.y - from.y };
+          },
+          unit: ctm.a || 1,
+        };
+      }
+      const scale = scribble.width ? box.width / scribble.width : 1;
+      return {
+        at: (x, y) => ({ x: box.left + x * scale - from.x, y: box.top + y * scale - from.y }),
+        unit: scale,
+      };
+    };
+    const shapes = drawn
+      .map(({ scribble, dotted }) => {
+        const paint = painter(scribble);
+        if (!paint) return "";
+        return scribble.shapes
+          .map((one) => {
+            const color = one.color || PEN_INK;
+            const width = round(Math.max(one.width * paint.unit, 1));
+            // Faint while it is waiting to be sent, solid once the server has
+            // it: the same thing said quietly and then said.
+            const waiting = dotted ? ` opacity="${DRAFT_INK}"` : "";
+            // A cross, which is what a hand makes when it means "here": a dot
+            // is easily read as part of the picture, and two strokes are not.
+            if (one.type === "point") {
+              const spot = paint.at(one.x, one.y);
+              const reach = width;
+              const cross =
+                `M${round(spot.x - reach)} ${round(spot.y - reach)} ` +
+                `L${round(spot.x + reach)} ${round(spot.y + reach)} ` +
+                `M${round(spot.x - reach)} ${round(spot.y + reach)} ` +
+                `L${round(spot.x + reach)} ${round(spot.y - reach)}`;
+              return `<path d="${cross}" fill="none" stroke="${color}" ` +
+                `stroke-width="${round(width * 0.55)}" stroke-linecap="round"${waiting}/>`;
+            }
+            const points = coordsOf(one.coords).map(([x, y]) => paint.at(x, y));
+            if (points.length < 2) return "";
+            return `<path d="${pathData(points)}" fill="none" stroke="${color}" ` +
+              `stroke-width="${width}" stroke-linecap="round" stroke-linejoin="round"${waiting}/>`;
+          })
+          .join("");
+      })
+      .join("");
+    // Clipped to the picture, the way the server clips them when it hands one
+    // to an agent: what was drawn past the edge is not about the page around it.
+    const clip = `tm-clip-${pin.uuid}`;
+    svg.innerHTML =
+      `<clipPath id="${clip}"><rect x="${round(box.left - from.x)}" y="${round(box.top - from.y)}" ` +
+      `width="${round(box.width)}" height="${round(box.height)}"/></clipPath>` +
+      `<g clip-path="url(#${clip})" opacity="${pinOpacity(pin)}">${shapes}</g>`;
+  };
+
+  // The points of a stroke, back from the base64 they are kept in.
+  const coordsOf = (coords) => {
+    const binary = atob(coords);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    const numbers = new Float32Array(bytes.buffer);
+    const out = [];
+    for (let i = 0; i + 1 < numbers.length; i += 2) out.push([numbers[i], numbers[i + 1]]);
+    return out;
+  };
+
   const CHIP_GAP = 7;
   const markerLine = (block, box) => {
     const el = block && block.el;
@@ -1104,6 +1249,7 @@
   const drawPin = (host, pin, geom, state) => {
     const dim = !!state;
     if (!geom || !geom.boxes.length) return;
+    drawMarks(host, pin, geom);
     const plain = pinColor(pin);
     const key = pin.uuid;
     const opacity = pinOpacity(pin);
@@ -1336,11 +1482,13 @@
       paint(el, false);
       el.style.opacity = opacity;
       place(el, b.left, b.bottom + 1, b.width, 2);
-      // Down to the underline, not just to the text: the mark is part of the
+      // Past the underline, not just to the text: the mark is part of the
       // annotation, and pointing at it must open that annotation rather than
-      // offer a second one over the same words.
+      // offer a second one over the same words. The reach below is where the
+      // underline and the letter are, which is where a hand aiming at an
+      // annotation goes.
       const hit = mark(host, key + ":h" + idx, "tm-hit");
-      place(hit, b.left, b.top, b.width, b.height + 5);
+      place(hit, b.left, b.top, b.width, b.height + TEXT_HIT_BELOW);
       openFor(hit, pin);
     });
     const last = boxes[boxes.length - 1];
@@ -2047,28 +2195,37 @@
     content.className = "ta-body";
     box.append(title, content);
     document.body.appendChild(box);
-    return { box, content };
+    return { box, content, title };
   };
 
   const msgRow = (hue, author, time, text, first) => {
     const wrap = document.createElement("div");
     wrap.style.marginTop = first ? "0" : "10px";
     const head = document.createElement("div");
-    head.style.cssText = "display:flex;align-items:baseline";
+    head.style.cssText = "display:flex;align-items:baseline;gap:5px";
     const who = document.createElement("b");
     who.style.cssText =
       "font-weight:650;font-size:12px;color:" +
       `color-mix(in oklab, ${hue} 30%, #ffffff)`;
     who.textContent = author || "unknown";
     const when = document.createElement("span");
-    when.style.cssText = "margin-left:auto;font-size:11px;color:rgba(255,255,255,0.4)";
-    when.textContent = time ? timeAgo(time) : "";
+    // Beside the name rather than across the row from it, at the same size and
+    // unemphasised: when something was said is a fact about the row rather
+    // than part of it. The annotation's own colour taken down towards the
+    // window's background, rather than white taken down, which comes out grey.
+    when.style.cssText =
+      "font-size:12px;font-weight:400;color:" +
+      `color-mix(in oklab, ${hue} 42%, #43434a)`;
+    when.textContent = time ? `(${longAgo(time)})` : "";
     when.title = time || "";
     head.append(who, when);
     const body = document.createElement("div");
+    // Tinted towards the annotation's own colour and away from white: what was
+    // said is read at leisure, and the window is next to a document it should
+    // not be shouting over.
     body.style.cssText =
       "margin-top:1px;white-space:pre-wrap;font-size:12.5px;color:" +
-      `color-mix(in oklab, ${hue} 22%, #f6f6f8)`;
+      `color-mix(in oklab, ${hue} 26%, #c4c4ca)`;
     body.textContent = text;
     wrap.append(head, body);
     return wrap;
@@ -2085,16 +2242,27 @@
     // the bottom, so extra height extends it upward.
     const autosize = () => {
       ta.style.height = "auto";
-      ta.style.height = ta.scrollHeight + "px";
+      ta.style.height = Math.max(ta.scrollHeight, least) + "px";
     };
-    requestAnimationFrame(autosize);
+    // Two lines at least, whatever is in it: the corner keeps a line for the
+    // pen and a line for what return does, and a field that shrank under them
+    // would put them on the words.
+    let least = 0;
+    requestAnimationFrame(() => {
+      const line = parseFloat(getComputedStyle(ta).lineHeight) || 18;
+      const pad = ta.offsetHeight - ta.clientHeight + 2 * (parseFloat(getComputedStyle(ta).paddingTop) || 0);
+      least = Math.round(line * Math.max(rows, 2) + pad);
+      autosize();
+    });
+    // What the field says about itself, down its right-hand edge: what return
+    // does at the top, and at the bottom — when a drawing is waiting — that
+    // the drawing goes with it. Opposite corners, so that neither lands on the
+    // other or on what is being typed.
     const hintEl = document.createElement("span");
-    hintEl.style.cssText =
-      "position:absolute;right:8px;top:7px;font-size:11px;" +
-      "color:rgba(255,255,255,0.28);pointer-events:none";
+    hintEl.className = "tm-field-hint";
     hintEl.textContent = hint;
     ta.addEventListener("input", () => {
-      hintEl.style.display = ta.value ? "none" : "";
+      hintEl.style.visibility = ta.value ? "hidden" : "";
       autosize();
       if (ta.__persistKey !== undefined) saveDraft(ta.__persistKey, ta.value);
     });
@@ -2108,8 +2276,22 @@
         closeBox();
       }
     });
-    wrap.append(ta, hintEl);
-    return { wrap, ta };
+    // A pen in the corner when a drawing is waiting on this field: what was
+    // drawn goes with what is typed, and there is otherwise nothing in the
+    // window to say so. In the same grey as the hint, since it says what is
+    // happening rather than being part of what is being written. Clicking it
+    // throws the drawing away.
+    const pen = document.createElement("button");
+    pen.type = "button";
+    pen.className = "tm-pen-waiting";
+    pen.hidden = true;
+    pen.innerHTML =
+      `<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">` +
+      `<path d="M3.4 10.8 L10.2 4 L13 6.8 L6.2 13.6 Z" fill="currentColor"/>` +
+      `<path d="M1 15 L3.4 10.8 L6.2 13.6 Z" fill="currentColor" opacity="0.55"/></svg>` +
+      `<span class="tm-tip">click to clear drawing</span>`;
+    wrap.append(ta, hintEl, pen);
+    return { wrap, ta, pen };
   };
 
   const pinSig = (pin) =>
@@ -2152,6 +2334,17 @@
 
   // A pin this page is holding rather than one the server sent: a draft goes
   // back to being written, and one that is waiting to be sent says so.
+  // A title bar that goes to what its window is about. Not the buttons in it,
+  // which have their own work.
+  const scrollsToPin = (title, pin) => {
+    title.style.cursor = "pointer";
+    title.title = "go to it";
+    title.addEventListener("click", (ev) => {
+      if (ev.target.closest("[data-act]")) return;
+      scrollToPin(pin);
+    });
+  };
+
   const showLocal = (pin) => {
     if (pin.state === "draft") {
       const kind = pin.location && pin.location.type === "word" ? "comment" : pin.location.type;
@@ -2215,6 +2408,9 @@
     ]);
     const parts = shell(pin.letter || "?", `${state}${pin.type || "comment"}`, acts);
     if (!parts) return;
+    // The window sits in the corner and the annotation may be anywhere: its
+    // title bar is the way back to what is being talked about.
+    scrollsToPin(parts.title, pin);
     openUuid = pin.uuid;
     openSig = pinSig(pin);
     const hue = ownColor(pin);
@@ -2232,16 +2428,20 @@
     for (const reply of pin.discussion || []) {
       parts.content.append(msgRow(hue, reply.author, reply.time, reply.content, false));
     }
-    const { wrap, ta } = replyField(
+    const { wrap, ta, pen } = replyField(
       hue,
       pin.resolved ? "Type reply to re-open" : "Type reply",
       "⏎ send",
-      1,
+      2,
       false,
       (field) => {
         const text = field.value.trim();
-        if (!text) return;
-        post("/api/annotate/reply", { uuid: pin.uuid, text }).then(refresh);
+        const drawn = scribbleBody(pendingFor(pin.uuid));
+        if (!text && !drawn) return;
+        post("/api/annotate/reply", { uuid: pin.uuid, text, scribble: drawn }).then(() => {
+          dropScribble(pin.uuid);
+          return refresh();
+        });
         // Answering a closed thread opens it again: the reply is the point,
         // and it would otherwise land somewhere nobody is looking.
         if (pin.resolved) post("/api/annotate/flags", { uuid: pin.uuid, resolved: false });
@@ -2251,6 +2451,7 @@
       },
     );
     parts.content.append(wrap);
+    penClears(pin.uuid, pen);
     ta.__persistKey = draftKey(pin);
     const persisted = loadDraft(ta.__persistKey);
     if (restore || persisted) {
@@ -2291,8 +2492,18 @@
     const draftUuid = (existing && existing.uuid) || draftId();
     const submit = (field) => {
       const text = field.value.trim();
-      if (text) {
-        const draft = { location, render: renderId, text, color, snapshot: snapshotOf(location) };
+      const drawn = scribbleBody(pendingFor(draftUuid));
+      // Words or a drawing: either is something to say, and enter sends what
+      // there is.
+      if (text || drawn) {
+        const draft = {
+          location,
+          render: renderId,
+          text,
+          color,
+          snapshot: snapshotOf(location),
+          scribble: drawn,
+        };
         dropDraft(draft);
         // The mark stays where it was put while the server has it, so that
         // pressing return does not make the annotation disappear and come back
@@ -2322,9 +2533,18 @@
       ["cancel", () => closeBox()],
     ]);
     if (!parts) return;
+    scrollsToPin(parts.title, { uuid: draftUuid, location, letter });
     composeActive = true;
-    const { wrap, ta } = replyField(letterColor(letter), "Type comment", "⏎ save", 3, true, submit);
+    const { wrap, ta, pen } = replyField(
+      letterColor(letter),
+      "Type comment",
+      "⏎ save",
+      3,
+      true,
+      submit,
+    );
     parts.content.append(wrap);
+    penClears(draftUuid, pen);
     // From the moment a place is picked, not from the first word: choosing
     // where a comment goes is most of the work of writing one.
     for (const event of ["input", "keyup", "click", "select"]) {
@@ -2399,10 +2619,10 @@
         pin.waiting = res.uuid;
         dropDraft(pin.draft);
         keepHeld();
-        // What was drawn on it before it was sent, now that there is an
-        // annotation to file the marks under.
-        sendMarks(pin.uuid, res.uuid);
-        if (pin.drawnAs) sendMarks(pin.drawnAs, res.uuid);
+        // The drawing went with it, so nothing is waiting on this page any
+        // more: what comes back from the server is drawn solid.
+        dropScribble(pin.uuid);
+        if (pin.drawnAs) dropScribble(pin.drawnAs);
         return refresh();
       }
       // No connection is about the page and will fix itself; a refusal is
@@ -2847,16 +3067,19 @@
   // itself, because the thing the reader drew on is a laid-out page and the
   // server has only the source it was made from.
   const PEN_W = 5;
+  // How far the pointer travels before the stroke takes another point.
+  const PEN_STEP = 10;
+  // How solid a drawing looks while it is still waiting to be sent.
+  const DRAFT_INK = 0.45;
   const PEN_INK = "#e8442f";
-  // What the pen looks like where there is nothing to draw on.
-  const PEN_GREY = "#8b8b93";
+  // Not a colour: what `penColor` answers where there is nothing to draw on,
+  // which the cursor turns into the forbidden pen rather than a pen in that
+  // shade.
+  const PEN_GREY = "none";
   // The locations that are pictures. A heading or a paragraph is text that an
   // agent reads in the source, and a drawing over it would say nothing the
   // source does not.
   const PEN_KINDS = ["svg", "image", "math", "math.block"];
-  // A region counts as a picture when it holds one, which is how a figure of a
-  // diagram comes to be drawable.
-  const PICTURE_INSIDE = "img,svg,math,canvas,video";
 
   // The annotations whose frames a pen may draw in, refreshed as the page is
   // drawn. The geometry is measured again at the moment it is needed, since
@@ -2912,7 +3135,12 @@
         const entry = byUid.get(uidOf(el));
         if (entry) {
           const kind = blockKind(entry.el, entry.kind);
-          if (PEN_KINDS.includes(kind)) return { el: entry.el, uid: entry.uid, kind };
+          // A picture by kind, or an element that is one in itself: a table is
+          // a region whose annotation is worth drawing on, while a paragraph
+          // with an equation in it is not — the equation is what to point at.
+          if (PEN_KINDS.includes(kind) || entry.el.matches(PICTURE_INSIDE)) {
+            return { el: entry.el, uid: entry.uid, kind };
+          }
         }
         el = el.parentElement;
       }
@@ -2951,9 +3179,8 @@
   // pressing anything, both that a drag would draw and what it would draw.
   // Grey says the same thing in the negative — here, nothing.
   const pens = new Map();
-  const penBitmap = (color, off) => {
-    const key = off ? `${color}:off` : color;
-    const held = pens.get(key);
+  const penBitmap = (color) => {
+    const held = pens.get(color);
     if (held) return held;
     const canvas = document.createElement("canvas");
     canvas.width = 16;
@@ -2985,9 +3212,6 @@
       ink.closePath();
     };
     ink.lineJoin = "round";
-    // A pen that would draw nothing is drawn faintly, so that it is not
-    // mistaken for one of the colours an annotation comes in.
-    ink.globalAlpha = off ? 0.45 : 1;
     ink.strokeStyle = "#101014";
     ink.lineWidth = 2.2;
     shape(barrel);
@@ -3004,35 +3228,59 @@
     ink.fillStyle = color;
     shape(point);
     ink.fill();
-    // And struck through, square to the barrel, which says it at a glance in a
-    // way that a shade of grey does not. Thin, so that the pen underneath is
-    // still a pen.
-    if (off) {
-      ink.globalAlpha = 1;
-      ink.lineCap = "round";
-      for (const [width, shade] of [[2.8, "#101014"], [1.2, "#f4f4f6"]]) {
-        ink.strokeStyle = shade;
-        ink.lineWidth = width;
-        ink.beginPath();
-        ink.moveTo(4.2, 4.2);
-        ink.lineTo(14.2, 14.2);
-        ink.stroke();
-      }
-    }
-    // The image and its hotspot only: the stylesheet says what to fall back to,
-    // and a keyword here would land in the middle of the list and make the
-    // whole declaration invalid, which reads as no cursor at all.
     const url = `url("${canvas.toDataURL("image/png")}") 1 15`;
-    pens.set(key, url);
+    pens.set(color, url);
     return url;
   };
+
+  // Where the pen would draw nothing, the pointer is a drawing rather than
+  // something drawn here: it has no colour to take from what is under it, and
+  // being a file it can be edited as a drawing. Its hotspot is the pen's own,
+  // at the bottom left.
+  //
+  // Drawn onto a canvas rather than handed to the browser as it is: an SVG
+  // cursor is not something every browser will take, and a picture of one is.
+  // Until it has been read, the drawing itself is offered, which the browsers
+  // that do take it will show meanwhile.
+  const FORBIDDEN_SVG = "/api/html/pen-forbidden.svg";
+  let forbidden = null;
+  const readForbidden = async () => {
+    try {
+      const drawn = await (await fetch(url(FORBIDDEN_SVG))).text();
+      // The drawing says how big it is and where in it the pointer is, so both
+      // can be changed by editing it.
+      const size = /viewBox="0 0 ([\d.]+) ([\d.]+)"/.exec(drawn);
+      const spot = /data-hotspot="([\d.]+) ([\d.]+)"/.exec(drawn);
+      const w = Math.round(size ? +size[1] : 16);
+      const h = Math.round(size ? +size[2] : 16);
+      const at = spot ? `${Math.round(+spot[1])} ${Math.round(+spot[2])}` : "1 15";
+      const drawing = new Image();
+      await new Promise((done, fail) => {
+        drawing.onload = done;
+        drawing.onerror = fail;
+        drawing.src = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(drawn);
+      });
+      const canvas = document.createElement("canvas");
+      canvas.width = w;
+      canvas.height = h;
+      canvas.getContext("2d").drawImage(drawing, 0, 0, w, h);
+      forbidden = `url("${canvas.toDataURL("image/png")}") ${at}`;
+    } catch (err) {
+      forbidden = `url("${url(FORBIDDEN_SVG)}") 1 15`;
+    }
+  };
+  const penForbidden = () => forbidden || `url("${url(FORBIDDEN_SVG)}") 1 15`;
 
   // Holding the key shows a pen wherever the pointer is: in the stroke's
   // colour where a drag would draw, and in grey where it would not.
   const penCursor = (color) => {
     const root = document.documentElement;
     root.classList.toggle("tm-pen", !!color);
-    if (color) root.style.setProperty("--tm-pen", penBitmap(color, color === PEN_GREY));
+    if (!color) return;
+    root.style.setProperty(
+      "--tm-pen",
+      color === PEN_GREY ? penForbidden() : penBitmap(color),
+    );
   };
 
   // The path as it is being drawn, over the frame and clipped to it.
@@ -3059,26 +3307,56 @@
     if (drawn) drawn.remove();
   };
 
-  // A stroke as an SVG path: straight segments between the points the pointer
-  // reported, which at the rate a mouse reports them is a curve.
-  const pathData = (points) =>
-    points.map((p, i) => `${i ? "L" : "M"}${round(p.x)} ${round(p.y)}`).join(" ");
+  // A stroke as an SVG path: a curve through the points the pointer reported.
+  //
+  // Straight segments between them show every place the hand changed direction
+  // and every place the subsampling dropped a report, which is a shape nobody
+  // drew. A Catmull-Rom spline passes through the points and is a cubic Bézier
+  // in disguise, so it can be written as one: each segment takes its handles
+  // from the neighbours on either side, a sixth of the way along.
+  const pathData = (points) => {
+    if (!points.length) return "";
+    if (points.length < 3) {
+      return points.map((p, i) => `${i ? "L" : "M"}${round(p.x)} ${round(p.y)}`).join(" ");
+    }
+    const at = (i) => points[Math.min(Math.max(i, 0), points.length - 1)];
+    let path = `M${round(points[0].x)} ${round(points[0].y)}`;
+    for (let i = 0; i < points.length - 1; i++) {
+      const [before, from, to, after] = [at(i - 1), at(i), at(i + 1), at(i + 2)];
+      const c1 = { x: from.x + (to.x - before.x) / 6, y: from.y + (to.y - before.y) / 6 };
+      const c2 = { x: to.x - (after.x - from.x) / 6, y: to.y - (after.y - from.y) / 6 };
+      path += ` C${round(c1.x)} ${round(c1.y)} ${round(c2.x)} ${round(c2.y)} ${round(to.x)} ${round(to.y)}`;
+    }
+    return path;
+  };
   const round = (n) => Math.round(n * 10) / 10;
 
-  // What the reader drew, in the coordinates of the picture it was drawn on,
-  // clipped to the frame. `at` maps a point from the viewport into those
-  // coordinates, and `unit` is what one pixel measures there.
-  const markupOf = (points, at, unit, clip) => {
-    const drawn = pathData(points.map(at));
-    const id = `tm-clip-${Math.random().toString(36).slice(2, 8)}`;
-    const rect =
-      `<rect x="${round(clip.x)}" y="${round(clip.y)}" ` +
-      `width="${round(clip.width)}" height="${round(clip.height)}"/>`;
-    return (
-      `<clipPath id="${id}">${rect}</clipPath>` +
-      `<g clip-path="url(#${id})"><path d="${drawn}" fill="none" stroke="${PEN_INK}" ` +
-      `stroke-width="${round(PEN_W * unit)}" stroke-linecap="round" stroke-linejoin="round"/></g>`
-    );
+  // What the reader drew, in the coordinates of the picture it was drawn on.
+  // `at` maps a point from the viewport into those coordinates, and `unit` is
+  // what one pixel measures there.
+  //
+  // A mark is the shape and nothing else: no clip, no caps, no joins. Those are
+  // how it is painted, and painting it is the server's business at the moment
+  // somebody asks to see it.
+  const markOf = (points, at, unit, color) => {
+    const placed = points.map(at);
+    const width = PEN_W * unit;
+    // A press that never became a stroke is a place, and a place is a place
+    // rather than a line of no length.
+    if (placed.length < 2) {
+      return { type: "point", x: placed[0].x, y: placed[0].y, width, color };
+    }
+    // Two floats a point, little-endian, base64: a stroke is a few hundred
+    // numbers, and numbers written as text are four times the size.
+    const coords = new Float32Array(placed.length * 2);
+    placed.forEach((point, at) => {
+      coords[at * 2] = point.x;
+      coords[at * 2 + 1] = point.y;
+    });
+    const bytes = new Uint8Array(coords.buffer);
+    let binary = "";
+    for (const byte of bytes) binary += String.fromCharCode(byte);
+    return { type: "path", coords: btoa(binary), width, color };
   };
 
   // ------------------------------------------------------- taking a picture
@@ -3114,6 +3392,15 @@
     };
     const corner = at({ x: box.left, y: box.top });
     const far = at({ x: box.right, y: box.bottom });
+    // Without the ids the exporter hangs on every element: they change
+    // whenever anything above them in the document does, and a picture is what
+    // it looks like. The server strips the same ones, so a drawing nobody has
+    // touched is the same capture whoever took it.
+    for (const el of [copy, ...copy.querySelectorAll("*")]) {
+      for (const name of ["data-uid", "data-typst-src", "data-typst-text", "data-typst-atom"]) {
+        el.removeAttribute(name);
+      }
+    }
     return {
       fmt: "svg",
       data: new XMLSerializer().serializeToString(copy),
@@ -3128,15 +3415,26 @@
 
   // A canvas holding the element as it is on the page, at the screen's own
   // resolution. Marks over one of these are in CSS pixels from its corner.
-  const rasterPicture = (canvas, box) => ({
-    fmt: "png",
-    data: canvas.toDataURL("image/png").replace(/^data:[^,]*,/, ""),
-    width: Math.round(box.width),
-    height: Math.round(box.height),
-    at: (p) => ({ x: p.x - box.left, y: p.y - box.top }),
-    unit: 1,
-    clip: new DOMRect(0, 0, box.width, box.height),
-  });
+  const rasterPicture = (canvas, box) => {
+    // A canvas that has had a drawing put on it is one some browsers will not
+    // read back. Nothing else about the stroke depends on this, so it is asked
+    // for where it can be refused.
+    let data;
+    try {
+      data = canvas.toDataURL("image/png").replace(/^data:[^,]*,/, "");
+    } catch (err) {
+      return null;
+    }
+    return {
+      fmt: "png",
+      data,
+      width: Math.round(box.width),
+      height: Math.round(box.height),
+      at: (p) => ({ x: p.x - box.left, y: p.y - box.top }),
+      unit: 1,
+      clip: new DOMRect(0, 0, box.width, box.height),
+    };
+  };
 
   const canvasFor = (box) => {
     const ratio = Math.min(window.devicePixelRatio || 1, 3);
@@ -3265,79 +3563,110 @@
   const pictureOf = async (el) =>
     svgPicture(el) || imagePicture(el) || (await rasterise(el));
 
-  // ------------------------------------------------------ keeping the marks
-  // What was drawn on an annotation the server has not got yet, kept until it
-  // has: a draft has no id to file a capture under until it has been sent.
-  const heldMarks = new Map();
-  const keepMarks = (uuid, capture) => {
-    const held = heldMarks.get(uuid) || [];
-    held.push(capture);
-    heldMarks.set(uuid, held);
+  // --------------------------------------------------- keeping the scribbles
+  // A drawing is part of what somebody is saying, so it waits with the words:
+  // held against the annotation being written, or against the reply being
+  // written on one that exists, and sent when that is sent. Until then it is
+  // drawn dotted, the way an annotation that has not been sent is.
+  const pending = new Map();
+  const scribbleId = () => `s${Math.random().toString(36).slice(2, 10)}`;
+  const pendingFor = (uuid) => pending.get(uuid) || null;
+  const holdScribble = (uuid, picture, mark) => {
+    const held = pending.get(uuid);
+    // The same picture drawn on again is the same scribble with more in it.
+    if (held && held.picture.fmt === picture.fmt && held.picture.data === picture.data) {
+      held.shapes.push(mark);
+      held.at = picture;
+      return held;
+    }
+    const fresh = {
+      id: scribbleId(),
+      shapes: [mark],
+      picture: { fmt: picture.fmt, data: picture.data, width: picture.width, height: picture.height },
+      at: picture,
+      el: picture.el,
+    };
+    pending.set(uuid, fresh);
+    return fresh;
   };
-  const sendMarks = (draftUuid, uuid) => {
-    const held = heldMarks.get(draftUuid);
-    if (!held || !held.length) return Promise.resolve();
-    heldMarks.delete(draftUuid);
-    return held
-      .reduce(
-        (queue, capture) => queue.then(() => post("/api/annotate/capture", { ...capture, uuid })),
-        Promise.resolve(),
-      )
-      .then(() => refresh());
+  const dropScribble = (uuid) => {
+    pending.delete(uuid);
+    showWaitingPen();
   };
 
+  // The pen in the corner of whichever field is open, if a drawing is waiting
+  // on it.
+  let waitingPen = null;
+  const showWaitingPen = () => {
+    if (!waitingPen || !waitingPen.pen.isConnected) {
+      waitingPen = null;
+      return;
+    }
+    waitingPen.pen.hidden = !pendingFor(waitingPen.uuid);
+  };
+  const penClears = (uuid, pen) => {
+    waitingPen = { uuid, pen };
+    pen.onclick = (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      dropScribble(uuid);
+      render();
+      const field = document.querySelector(`#${BOX_ID} textarea`);
+      if (field) field.focus();
+    };
+    showWaitingPen();
+  };
+  // What goes in a request: the shapes and the picture, without the page's own
+  // way of putting them back on the screen.
+  const scribbleBody = (held) =>
+    held && held.shapes.length
+      ? { id: held.id, shapes: held.shapes, picture: held.picture }
+      : undefined;
+
   const finishSketch = async (sk) => {
-    if (sk.points.length < 2) return;
     const picture = await pictureOf(sk.el);
     if (!picture) {
       showBanner("cannot take a picture of this to draw on", "warn");
       return;
     }
-    // The frame, in the picture's own coordinates: what is drawn is clipped to
-    // it, so a stroke that ran off the edge stops at the edge.
-    const near = picture.at({ x: sk.box.left, y: sk.box.top });
-    const far = picture.at({ x: sk.box.right, y: sk.box.bottom });
-    const clip = new DOMRect(
-      Math.min(near.x, far.x),
-      Math.min(near.y, far.y),
-      Math.abs(far.x - near.x),
-      Math.abs(far.y - near.y),
+    const mark = markOf(
+      sk.points.map((p) => ({ x: p.x + sk.box.left, y: p.y + sk.box.top })),
+      picture.at,
+      picture.unit,
+      sk.color,
     );
-    const capture = {
-      fmt: picture.fmt,
-      data: picture.data,
-      width: picture.width,
-      height: picture.height,
-      markup: markupOf(
-        sk.points.map((p) => ({ x: p.x + sk.box.left, y: p.y + sk.box.top })),
-        picture.at,
-        picture.unit,
-        clip,
-      ),
-    };
-    // An annotation the server has not got yet has no id to file a capture
-    // under, so what was drawn on it waits until it has one.
-    if (sk.pin.state || String(sk.pin.uuid).startsWith(DRAFT_ID)) {
-      keepMarks(sk.pin.uuid, capture);
-      showBanner("the marks go with the annotation when it is sent", "note");
-      return;
-    }
-    const res = await post("/api/annotate/capture", { ...capture, uuid: sk.pin.uuid });
-    if (res && res.ok) {
-      showBanner(`marked ${sk.pin.letter || "an annotation"}`, "note");
-      refresh();
-    } else {
-      showBanner((res && res.error) || "the server would not take the marks", "warn");
-    }
+    picture.el = sk.el;
+    holdScribble(sk.pin.uuid, picture, mark);
+    render();
+    showWaitingPen();
+    // The window is where the words go, and the drawing goes with them: an
+    // annotation that exists opens its own, and one still being written is
+    // already open on the draft the drawing was held against.
+    if (!sk.pin.state && openUuid !== sk.pin.uuid) showAnnot(sk.pin);
+    else if (sk.pin.state && composing !== sk.pin.uuid) showLocal(sk.pin);
+    showWaitingPen();
+    focusField();
+  };
+
+  // The field a scribble is waiting on, so that a stroke leaves the pointer
+  // ready to type.
+  const focusField = () => {
+    const field = document.querySelector(`#${BOX_ID} textarea`);
+    if (field) field.focus();
   };
 
   const onMouseDown = (ev) => {
-    if (!annotating || ev.button !== 0 || onOverlay(ev)) return;
+    if (!annotating || ev.button !== 0 || inBox(ev)) return;
     // Held down, command draws on a picture. Offered even while a window is
     // open, since what is being written is often about the picture being drawn
     // on, and offered on a picture nothing is annotated on yet: the annotation
     // is made by the same press that starts the stroke, since a mark on a
     // picture is a remark about it.
+    //
+    // Asked before the marks are stepped over. A framed annotation lays a mark
+    // across the whole of what it frames, so a press inside the frame of the
+    // annotation most worth drawing on lands on a mark, and stepping over the
+    // marks first is refusing to draw exactly where drawing was offered.
     if (ev.metaKey) {
       const target = penTarget(ev.clientX, ev.clientY);
       if (!target) return;
@@ -3363,13 +3692,21 @@
       if (target.pin && openUuid !== pin.uuid) showAnnot(pin);
       return;
     }
-    // Shift drags from one place between blocks to another, which is the
-    // stretch of document between them.
+    // Everything else is about the document, and a press on a mark belongs to
+    // the mark: it opens the annotation it is part of.
+    if (onOverlay(ev)) return;
+    // Shift drags from one place to another, which is the stretch of document
+    // between them: between two gaps in a line, that is the words between them
+    // exactly, and between two block edges it is the blocks.
     if (ev.shiftKey) {
       if (openUuid !== null || composeActive) return; // this click only dismisses
       const spot = positionAt(ev.clientX, ev.clientY);
-      if (!spot || !spot.edge) return;
-      vdrag = { from: { x: ev.clientX, y: ev.clientY }, start: spot.edge, moved: false };
+      if (!spot) return;
+      if (spot.edge) {
+        vdrag = { from: { x: ev.clientX, y: ev.clientY }, start: spot.edge, moved: false };
+      } else {
+        pdrag = { from: { x: ev.clientX, y: ev.clientY }, start: spot.gap, moved: false };
+      }
       return;
     }
     if (openUuid !== null || composeActive) return; // this click only dismisses
@@ -3381,6 +3718,8 @@
   // every report would otherwise measure the page again. The last one before
   // the next frame is the only one that matters.
   let vdrag = null;
+  // A shift drag that began on a line: the stretch between two positions.
+  let pdrag = null;
   let hovering = null;
   let hoverFrame = 0;
   const hoverSoon = (ev) => {
@@ -3399,14 +3738,48 @@
   };
   const onMouseMove = (ev) => {
     if (!annotating) return;
+    // Where the pointer is, before anything decides whether to draw a preview
+    // for it. Pressing a modifier without moving is answered from here, and a
+    // pointer that came to rest over a mark — or while the page was scrolling,
+    // or with a window open — never reached the place that used to record it.
+    pointer = {
+      x: ev.clientX,
+      y: ev.clientY,
+      alt: ev.altKey,
+      shift: ev.shiftKey,
+      meta: ev.metaKey,
+    };
     if (sketch) {
       const at = { x: ev.clientX - sketch.box.left, y: ev.clientY - sketch.box.top };
       const last = sketch.points[sketch.points.length - 1];
-      // A mouse reports a position far more often than a stroke has corners.
-      if (Math.hypot(at.x - last.x, at.y - last.y) >= 2) {
+      // A pointer reports a position far more often than a stroke changes
+      // direction, and every report kept is a number stored and drawn forever.
+      // One every PEN_STEP pixels is a curve at the size these are looked at.
+      if (Math.hypot(at.x - last.x, at.y - last.y) >= PEN_STEP) {
         sketch.points.push(at);
         drawSketch(sketch);
       }
+      return;
+    }
+    if (pdrag) {
+      if (!pdrag.moved && Math.hypot(ev.clientX - pdrag.from.x, ev.clientY - pdrag.from.y) < 4) {
+        return;
+      }
+      pdrag.moved = true;
+      const spot = positionAt(ev.clientX, ev.clientY);
+      if (!spot || !spot.gap) return;
+      pdrag.end = spot.gap;
+      // Exactly what the two positions have between them, rather than the
+      // whole words: the point of holding the key is to be exact.
+      previewUnderline(
+        rectsOf(
+          domRange(
+            { node: pdrag.start.run.node, at: pdrag.start.at },
+            { node: pdrag.end.run.node, at: pdrag.end.at },
+          ),
+        ),
+        true,
+      );
       return;
     }
     if (vdrag) {
@@ -3462,6 +3835,27 @@
     );
   };
   const onMouseUp = (ev) => {
+    if (pdrag) {
+      const dragged = pdrag;
+      pdrag = null;
+      clearHover();
+      if (!dragged.moved || !dragged.end) return;
+      const { start, end } = dragged;
+      // Two names for the same place are one place, and a span needs two.
+      if (start.run === end.run && start.at === end.at) return;
+      const forwards =
+        start.run === end.run ? start.at < end.at : start.box.top <= end.box.top;
+      const [from, to] = forwards ? [start, end] : [end, start];
+      ev.preventDefault();
+      ev.stopImmediatePropagation();
+      swallowClick = true;
+      compose("span", {
+        type: "span.h",
+        begin: cursorRef(from.run, from.at),
+        end: cursorRef(to.run, to.at),
+      });
+      return;
+    }
     if (sketch) {
       const drawn = sketch;
       sketch = null;
@@ -3469,6 +3863,14 @@
       ev.preventDefault();
       ev.stopImmediatePropagation();
       swallowClick = true;
+      // Where it was let go, so that the stroke ends where the pointer did
+      // rather than at the last point the subsampling kept. A press that never
+      // moved keeps its single point, which is what makes it a place.
+      const end = { x: ev.clientX - drawn.box.left, y: ev.clientY - drawn.box.top };
+      const last = drawn.points[drawn.points.length - 1];
+      if (drawn.points.length > 1 && Math.hypot(end.x - last.x, end.y - last.y) >= 1) {
+        drawn.points.push(end);
+      }
       finishSketch(drawn);
       return;
     }
@@ -4165,6 +4567,7 @@
   };
 
   if (ANNOTATE) {
+    readForbidden();
     buildToggle();
     document.documentElement.classList.add("tm-annotate");
     window.addEventListener("mousedown", onMouseDown, true);
@@ -4190,8 +4593,9 @@
       if (e.key === "Meta" && !sketch) penCursor(false);
     }, true);
     document.addEventListener("keydown", (e) => {
-      if (e.key === "Escape" && (drag || sketch)) {
+      if (e.key === "Escape" && (drag || sketch || pdrag)) {
         drag = null;
+        pdrag = null;
         sketch = null;
         clearSketch();
         clearHover();

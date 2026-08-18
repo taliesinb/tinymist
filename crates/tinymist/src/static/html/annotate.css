@@ -154,8 +154,41 @@ body {
   padding: 0.25rem 0.5rem;
 }
 
+/* Raw text. The exporter puts the monospace family on every run and a size on
+   the inline ones — 0.8em — but nothing at all on the runs inside a block,
+   which therefore come out at the size of the prose around them. Monospace at
+   the size of a serif body text reads as larger than it, so a code block was
+   the loudest thing on the page, and with no ground under it there was nothing
+   to say where it began and ended. Same size as inline raw, on a tint of the
+   page's own colour. */
 .tm-doc pre {
   overflow-x: auto;
+  font-size: 0.8em;
+  line-height: 1.5;
+  margin-block: 1em;
+  padding: 0.75em 0.9em;
+  border: 1px solid var(--tm-rule);
+  border-radius: 5px;
+  background: color-mix(in srgb, var(--tm-fg) 7%, var(--tm-bg));
+  tab-size: 2;
+}
+
+/* The exporter highlights code in a palette chosen for paper: mid blues and
+   greens that are dark against white and nearly black against a dark page.
+   Only the coloured runs are touched, and only their lightness and how much
+   they insist. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .tm-doc :is(pre, code) span[style*="color"] {
+    filter: brightness(1.55) saturate(0.75);
+  }
+}
+
+/* Inline raw already carries its size; what it wants is enough ground to be
+   read as a name rather than as a word that changed font. */
+.tm-doc :not(pre) > code {
+  padding: 0.1em 0.3em;
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--tm-fg) 7%, var(--tm-bg));
 }
 
 /* Math arrives as MathML. Browsers have a math font of their own, but the
@@ -384,11 +417,16 @@ html.tm-offline #tinymist-marks * {
 /* The annotation window: docked bottom-left, coloured by status. */
 #tinymist-annot-box {
   position: fixed;
-  left: 12px;
+  /* Along the bottom, in the middle: the document is a column in the middle of
+     the page, so a window at one side is at the far edge of what is being read
+     while a window under it is right there. */
+  left: 50%;
+  transform: translateX(-50%);
   /* Just above whatever the status panel is saying, which grows from the
      bottom of the window. */
   bottom: calc(12px + var(--tm-status-height, 0px));
-  width: 280px;
+  width: 420px;
+  max-width: calc(100vw - 24px);
   border-radius: 8px;
   overflow: hidden;
   z-index: 2147483647;
@@ -636,9 +674,13 @@ html.tm-pen #tinymist-marks .tm-hit {
   cursor: var(--tm-pen), crosshair;
 }
 
+/* A stroke as it is being drawn. Not clipped to the frame it is drawn in: a
+   hand that runs past the edge of a picture is drawing on the picture and
+   overshooting, and a line that stops dead at the edge reads as a mistake. It
+   is clipped where it is composited, once, onto what it is about. */
 #tinymist-marks .tm-sketch {
   position: absolute;
-  overflow: hidden;
+  overflow: visible;
   pointer-events: none;
 }
 
@@ -646,4 +688,83 @@ html.tm-pen #tinymist-marks .tm-hit {
   width: 100%;
   height: 100%;
   overflow: visible;
+}
+
+/* What the reader drew, drawn again over the picture it was drawn on. Fixed to
+   the viewport like every other mark, so it travels with the text it is on. */
+#tinymist-marks .tm-drawn {
+  position: absolute;
+  pointer-events: none;
+}
+
+/* The corner of a field, where it says what return will do — and, when a
+   drawing is waiting to go with what is typed, that there is one. A row
+   anchored to the right, so the pen appearing moves the hint along instead of
+   sitting on it. The pen is in the hint's own grey: it says what is happening
+   rather than being part of what is being written, and what it says appears on
+   hover, since it is also the way to throw the drawing away. */
+/* What a field says about itself, down its right-hand edge: the pen at the top
+   when a drawing is waiting to go with what is typed, and what return does at
+   the bottom. Opposite corners of a field that is two lines at least, so
+   neither lands on the other. What return does is said in grey, since it is
+   only how to send; the pen is white, since it is part of what is sent. */
+#tinymist-annot-box .tm-field-hint {
+  position: absolute;
+  right: 8px;
+  bottom: 6px;
+  font-size: 11px;
+  color: rgba(255, 255, 255, 0.28);
+  pointer-events: none;
+}
+
+/* A rule that sets `display` beats the browser's own rule for `hidden`, so
+   what is hidden in the annotator's own chrome has to say so here as well.
+   Only the chrome: what the document does with the attribute is its business. */
+#tinymist-annot-box [hidden],
+#tinymist-marks [hidden],
+#tinymist-status [hidden] {
+  display: none !important;
+}
+
+#tinymist-annot-box .tm-pen-waiting {
+  position: absolute;
+  right: 7px;
+  top: 7px;
+  display: flex;
+  align-items: center;
+  padding: 0;
+  border: 0;
+  background: none;
+  font: inherit;
+  font-size: 11px;
+  line-height: 0;
+  /* White, not grey: the pen says a drawing is going with this, which is the
+     one thing in the corner that is about what is being sent rather than about
+     how to send it. */
+  color: #f2f2f4;
+  cursor: pointer;
+}
+
+/* What the pen does, said under it rather than beside it: room for the words
+   would otherwise have to be kept in the corner whether they are being read or
+   not. Shown the moment the pointer arrives, since a pointer that is on it is
+   already asking. */
+#tinymist-annot-box .tm-pen-waiting .tm-tip {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 5px);
+  display: none;
+  padding: 3px 6px;
+  border-radius: 4px;
+  border: 1px solid var(--tm-rule);
+  background: var(--tm-halo);
+  color: rgba(255, 255, 255, 0.72);
+  font-size: 11px;
+  line-height: normal;
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+#tinymist-annot-box .tm-pen-waiting:hover .tm-tip {
+  display: block;
 }
