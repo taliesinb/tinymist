@@ -629,6 +629,13 @@ html.tm-pen.tm-annotate body {
 /* A stroke as it is being drawn. Clipped by the frame it is drawn in, which is
    what the box around it is: the marks belong to the picture, not to the page
    around it. */
+/* A mark of an annotation is something to click, and says so with a hand. Not
+   while the pen is out: what is under the pointer then is the picture the mark
+   is drawn on, and the mark is in front of it. */
+html.tm-pen #tinymist-marks .tm-hit {
+  cursor: var(--tm-pen), crosshair;
+}
+
 #tinymist-marks .tm-sketch {
   position: absolute;
   overflow: hidden;

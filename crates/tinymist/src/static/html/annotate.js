@@ -2899,14 +2899,19 @@
   // The innermost wins, since the elements nest: a drawing inside a figure
   // inside a section.
   const pictureUnder = (x, y) => {
-    let el = document.elementFromPoint(x, y);
-    while (el && el !== document.body) {
-      const entry = byUid.get(uidOf(el));
-      if (entry) {
-        const kind = blockKind(entry.el, entry.kind);
-        if (PEN_KINDS.includes(kind)) return { el: entry.el, uid: entry.uid, kind };
+    // Everything under the point, not the topmost: the marks of the
+    // annotations are in front of the document, and what is being pointed at
+    // is behind them.
+    for (let el of document.elementsFromPoint(x, y)) {
+      if (el.closest(`#${MARKS_ID}, #${BOX_ID}`)) continue;
+      while (el && el !== document.body) {
+        const entry = byUid.get(uidOf(el));
+        if (entry) {
+          const kind = blockKind(entry.el, entry.kind);
+          if (PEN_KINDS.includes(kind)) return { el: entry.el, uid: entry.uid, kind };
+        }
+        el = el.parentElement;
       }
-      el = el.parentElement;
     }
     return null;
   };
