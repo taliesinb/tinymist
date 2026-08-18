@@ -2876,36 +2876,52 @@
     canvas.width = 16;
     canvas.height = 16;
     const ink = canvas.getContext("2d");
-    ink.lineCap = "round";
-    // The barrel, outlined so that it reads on any background.
+    // A pen seen from the side: pointed at the bottom left, where the hotspot
+    // is, and cut off square at the top right. Outlined in near-black so that
+    // it reads on a dark page and a light one.
+    const barrel = [
+      [3.4, 10.8],
+      [10.2, 4.0],
+      [13.0, 6.8],
+      [6.2, 13.6],
+    ];
+    const nib = [
+      [1.0, 15.0],
+      [3.4, 10.8],
+      [6.2, 13.6],
+    ];
+    const point = [
+      [1.0, 15.0],
+      [2.6, 12.6],
+      [4.2, 14.2],
+    ];
+    const shape = (points) => {
+      ink.beginPath();
+      ink.moveTo(points[0][0], points[0][1]);
+      for (const [x, y] of points.slice(1)) ink.lineTo(x, y);
+      ink.closePath();
+    };
+    ink.lineJoin = "round";
     ink.strokeStyle = "#101014";
-    ink.lineWidth = 5;
-    ink.beginPath();
-    ink.moveTo(4, 12);
-    ink.lineTo(13, 3);
+    ink.lineWidth = 2.2;
+    shape(barrel);
     ink.stroke();
-    ink.strokeStyle = color;
-    ink.lineWidth = 2.6;
-    ink.beginPath();
-    ink.moveTo(4.5, 11.5);
-    ink.lineTo(12.5, 3.5);
+    shape(nib);
     ink.stroke();
-    // The nib, at the point being drawn at.
-    ink.fillStyle = "#101014";
-    ink.beginPath();
-    ink.moveTo(0.5, 15.5);
-    ink.lineTo(6, 12.5);
-    ink.lineTo(3.5, 10);
-    ink.closePath();
-    ink.fill();
     ink.fillStyle = color;
-    ink.beginPath();
-    ink.moveTo(2.5, 13.5);
-    ink.lineTo(5, 12.2);
-    ink.lineTo(3.8, 11);
-    ink.closePath();
+    shape(barrel);
     ink.fill();
-    const url = `url("${canvas.toDataURL("image/png")}") 1 15, crosshair`;
+    ink.fillStyle = "#f4f4f6";
+    shape(nib);
+    ink.fill();
+    // The very point, in the ink the pen would draw with.
+    ink.fillStyle = color;
+    shape(point);
+    ink.fill();
+    // The image and its hotspot only: the stylesheet says what to fall back to,
+    // and a keyword here would land in the middle of the list and make the
+    // whole declaration invalid, which reads as no cursor at all.
+    const url = `url("${canvas.toDataURL("image/png")}") 1 15`;
     pens.set(color, url);
     return url;
   };
