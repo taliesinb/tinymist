@@ -47,6 +47,16 @@ pub fn read_sidecar(path: &std::path::Path) -> Sidecar {
     Sidecar::read(path).unwrap_or_default()
 }
 
+/// The same, for whoever is about to write it back.
+///
+/// A file that cannot be read is not a file with nothing in it. Reading one as
+/// empty and then writing it back is how a sidecar full of somebody's work
+/// becomes a sidecar with one annotation in it, so anything that is going to
+/// write says here that it could not read.
+fn read_sidecar_to_change(path: &std::path::Path) -> Result<Sidecar, String> {
+    Sidecar::read(path)
+}
+
 /// Serialised so that two writes of the same annotations produce the same
 /// bytes, since these files are kept in a repository beside the documents.
 pub fn write_sidecar(path: &std::path::Path, sidecar: &Sidecar) -> Result<(), String> {
@@ -63,7 +73,7 @@ pub fn revise<T>(
     change: impl FnOnce(&mut Sidecar) -> Result<T, String>,
 ) -> Result<T, String> {
     let _held = SIDECAR_LOCK.lock();
-    let mut sidecar = read_sidecar(path);
+    let mut sidecar = read_sidecar_to_change(path)?;
     let out = change(&mut sidecar)?;
     write_sidecar(path, &sidecar)?;
     Ok(out)
@@ -126,6 +136,86 @@ pub struct AnnotateRequest {
     /// author could sign a colleague's name to a comment.
     #[serde(skip)]
     pub author: Option<String>,
+    /// What was drawn while writing it, if anything was.
+    #[serde(default)]
+    pub scribble: Option<NewScribble>,
+}
+
+/// A drawing as it arrives from a page: the shapes, and the picture they were
+/// drawn on, which the server has not seen before.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct NewScribble {
+    /// The name the page gave it.
+    pub id: String,
+    /// What was drawn, in the picture's coordinates.
+    pub shapes: Vec<tinymist_annos::Mark>,
+    /// The picture itself.
+    pub picture: NewPicture,
+}
+
+/// A picture a page took of what an annotation is about.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct NewPicture {
+    /// `svg` or `png`.
+    pub fmt: String,
+    /// SVG text, or base64 for a PNG.
+    pub data: String,
+    /// How wide it is on the page, in CSS pixels.
+    pub width: u32,
+    /// How tall.
+    pub height: u32,
+}
+
+/// Stores the picture a scribble was drawn on and returns the scribble, filed
+/// against the capture it belongs to.
+///
+/// A picture that is already there is not stored twice: the same drawing
+/// scribbled on a second time is the same capture, and a scribble names it.
+pub fn keep_scribble(
+    record: &mut AnnotationRecord,
+    new: NewScribble,
+) -> Result<tinymist_annos::Scribble, String> {
+    let bytes = match new.picture.fmt.as_str() {
+        "svg" => new.picture.data.into_bytes(),
+        "png" => {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD
+                .decode(new.picture.data.as_bytes())
+                .map_err(|err| format!("the picture is not base64: {err}"))?
+        }
+        other => return Err(format!("a capture cannot be {other}")),
+    };
+    let hash = crate::tool::serve::capture::store(&bytes, &new.picture.fmt)
+        .ok_or("cannot store the capture")?;
+    // The same bytes are the same picture, and a picture that says it is a
+    // different size is a different capture: a scribble's coordinates are
+    // relative to what its capture says it measures.
+    let held = record.captures.iter().find(|capture| {
+        capture.hash == hash
+            && capture.fmt == new.picture.fmt
+            && capture.width == new.picture.width
+            && capture.height == new.picture.height
+    });
+    let capture = match held {
+        Some(capture) => capture.name().to_owned(),
+        None => {
+            let id = fresh_uuid(&hash);
+            record.captures.push(tinymist_annos::Capture {
+                id: id.clone(),
+                time: tinymist_project::iso_now(),
+                fmt: new.picture.fmt,
+                hash,
+                width: new.picture.width,
+                height: new.picture.height,
+            });
+            id
+        }
+    };
+    Ok(tinymist_annos::Scribble {
+        id: new.id,
+        capture,
+        shapes: new.shapes,
+    })
 }
 
 
@@ -135,8 +225,15 @@ pub trait AnnotationServer: Send + Sync {
     /// Deletes an annotation by uuid.
     fn remove(&self, uuid: &str) -> Result<(), String>;
     /// Appends a reply to an annotation's discussion. `author` is the identity
-    /// the server resolved for the request, if it found one.
-    fn reply(&self, uuid: &str, text: &str, author: Option<&str>) -> Result<(), String>;
+    /// the server resolved for the request, if it found one; `scribble` is what
+    /// was drawn while writing it, if anything was.
+    fn reply(
+        &self,
+        uuid: &str,
+        text: &str,
+        author: Option<&str>,
+        scribble: Option<NewScribble>,
+    ) -> Result<(), String>;
     /// Sets an annotation's flags — claimed, resolved, or both. Whichever is
     /// left out is left alone.
     fn set_flags(&self, uuid: &str, claimed: Option<bool>, resolved: Option<bool>)
@@ -145,13 +242,6 @@ pub trait AnnotationServer: Send + Sync {
     /// before rewriting it.
     fn block(&self, _uuid: &str, _context: bool) -> Result<SourceBlock, String> {
         Err("this server cannot read blocks".into())
-    }
-
-    /// Records a picture of what an annotation points at, with the marks the
-    /// reader drew over it. Taken by the page rather than by the server: what
-    /// the reader drew on is a laid-out page, which only a browser has.
-    fn add_capture(&self, _uuid: &str, _capture: AnnotationCapture) -> Result<(), String> {
-        Err("this server cannot store captures".into())
     }
 
     /// What the document and its sidecar say about each other: anchors nothing
@@ -849,12 +939,17 @@ impl DiskAnnotationServer {
             claimed: false,
             resolved: false,
             content: req.text.clone(),
+            scribble: None,
             discussion: vec![],
             captures: vec![],
         };
         let uuid = record.uuid.clone();
+        let mut drawn = req.scribble.clone();
         let record = revise(&sidecar_path, |sidecar| {
             let mut record = record;
+            if let Some(new) = drawn.take() {
+                record.scribble = Some(keep_scribble(&mut record, new)?);
+            }
             record.letter = sidecar.next_letter();
             sidecar.put(record.clone());
             Ok(record)
@@ -924,13 +1019,18 @@ impl crate::tool::serve::AnnotationServer for DiskAnnotationServer {
             claimed: false,
             resolved: false,
             content: req.text.clone(),
+            scribble: None,
             discussion: vec![],
             captures: vec![],
         };
+        let mut drawn = req.scribble.clone();
         let record = revise(&sidecar_path, |sidecar| {
             // The letter is the server's to give: two pages composing at once
             // would otherwise both think they are `c`.
             let mut record = record;
+            if let Some(new) = drawn.take() {
+                record.scribble = Some(keep_scribble(&mut record, new)?);
+            }
             record.letter = sidecar.next_letter();
             sidecar.put(record.clone());
             Ok(record)
@@ -989,19 +1089,31 @@ impl crate::tool::serve::AnnotationServer for DiskAnnotationServer {
         Ok(())
     }
 
-    fn reply(&self, uuid: &str, text: &str, author: Option<&str>) -> Result<(), String> {
+    fn reply(
+        &self,
+        uuid: &str,
+        text: &str,
+        author: Option<&str>,
+        scribble: Option<NewScribble>,
+    ) -> Result<(), String> {
         let art = self.art()?;
         let sidecar_path = sidecar_path(&art).ok_or("cannot determine the sidecar path")?;
         let author = author_or_local(author);
         let now = tinymist_project::iso_now();
+        let mut scribble = scribble;
         revise(&sidecar_path, |sidecar| {
             let record = sidecar
                 .find_mut(uuid)
                 .ok_or_else(|| format!("no annotation {uuid}"))?;
+            let drawn = match scribble.take() {
+                Some(new) => Some(keep_scribble(record, new)?),
+                None => None,
+            };
             record.discussion.push(AnnotationReply {
                 author: author.clone(),
                 time: now.clone(),
                 content: text.to_owned(),
+                scribble: drawn,
             });
             record.mtime = now.clone();
             Ok(())
@@ -1238,19 +1350,6 @@ impl crate::tool::serve::AnnotationServer for DiskAnnotationServer {
         let art = self.art()?;
         let sidecar = sidecar_path(&art).ok_or("cannot determine the sidecar path")?;
         Ok(read_sidecar(&sidecar).annotations)
-    }
-
-    fn add_capture(&self, uuid: &str, capture: AnnotationCapture) -> Result<(), String> {
-        let art = self.art()?;
-        let sidecar = sidecar_path(&art).ok_or("cannot determine the sidecar path")?;
-        let uuid = uuid.to_owned();
-        revise(&sidecar, |held| {
-            let record = held
-                .find_mut(&uuid)
-                .ok_or_else(|| format!("no annotation {uuid}"))?;
-            record.captures.push(capture);
-            Ok(())
-        })
     }
 
     fn pins(&self) -> Vec<super::pins::HtmlPin> {

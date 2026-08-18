@@ -61,6 +61,29 @@ pub struct HtmlPin {
     /// annotation was about.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snapshot: Option<String>,
+    /// The drawings on the picture as it looks now, oldest first. The page
+    /// draws them over it, so that a scribble is something the reader can see
+    /// as well as something an agent is handed.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub scribbles: Vec<HtmlScribble>,
+}
+
+/// A drawing on an annotation, as the page needs it: what it is, and what its
+/// coordinates are in.
+#[derive(Debug, Clone, Serialize)]
+pub struct HtmlScribble {
+    /// Its own name.
+    pub id: String,
+    /// `svg` for coordinates in the drawing's own units, `png` for CSS pixels
+    /// from the corner of the picture.
+    pub fmt: String,
+    /// How wide the picture was when it was drawn on, in CSS pixels: a picture
+    /// that is a different size now scales them.
+    pub width: u32,
+    /// Likewise.
+    pub height: u32,
+    /// What was drawn.
+    pub shapes: Vec<tinymist_annos::Mark>,
 }
 
 /// Every annotation of a document, placed on the rendering a page is showing.
@@ -115,6 +138,27 @@ fn pin_for(rec: &AnnotationRecord, ctx: &tinymist_annos::resolve::Context) -> Ht
         location,
         orphaned,
         snapshot: rec.snapshot.clone(),
+        // Only what is drawn on the picture as it stands: a scribble on an
+        // older capture is about a picture that has been redrawn since, and
+        // its coordinates are that picture's.
+        scribbles: rec
+            .captures
+            .last()
+            .map(|capture| {
+                std::iter::once(&rec.scribble)
+                    .chain(rec.discussion.iter().map(|reply| &reply.scribble))
+                    .flatten()
+                    .filter(|scribble| scribble.capture == capture.name())
+                    .map(|scribble| HtmlScribble {
+                        id: scribble.id.clone(),
+                        fmt: capture.fmt.clone(),
+                        width: capture.width,
+                        height: capture.height,
+                        shapes: scribble.shapes.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
     }
 }
 
@@ -182,20 +226,24 @@ pub fn record_captures(art: &LspCompiledArtifact, body: &str) {
         // have. Writing an unchanged drawing back under the hash it already has
         // is what makes those readable again, and costs nothing when the file
         // is there.
-        let Some(hash) = capture::store(drawing.svg.as_bytes(), "svg") else {
+        // Without the ids the exporter hangs on it: a drawing nobody has
+        // touched is the same picture after an edit somewhere else in the
+        // document, and should not be stored again as if it were new.
+        let picture = capture::plain_svg(&drawing.svg);
+        let Some(hash) = capture::store(picture.as_bytes(), "svg") else {
             continue;
         };
         if rec.captures.last().map(|last| last.hash.as_str()) == Some(hash.as_str()) {
             continue;
         }
-        let (width, height) = capture::pixel_size(&drawing.svg).unwrap_or((0, 0));
+        let (width, height) = capture::pixel_size(&picture).unwrap_or((0, 0));
         let entry = super::annotations::AnnotationCapture {
+            id: super::annotations::fresh_uuid(&hash),
             time: tinymist_project::iso_now(),
             fmt: "svg".into(),
             hash,
             width,
             height,
-            markup: None,
         };
         let uuid = rec.uuid.clone();
         let written = super::annotations::revise(&sidecar_path, |sidecar| {

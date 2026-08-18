@@ -61,6 +61,17 @@ pub fn client_css() -> String {
     asset("annotate.css", include_str!("../../static/html/annotate.css"))
 }
 
+/// The pointer shown where the pen cannot draw: a drawing rather than
+/// something the script draws, so that it can be edited as a drawing. The pen
+/// that *can* draw is drawn in code, since its colour is not known until there
+/// is something under the pointer.
+pub fn pen_forbidden_svg() -> String {
+    asset(
+        "pen-forbidden.svg",
+        include_str!("../../static/html/pen-forbidden.svg"),
+    )
+}
+
 /// The export shims: show rules that recover what Typst's HTML export drops.
 /// Read from the source tree when there is one, so they can be edited live.
 pub fn shims_typ() -> String {
@@ -99,7 +110,7 @@ pub fn install_shims(verse: &mut tinymist_project::LspUniverse) -> Result<(), St
 
 /// The source-tree paths of the HTML-mode assets, for dev asset watching.
 pub fn asset_paths() -> Vec<std::path::PathBuf> {
-    ["shell.html", "annotate.js", "annotate.css", "shims.typ"]
+    ["shell.html", "annotate.js", "annotate.css", "shims.typ", "pen-forbidden.svg"]
         .iter()
         .map(|name| dev_asset_path("html", name))
         .collect()

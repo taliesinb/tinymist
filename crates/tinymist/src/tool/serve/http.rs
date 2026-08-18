@@ -765,6 +765,18 @@ pub async fn make_http_server(
                             .unwrap()
                     };
                     Ok(res)
+                } else if endpoint == "/api/html/pen-forbidden.svg" {
+                    // The pointer for where the pen cannot draw, read from the
+                    // source tree on every request so that editing the drawing
+                    // needs no restart.
+                    let res = hyper::Response::builder()
+                        .header(hyper::header::CONTENT_TYPE, "image/svg+xml")
+                        .header(hyper::header::CACHE_CONTROL, "no-cache")
+                        .body(Body::new(Full::<Bytes>::from(
+                            crate::tool::render::html::pen_forbidden_svg(),
+                        )))
+                        .unwrap();
+                    Ok(res)
                 } else if endpoint == "/api/html/annotate.js" || endpoint == "/api/html/annotate.css" {
                     // The client itself, which is the same for every document
                     // and for the listing: asked for without one, and read from
@@ -898,6 +910,9 @@ pub async fn make_http_server(
                         uuid: String,
                         #[serde(default)]
                         text: String,
+                        /// What was drawn while writing the reply, if anything.
+                        #[serde(default)]
+                        scribble: Option<crate::tool::serve::annotations::NewScribble>,
                         /// Whether somebody is on it; absent leaves it alone.
                         #[serde(default)]
                         claimed: Option<bool>,
@@ -915,50 +930,7 @@ pub async fn make_http_server(
                     let parse_uuid = || {
                         serde_json::from_slice::<UuidReq>(&body).map_err(|e| e.to_string())
                     };
-                    // A picture of what an annotation points at, taken by the
-                    // page. The reader draws over a laid-out drawing, and the
-                    // server has only the source it was made from.
-                    #[derive(serde::Deserialize)]
-                    struct CaptureReq {
-                        uuid: String,
-                        /// `svg` for a drawing the page could serialise, `png`
-                        /// for one it had to rasterise.
-                        fmt: String,
-                        /// The picture: SVG text, or base64 for a PNG.
-                        data: String,
-                        width: u32,
-                        height: u32,
-                        /// What the reader drew, as SVG in the picture's own
-                        /// coordinates.
-                        #[serde(default)]
-                        markup: Option<String>,
-                    }
                     let outcome = match path.as_str() {
-                        "/api/annotate/capture" => serde_json::from_slice::<CaptureReq>(&body)
-                            .map_err(|e| e.to_string())
-                            .and_then(|req| {
-                                let bytes = match req.fmt.as_str() {
-                                    "svg" => req.data.into_bytes(),
-                                    "png" => {
-                                        use base64::Engine as _;
-                                        base64::engine::general_purpose::STANDARD
-                                            .decode(req.data.as_bytes())
-                                            .map_err(|err| format!("the picture is not base64: {err}"))?
-                                    }
-                                    other => return Err(format!("a capture cannot be {other}")),
-                                };
-                                let hash = super::capture::store(&bytes, &req.fmt)
-                                    .ok_or("cannot store the capture")?;
-                                let capture = crate::tool::serve::annotations::AnnotationCapture {
-                                    time: tinymist_project::iso_now(),
-                                    fmt: req.fmt,
-                                    hash: hash.clone(),
-                                    width: req.width,
-                                    height: req.height,
-                                    markup: req.markup,
-                                };
-                                annot.add_capture(&req.uuid, capture).map(|()| hash)
-                            }),
                         "/api/annotate" => serde_json::from_slice::<crate::tool::serve::AnnotateRequest>(&body)
                             .map_err(|e| e.to_string())
                             .and_then(|mut req| {
@@ -969,7 +941,7 @@ pub async fn make_http_server(
                             .and_then(|req| annot.remove(&req.uuid).map(|()| String::new())),
                         "/api/annotate/reply" => parse_uuid().and_then(|req| {
                             annot
-                                .reply(&req.uuid, &req.text, author.as_deref())
+                                .reply(&req.uuid, &req.text, author.as_deref(), req.scribble)
                                 .map(|()| String::new())
                         }),
                         "/api/annotate/flags" => parse_uuid().and_then(|req| {

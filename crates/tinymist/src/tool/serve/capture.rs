@@ -4,9 +4,15 @@
 //! source, the annotation is a sentence about a picture, and the picture only
 //! exists once something has laid it out. So the server keeps one: every time a
 //! document compiles, the drawing each graphical annotation points at is taken
-//! out of the rendered page as SVG, hashed, and stored under that hash. The
-//! annotation records the hashes it has been through, in order, and an agent can
-//! ask for one and be handed an image.
+//! out of the rendered page as SVG, hashed, and stored under that hash. A page
+//! adds to the same list when a reader draws on something the compile cannot
+//! reach — an equation, a table, a figure of several things — by taking its own
+//! picture of it. The annotation records the captures it has been through, in
+//! order, and an agent can ask for one and be handed an image.
+//!
+//! What was drawn on a capture is not held here. A scribble belongs to the
+//! remark it was drawn with and names the capture it is on, so this module is
+//! given the shapes when it is asked for a picture and paints them then.
 //!
 //! Kept next to the server registry rather than in the per-process render
 //! cache, and so outliving both the server and the drawing: an annotation made
@@ -43,6 +49,40 @@ pub fn path_of(hash: &str, fmt: &str) -> Option<PathBuf> {
     Some(captures_dir().join(format!("{hash}.{fmt}")))
 }
 
+/// A drawing without the rendering's bookkeeping on it.
+///
+/// The exporter labels every element with an id and the source range it came
+/// from, and those change whenever anything above them in the document does. A
+/// picture is what it looks like, so a drawing that is the same drawing should
+/// hash to the same bytes however many times the document has been rebuilt
+/// around it — otherwise every edit anywhere leaves another copy of every
+/// drawing in the store and another entry in every annotation.
+pub fn plain_svg(svg: &str) -> String {
+    let mut out = String::with_capacity(svg.len());
+    let mut rest = svg;
+    while let Some(at) = rest.find(" data-") {
+        let after = &rest[at + " data-".len()..];
+        let named = after
+            .split_once('=')
+            .filter(|(name, _)| matches!(*name, "uid" | "typst-src" | "typst-text" | "typst-atom"));
+        let Some((_, value)) = named else {
+            out.push_str(&rest[..at + " data-".len()]);
+            rest = after;
+            continue;
+        };
+        // The value is quoted, and an attribute value cannot contain the quote
+        // that opened it.
+        let quote = value.chars().next().unwrap_or('"');
+        let Some(end) = value[1..].find(quote) else {
+            break;
+        };
+        out.push_str(&rest[..at]);
+        rest = &value[1 + end + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Stores a capture, returning its hash. Writing is skipped when the file is
 /// already there: the same drawing compiles to the same bytes, and most
 /// compiles change nothing about it.
@@ -65,31 +105,145 @@ pub fn read(hash: &str, fmt: &str) -> Option<Vec<u8>> {
 
 
 
-/// Puts the reader's own marks on top of a capture.
+/// The reader's marks, as SVG to paint over a capture.
 ///
-/// Markup is inline SVG in the capture's own coordinates — a circle around the
-/// outlier, an arrow at the label — so it goes in just before the drawing ends,
-/// which is what "on top" means in SVG.
-pub fn with_markup(svg: &str, markup: &str) -> String {
+/// The file holds shapes and nothing else, so everything about how a mark looks
+/// is decided here: round joins and caps, because a pen has them, and a clip to
+/// the picture, because a mark that ran past the edge of what it was drawn on
+/// is about the picture only as far as the picture goes.
+pub fn marks_svg(marks: &[tinymist_annos::Mark], width: u32, height: u32) -> String {
+    use tinymist_annos::Mark;
+    let mut out = String::new();
+    for mark in marks {
+        let color = escape(mark.color());
+        match mark {
+            Mark::Path { .. } => {
+                let points = mark.points();
+                if points.len() < 2 {
+                    continue;
+                }
+                let path = curve_through(&points);
+                out.push_str(&format!(
+                    "<path d=\"{path}\" fill=\"none\" stroke=\"{color}\" \
+                     stroke-width=\"{:.2}\" stroke-linecap=\"round\" \
+                     stroke-linejoin=\"round\"/>",
+                    mark.width(),
+                ));
+            }
+            // A cross, which is what a hand makes when it means "here": a dot
+            // is easily read as part of the picture, and two strokes are not.
+            Mark::Point { x, y, width, .. } => {
+                let reach = width;
+                out.push_str(&format!(
+                    "<path d=\"M{:.1} {:.1} L{:.1} {:.1} M{:.1} {:.1} L{:.1} {:.1}\" \
+                     fill=\"none\" stroke=\"{color}\" stroke-width=\"{:.2}\" \
+                     stroke-linecap=\"round\"/>",
+                    x - reach,
+                    y - reach,
+                    x + reach,
+                    y + reach,
+                    x - reach,
+                    y + reach,
+                    x + reach,
+                    y - reach,
+                    width * 0.55,
+                ));
+            }
+        }
+    }
+    if out.is_empty() {
+        return out;
+    }
+    format!(
+        "<clipPath id=\"tm-marks\"><rect x=\"0\" y=\"0\" width=\"{width}\" \
+         height=\"{height}\"/></clipPath><g clip-path=\"url(#tm-marks)\">{out}</g>"
+    )
+}
+
+/// A curve through the points a stroke was drawn through.
+///
+/// Straight segments between them show every place the hand changed direction
+/// and every place the subsampling dropped a report, which is a shape nobody
+/// drew. A Catmull-Rom spline passes through the points and is a cubic Bézier
+/// in disguise, so it is written as one: each segment takes its handles from
+/// the neighbours on either side, a sixth of the way along.
+fn curve_through(points: &[(f32, f32)]) -> String {
+    let at = |i: isize| points[i.clamp(0, points.len() as isize - 1) as usize];
+    let (x, y) = points[0];
+    let mut path = format!("M{x:.1} {y:.1}");
+    if points.len() < 3 {
+        for (x, y) in &points[1..] {
+            path.push_str(&format!(" L{x:.1} {y:.1}"));
+        }
+        return path;
+    }
+    for i in 0..points.len() as isize - 1 {
+        let (before, from, to, after) = (at(i - 1), at(i), at(i + 1), at(i + 2));
+        let c1 = (from.0 + (to.0 - before.0) / 6.0, from.1 + (to.1 - before.1) / 6.0);
+        let c2 = (to.0 - (after.0 - from.0) / 6.0, to.1 - (after.1 - from.1) / 6.0);
+        path.push_str(&format!(
+            " C{:.1} {:.1} {:.1} {:.1} {:.1} {:.1}",
+            c1.0, c1.1, c2.0, c2.1, to.0, to.1
+        ));
+    }
+    path
+}
+
+/// What a colour may contain, so that a value from a page cannot close the
+/// attribute it is written into.
+fn escape(color: &str) -> String {
+    color
+        .chars()
+        .filter(|ch| {
+            ch.is_ascii_alphanumeric() || matches!(ch, '#' | '(' | ')' | ',' | '.' | '%' | ' ')
+        })
+        .collect()
+}
+
+/// Puts a scribble's marks on top of a capture that is SVG.
+///
+/// They are in the drawing's own coordinates, so they go in just before the
+/// drawing ends, which is what "on top" means in SVG.
+pub fn with_marks(
+    svg: &str,
+    marks: &[tinymist_annos::Mark],
+    width: u32,
+    height: u32,
+) -> String {
+    let drawn = marks_svg(marks, width, height);
+    if drawn.is_empty() {
+        return svg.to_owned();
+    }
     match svg.rfind("</svg>") {
-        Some(at) => format!("{}{markup}{}", &svg[..at], &svg[at..]),
+        Some(at) => format!("{}{drawn}{}", &svg[..at], &svg[at..]),
         None => svg.to_owned(),
     }
 }
 
-/// Draws a reader's marks over a capture that is already a picture.
+/// Draws a scribble's marks over a capture that is already a picture.
 ///
 /// A capture the page rasterised is PNG, so the marks cannot be put inside it
 /// the way they are put inside an SVG. They are rendered over it instead, at
 /// the size the picture was taken at, which is the size their coordinates are
 /// in.
-pub fn png_with_markup(png: &[u8], markup: &str, width: u32, height: u32) -> Result<Vec<u8>, String> {
+pub fn png_with_marks(
+    png: &[u8],
+    marks: &[tinymist_annos::Mark],
+    width: u32,
+    height: u32,
+) -> Result<Vec<u8>, String> {
     let mut pixmap = resvg::tiny_skia::Pixmap::decode_png(png)
         .map_err(|err| format!("cannot read the capture as PNG: {err}"))?;
     let (w, h) = (width.max(1), height.max(1));
+    let drawn = marks_svg(marks, w, h);
+    if drawn.is_empty() {
+        return pixmap
+            .encode_png()
+            .map_err(|err| format!("cannot encode the capture as PNG: {err}"));
+    }
     let svg = format!(
         "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{w}\" height=\"{h}\" \
-         viewBox=\"0 0 {w} {h}\">{markup}</svg>"
+         viewBox=\"0 0 {w} {h}\">{drawn}</svg>"
     );
     let tree = resvg::usvg::Tree::from_str(&svg, &resvg::usvg::Options::default())
         .map_err(|err| format!("cannot read the marks as SVG: {err}"))?;

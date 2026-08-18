@@ -205,17 +205,18 @@ fn tools() -> Vec<Tool> {
             description: "Returns an image of what a graphical annotation is about — a plot, a \
                           diagram, a framed drawing — together with anything the reader drew on \
                           top of it. The document is source, so this is the only way to see what \
-                          the reader saw. Defaults to the most recent capture; earlier ones show \
-                          the same drawing before it changed. Examples: {\"uuid\": \"q\"}; \
-                          {\"uuid\": \"q\", \"markup\": false} for the drawing without what the \
-                          reader drew on it.",
+                          the reader saw. Whatever the reader scribbled on it — a stroke round \
+                          the part they mean, a cross where they mean it — is drawn on top. \
+                          Defaults to the most recent capture; earlier ones show the same \
+                          drawing before it changed. Examples: {\"uuid\": \"q\"}; {\"uuid\": \
+                          \"q\", \"scribbles\": false} for the drawing bare.",
             schema: || {
                 schema(
                     json!({
                         "uuid": string("The annotation, by id or letter. Its captures are listed on the annotation."),
                         "index": {"type": "integer", "description": "Which capture: 0 is the most recent, 1 the one before it. Default 0."},
                         "hash": optional_string("A capture's hash, when you want that exact one."),
-                        "markup": {"type": "boolean", "description": "Include what the reader drew on top. Default true; pass false to see the drawing bare."},
+                        "scribbles": {"type": "boolean", "description": "Draw what the reader scribbled on it. Default true; pass false to see the picture bare."},
                         "scale": {"type": "number", "description": "Size, as a multiple of the drawing's own. Default is half size, or less when that would still be over 1000px on the long edge."},
                         "document": optional_string("Which document, when the server holds several."),
                     }),
@@ -640,6 +641,7 @@ async fn call_tool(site: &Arc<dyn DocumentSite>, name: &str, args: &Value) -> Re
                 color: None,
                 snapshot: None,
                 author: text("author"),
+                scribble: None,
             })?;
             let letter = annot
                 .records()?
@@ -765,26 +767,31 @@ async fn call_tool(site: &Arc<dyn DocumentSite>, name: &str, args: &Value) -> Re
                     chosen.hash
                 )
             })?;
-            let with_markup = args.get("markup").and_then(Value::as_bool).unwrap_or(true);
-            let markup = chosen.markup.as_deref().filter(|_| with_markup);
+            let show = args.get("scribbles").and_then(Value::as_bool).unwrap_or(true);
+            // Everything drawn on this picture, whoever drew it and whatever
+            // they were saying at the time: the scribbles belong to the
+            // remarks, and the picture is what they are all on.
+            let marks: Vec<tinymist_annos::Mark> = if show {
+                std::iter::once(&record.scribble)
+                    .chain(record.discussion.iter().map(|reply| &reply.scribble))
+                    .flatten()
+                    .filter(|scribble| scribble.capture == chosen.name())
+                    .flat_map(|scribble| scribble.shapes.clone())
+                    .collect()
+            } else {
+                vec![]
+            };
+            let marks = marks.as_slice();
             let scale = args.get("scale").and_then(Value::as_f64).map(|s| s as f32);
             // A capture the page rasterised is already a picture, so the marks
             // are drawn over it rather than into it, and the size it was taken
             // at is the size it is read at.
             let png = match chosen.fmt.as_str() {
-                "png" => match markup {
-                    Some(markup) => {
-                        capture::png_with_markup(&source, markup, chosen.width, chosen.height)?
-                    }
-                    None => source,
-                },
+                "png" => capture::png_with_marks(&source, marks, chosen.width, chosen.height)?,
                 "svg" => {
                     let svg = String::from_utf8(source)
                         .map_err(|_| "the capture is not text".to_owned())?;
-                    let drawn = match markup {
-                        Some(markup) => capture::with_markup(&svg, markup),
-                        None => svg,
-                    };
+                    let drawn = capture::with_marks(&svg, marks, chosen.width, chosen.height);
                     capture::png(&drawn, scale)?
                 }
                 other => return Err(format!("captures stored as {other} cannot be rendered")),
@@ -798,7 +805,7 @@ async fn call_tool(site: &Arc<dyn DocumentSite>, name: &str, args: &Value) -> Re
                 "time": chosen.time,
                 "index": newest - wanted,
                 "captures": record.captures.len(),
-                "markup": markup.is_some(),
+                "scribbled": !marks.is_empty(),
                 "width": chosen.width,
                 "height": chosen.height,
             }))
@@ -808,7 +815,7 @@ async fn call_tool(site: &Arc<dyn DocumentSite>, name: &str, args: &Value) -> Re
             let (_, doc) = document_of(site, args).await?;
             let annot = annot_of(&doc).await?;
             let uuid = identify(&annot, &uuid()?)?;
-            annot.reply(&uuid, &said, text("author").as_deref())?;
+            annot.reply(&uuid, &said, text("author").as_deref(), None)?;
             Ok(json!({ "uuid": uuid, "replied": true }))
         }
         "resolve_annotation" => {
@@ -816,7 +823,7 @@ async fn call_tool(site: &Arc<dyn DocumentSite>, name: &str, args: &Value) -> Re
             let annot = annot_of(&doc).await?;
             let uuid = identify(&annot, &uuid()?)?;
             if let Some(said) = text("text") {
-                annot.reply(&uuid, &said, text("author").as_deref())?;
+                annot.reply(&uuid, &said, text("author").as_deref(), None)?;
             }
             // Resolved and let go in one move: an annotation nobody needs to
             // look at again is not one anybody is still holding.

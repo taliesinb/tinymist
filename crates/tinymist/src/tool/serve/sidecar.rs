@@ -76,6 +76,13 @@ fn card(rec: &AnnotationRecord, annot: &Arc<dyn AnnotationServer>) -> String {
     let captures = if rec.captures.is_empty() {
         String::new()
     } else {
+        // Which pictures have been drawn on, from the remarks that carry the
+        // drawings: a capture holds the picture and nothing about it.
+        let scribbled: Vec<&str> = std::iter::once(&rec.scribble)
+            .chain(rec.discussion.iter().map(|reply| &reply.scribble))
+            .flatten()
+            .map(|scribble| scribble.capture.as_str())
+            .collect();
         let shots: String = rec
             .captures
             .iter()
@@ -87,7 +94,7 @@ fn card(rec: &AnnotationRecord, annot: &Arc<dyn AnnotationServer>) -> String {
                     "<figure style=\"margin:0\">\
                        <img src=\"{root}/api/capture/{hash}.{fmt}\" alt=\"capture {hash}\" \
                             width=\"{width}\" height=\"{height}\">\
-                       <div class=\"cap\">{time} · {hash} · {width}×{height}{markup}</div>\
+                       <div class=\"cap\">{time} · {hash} · {width}×{height}{drawn}</div>\
                      </figure>",
                     root = crate::tool::webapp::public_base(),
                     hash = escape(&capture.hash),
@@ -95,8 +102,8 @@ fn card(rec: &AnnotationRecord, annot: &Arc<dyn AnnotationServer>) -> String {
                     width = capture.width,
                     height = capture.height,
                     time = escape(&capture.time),
-                    markup = if capture.markup.is_some() {
-                        " · marked up"
+                    drawn = if scribbled.contains(&capture.name()) {
+                        " · scribbled on"
                     } else {
                         ""
                     },
