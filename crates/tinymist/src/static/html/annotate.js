@@ -2510,7 +2510,7 @@
   };
   const keepHeld = () => {
     clearTimeout(heldTimer);
-    if (!resumed) return;
+    if (!resumed || restoring) return;
     try {
       const box = document.getElementById(BOX_ID);
       const ta = box && box.querySelector("textarea");
@@ -2531,8 +2531,15 @@
         scroll: window.scrollY,
         at: Date.now(),
       };
-      if (!record.pins.length && !record.open) localStorage.removeItem(HELD);
-      else localStorage.setItem(HELD, JSON.stringify(record));
+      // Where the reader had got to is worth keeping on its own. A document
+      // being annotated is read over days, and opening it again at the top is
+      // opening it in the wrong place; the page has nothing else to hold when
+      // nothing is being written, which is most of the time.
+      if (!record.pins.length && !record.open && !record.scroll) {
+        localStorage.removeItem(HELD);
+      } else {
+        localStorage.setItem(HELD, JSON.stringify(record));
+      }
     } catch (err) {}
   };
   const takeHeld = () => {
@@ -2541,6 +2548,35 @@
     } catch (err) {
       return null;
     }
+  };
+
+  // Putting the page back where it was read to.
+  //
+  // Asking for it once is not enough: the document is still growing when the
+  // annotations arrive — fonts are loading, images have no height yet — and a
+  // page shorter than the position asked for scrolls as far as it can, which
+  // is the top. So it is asked for again until it takes, and nothing is
+  // written back in the meantime: the clamped position would otherwise be
+  // stored over the one being restored.
+  const RESTORE_TRIES = 12;
+  const RESTORE_WAIT = 120;
+  let restoring = false;
+  const restoreScroll = (to) => {
+    if (!to) return;
+    restoring = true;
+    let tries = 0;
+    const go = () => {
+      window.scrollTo(0, to);
+      if (Math.abs(window.scrollY - to) <= 2 || ++tries >= RESTORE_TRIES) {
+        restoring = false;
+        return;
+      }
+      setTimeout(go, RESTORE_WAIT);
+    };
+    go();
+    // A document whose last picture decides its height is not finished until
+    // everything in it is.
+    window.addEventListener("load", go, { once: true });
   };
 
   // Drafts the server has not taken. Kept in the browser so that a comment
@@ -4101,6 +4137,10 @@
   // until the page settles and the pointer moves again.
   let scrolling = null;
   const onScroll = () => {
+    // Where the page has got to, which is the thing it is holding when nothing
+    // is being written. Debounced with everything else that is held, so a
+    // scroll writes once it stops rather than at every frame of it.
+    touchHeld();
     // The overlay's corner moves with a toolbar that hides as the page
     // scrolls, so where a mark has to be put to land on its text moves too.
     forgetOrigin();
@@ -4160,7 +4200,7 @@
     } else if (open) {
       showLocal(open);
     } else if (held.scroll) {
-      window.scrollTo(0, held.scroll);
+      restoreScroll(held.scroll);
     }
     // Anything that never reached the server goes again.
     flush();
