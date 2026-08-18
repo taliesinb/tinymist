@@ -38,7 +38,7 @@ pub use location::{
     TypstWordRef, VSide, CONTEXT_CHARS,
 };
 pub use migrate::{Rebase, Shift};
-pub use record::{Annotation, Capture, Reply};
+pub use record::{Annotation, Capture, Mark, Reply, Scribble};
 pub use render_map::{FileEntry, NodeEntry, NodeKind, RenderMap, Segment, SrcRange};
 pub use resolve::{project, resolve, Context, Failure, Resolution};
 pub use sidecar::{is_sidecar, sidecar_path, Sidecar, VERSION};

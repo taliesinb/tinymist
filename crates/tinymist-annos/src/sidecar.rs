@@ -26,7 +26,7 @@ pub const NOTE: &str = "Annotations for companion .typ file; written by \
                         talimist mcp tool to edit.";
 
 /// What a sidecar file holds.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Sidecar {
     /// What this file is. Not read back: whatever the file on disk says here is
     /// replaced by [`NOTE`] when the file is next written.
@@ -202,4 +202,37 @@ pub fn is_sidecar(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
         .is_some_and(|name| name.ends_with(".annos.json"))
+}
+
+#[cfg(test)]
+mod guard_tests {
+    use super::Sidecar;
+
+    /// A sidecar that cannot be read is an error, not an empty one. Whatever is
+    /// about to write it back would otherwise write nothing over everything.
+    #[test]
+    fn a_file_that_cannot_be_read_says_so() {
+        assert!(Sidecar::parse("{ this is not json").is_err());
+        // Empty is empty, which is a file nobody has written to yet.
+        assert_eq!(Sidecar::parse("  ").expect("empty").annotations.len(), 0);
+    }
+
+    /// A capture written before captures had ids is still one a scribble can
+    /// name, and the annotations around it still load.
+    #[test]
+    fn a_capture_without_an_id_keeps_its_name() {
+        let held = concat!(
+            r#"{"_": "note", "version": 1, "annotations": [{"#,
+            r#""uuid": "u1", "letter": "a","#,
+            r#""location": {"type": "svg", "ref": {"type": "node", "ref": "anno.A1"}},"#,
+            r#""type": "comment", "color": "white", "author": "tali","#,
+            r#""time": "2026-01-01T00:00:00Z", "mtime": "2026-01-01T00:00:00Z","#,
+            r#""claimed": false, "resolved": false, "content": "said","#,
+            r#""captures": [{"time": "2026-01-01T00:00:00Z", "fmt": "svg","#,
+            r#""hash": "abc123", "width": 10, "height": 10}]}]}"#,
+        );
+        let sidecar = Sidecar::parse(held).expect("an older sidecar still reads");
+        let capture = &sidecar.annotations[0].captures[0];
+        assert_eq!(capture.name(), "abc123");
+    }
 }

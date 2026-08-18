@@ -228,6 +228,7 @@ fn annotation(uuid: &str, location: TypstLocation) -> Annotation {
         claimed: false,
         resolved: false,
         content: "is this the right word?".into(),
+        scribble: None,
         discussion: vec![],
         captures: vec![],
     }

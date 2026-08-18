@@ -6801,6 +6801,7 @@ dependencies = [
 name = "tinymist-annos"
 version = "0.15.0"
 dependencies = [
+ "base64 0.22.1",
  "serde",
  "serde_json",
  "typst-syntax 0.15.0",
