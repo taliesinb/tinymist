@@ -2651,6 +2651,10 @@
     ev.target &&
     ev.target.closest &&
     ev.target.closest(`#${BOX_ID}, #${MARKS_ID}, #${STATUS_ID}`);
+  // The annotation window alone, as opposed to everything drawn over the
+  // document: what is written there is text, and nothing is drawn on it.
+  const inBox = (ev) =>
+    ev.target && ev.target.closest && ev.target.closest(`#${BOX_ID}, #${STATUS_ID}`);
 
   // Where the pointer was last, so that pressing or releasing the modifier
   // changes what is offered without moving the mouse.
@@ -2947,8 +2951,9 @@
   // pressing anything, both that a drag would draw and what it would draw.
   // Grey says the same thing in the negative — here, nothing.
   const pens = new Map();
-  const penBitmap = (color) => {
-    const held = pens.get(color);
+  const penBitmap = (color, off) => {
+    const key = off ? `${color}:off` : color;
+    const held = pens.get(key);
     if (held) return held;
     const canvas = document.createElement("canvas");
     canvas.width = 16;
@@ -2980,6 +2985,9 @@
       ink.closePath();
     };
     ink.lineJoin = "round";
+    // A pen that would draw nothing is drawn faintly, so that it is not
+    // mistaken for one of the colours an annotation comes in.
+    ink.globalAlpha = off ? 0.45 : 1;
     ink.strokeStyle = "#101014";
     ink.lineWidth = 2.2;
     shape(barrel);
@@ -2996,11 +3004,26 @@
     ink.fillStyle = color;
     shape(point);
     ink.fill();
+    // And struck through, square to the barrel, which says it at a glance in a
+    // way that a shade of grey does not. Thin, so that the pen underneath is
+    // still a pen.
+    if (off) {
+      ink.globalAlpha = 1;
+      ink.lineCap = "round";
+      for (const [width, shade] of [[2.8, "#101014"], [1.2, "#f4f4f6"]]) {
+        ink.strokeStyle = shade;
+        ink.lineWidth = width;
+        ink.beginPath();
+        ink.moveTo(4.2, 4.2);
+        ink.lineTo(14.2, 14.2);
+        ink.stroke();
+      }
+    }
     // The image and its hotspot only: the stylesheet says what to fall back to,
     // and a keyword here would land in the middle of the list and make the
     // whole declaration invalid, which reads as no cursor at all.
     const url = `url("${canvas.toDataURL("image/png")}") 1 15`;
-    pens.set(color, url);
+    pens.set(key, url);
     return url;
   };
 
@@ -3009,7 +3032,7 @@
   const penCursor = (color) => {
     const root = document.documentElement;
     root.classList.toggle("tm-pen", !!color);
-    if (color) root.style.setProperty("--tm-pen", penBitmap(color));
+    if (color) root.style.setProperty("--tm-pen", penBitmap(color, color === PEN_GREY));
   };
 
   // The path as it is being drawn, over the frame and clipped to it.
@@ -3403,8 +3426,10 @@
         clearHover();
         // The pen still works while a window is open: drawing on the picture
         // is part of writing the annotation about it, and the window is where
-        // the writing happens.
-        if (ev.metaKey && !onOverlay(ev)) {
+        // the writing happens. It works over the marks too — the mark of a
+        // framed annotation covers the very picture the pen is for — but not
+        // over the window itself, which is not the document.
+        if (ev.metaKey && !inBox(ev)) {
           penCursor(penColor(penTarget(ev.clientX, ev.clientY)));
         }
         return;
