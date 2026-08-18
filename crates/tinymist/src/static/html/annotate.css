@@ -615,7 +615,7 @@ html.tm-offline #tinymist-marks * {
   transform: rotate(42deg);
 }
 
-/* The pen. Holding shift inside the frame of an annotation about a picture
+/* The pen. Holding command inside the frame of an annotation about a picture
    means drawing on the picture, and the pointer says so: a pen held at an
    angle, its nib on the point being drawn at. */
 html.tm-pen.tm-annotate .tm-doc,

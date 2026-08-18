@@ -2602,7 +2602,13 @@
 
   const previewAt = (ev) => {
     if (scrolling) return;
-    pointer = { x: ev.clientX, y: ev.clientY, alt: ev.altKey, shift: ev.shiftKey };
+    pointer = {
+      x: ev.clientX,
+      y: ev.clientY,
+      alt: ev.altKey,
+      shift: ev.shiftKey,
+      meta: ev.metaKey,
+    };
     // Held down, shift means a position — between two words, or between two
     // blocks — and nothing else. Positions are not offered otherwise: they are
     // places a pointer lands on only by being exact about it, and holding a key
@@ -2611,18 +2617,21 @@
     //
     // Shift rather than control: on macOS a control-click is a secondary click,
     // and the browser answers it with its own menu.
-    if (ev.shiftKey) {
-      // Inside the frame of an annotation about a picture, shift means the pen:
-      // the frame is already an annotation, and what a reader wants there is to
-      // point at part of the picture rather than to make another one.
+    // Held down, command means the pen, inside the frame of an annotation about
+    // a picture: the frame is already an annotation, and what a reader wants
+    // there is to point at part of the picture rather than to make another one.
+    if (ev.metaKey) {
       const pen = penAt(ev.clientX, ev.clientY);
       penCursor(pen);
       if (pen) return clearHover();
+    } else {
+      penCursor(false);
+    }
+    if (ev.shiftKey) {
       const spot = positionAt(ev.clientX, ev.clientY);
       if (!spot) return clearHover();
       return spot.edge ? previewEdge(spot.edge) : previewPoint(spot.gap.box);
     }
-    penCursor(false);
     if (ev.altKey) {
       const region = regionUnder(ev.clientX, ev.clientY);
       return region ? previewRegion(region) : clearHover();
@@ -3110,25 +3119,27 @@
 
   const onMouseDown = (ev) => {
     if (!annotating || ev.button !== 0 || onOverlay(ev)) return;
-    // Held down, shift draws on a picture that is already annotated, or drags
-    // from one place between blocks to another, which is the stretch of
-    // document between them. Drawing is offered even while a window is open,
-    // since what is being written is often about the picture being drawn on.
-    if (ev.shiftKey) {
+    // Held down, command draws on a picture that is already annotated. It is
+    // offered even while a window is open, since what is being written is
+    // often about the picture being drawn on.
+    if (ev.metaKey) {
       const pen = penAt(ev.clientX, ev.clientY);
-      if (pen) {
-        ev.preventDefault();
-        ev.stopImmediatePropagation();
-        sketch = {
-          pin: pen.pin,
-          el: pen.el,
-          box: pen.box,
-          color: ownColor(pen.pin) || PEN_INK,
-          points: [{ x: ev.clientX - pen.box.left, y: ev.clientY - pen.box.top }],
-        };
-        clearHover();
-        return;
-      }
+      if (!pen) return;
+      ev.preventDefault();
+      ev.stopImmediatePropagation();
+      sketch = {
+        pin: pen.pin,
+        el: pen.el,
+        box: pen.box,
+        color: ownColor(pen.pin) || PEN_INK,
+        points: [{ x: ev.clientX - pen.box.left, y: ev.clientY - pen.box.top }],
+      };
+      clearHover();
+      return;
+    }
+    // Shift drags from one place between blocks to another, which is the
+    // stretch of document between them.
+    if (ev.shiftKey) {
       if (openUuid !== null || composeActive) return; // this click only dismisses
       const spot = positionAt(ev.clientX, ev.clientY);
       if (!spot || !spot.edge) return;
@@ -3152,6 +3163,7 @@
       clientY: ev.clientY,
       altKey: ev.altKey,
       shiftKey: ev.shiftKey,
+      metaKey: ev.metaKey,
     };
     if (hoverFrame) return;
     hoverFrame = requestAnimationFrame(() => {
@@ -3189,7 +3201,7 @@
         // The pen still works while a window is open: drawing on the picture
         // is part of writing the annotation about it, and the window is where
         // the writing happens.
-        if (ev.shiftKey && !onOverlay(ev)) penCursor(penAt(ev.clientX, ev.clientY));
+        if (ev.metaKey && !onOverlay(ev)) penCursor(penAt(ev.clientX, ev.clientY));
         return;
       }
       hoverSoon(ev);
@@ -3301,6 +3313,9 @@
       return;
     }
     clearHover();
+    // Command is the pen, which acts on the drag and has nothing to say about
+    // a click.
+    if (ev.metaKey) return;
     if (ev.shiftKey) {
       const spot = positionAt(ev.clientX, ev.clientY);
       if (!spot) return;
@@ -3928,7 +3943,7 @@
     document.addEventListener("click", onClick, true);
     document.addEventListener("keydown", onArrow, true);
     const modifier = (e) => {
-      if ((e.key !== "Alt" && e.key !== "Shift") || !pointer) return;
+      if ((e.key !== "Alt" && e.key !== "Shift" && e.key !== "Meta") || !pointer) return;
       if (openUuid !== null || composeActive) return;
       const down = e.type === "keydown";
       previewAt({
@@ -3936,12 +3951,13 @@
         clientY: pointer.y,
         altKey: e.key === "Alt" ? down : !!pointer.alt,
         shiftKey: e.key === "Shift" ? down : !!pointer.shift,
+        metaKey: e.key === "Meta" ? down : !!pointer.meta,
       });
     };
     document.addEventListener("keydown", modifier, true);
     document.addEventListener("keyup", modifier, true);
     document.addEventListener("keyup", (e) => {
-      if (e.key === "Shift" && !sketch) penCursor(false);
+      if (e.key === "Meta" && !sketch) penCursor(false);
     }, true);
     document.addEventListener("keydown", (e) => {
       if (e.key === "Escape" && (drag || sketch)) {
