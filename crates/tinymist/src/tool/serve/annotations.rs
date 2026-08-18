@@ -147,6 +147,13 @@ pub trait AnnotationServer: Send + Sync {
         Err("this server cannot read blocks".into())
     }
 
+    /// Records a picture of what an annotation points at, with the marks the
+    /// reader drew over it. Taken by the page rather than by the server: what
+    /// the reader drew on is a laid-out page, which only a browser has.
+    fn add_capture(&self, _uuid: &str, _capture: AnnotationCapture) -> Result<(), String> {
+        Err("this server cannot store captures".into())
+    }
+
     /// What the document and its sidecar say about each other: anchors nothing
     /// points at, annotations pointing at anchors that are gone.
     fn audit(&self) -> Result<serde_json::Value, String> {
@@ -1231,6 +1238,19 @@ impl crate::tool::serve::AnnotationServer for DiskAnnotationServer {
         let art = self.art()?;
         let sidecar = sidecar_path(&art).ok_or("cannot determine the sidecar path")?;
         Ok(read_sidecar(&sidecar).annotations)
+    }
+
+    fn add_capture(&self, uuid: &str, capture: AnnotationCapture) -> Result<(), String> {
+        let art = self.art()?;
+        let sidecar = sidecar_path(&art).ok_or("cannot determine the sidecar path")?;
+        let uuid = uuid.to_owned();
+        revise(&sidecar, |held| {
+            let record = held
+                .find_mut(&uuid)
+                .ok_or_else(|| format!("no annotation {uuid}"))?;
+            record.captures.push(capture);
+            Ok(())
+        })
     }
 
     fn pins(&self) -> Vec<super::pins::HtmlPin> {

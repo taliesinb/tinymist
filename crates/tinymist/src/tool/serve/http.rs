@@ -901,7 +901,50 @@ pub async fn make_http_server(
                     let parse_uuid = || {
                         serde_json::from_slice::<UuidReq>(&body).map_err(|e| e.to_string())
                     };
+                    // A picture of what an annotation points at, taken by the
+                    // page. The reader draws over a laid-out drawing, and the
+                    // server has only the source it was made from.
+                    #[derive(serde::Deserialize)]
+                    struct CaptureReq {
+                        uuid: String,
+                        /// `svg` for a drawing the page could serialise, `png`
+                        /// for one it had to rasterise.
+                        fmt: String,
+                        /// The picture: SVG text, or base64 for a PNG.
+                        data: String,
+                        width: u32,
+                        height: u32,
+                        /// What the reader drew, as SVG in the picture's own
+                        /// coordinates.
+                        #[serde(default)]
+                        markup: Option<String>,
+                    }
                     let outcome = match path.as_str() {
+                        "/dev/annotate/capture" => serde_json::from_slice::<CaptureReq>(&body)
+                            .map_err(|e| e.to_string())
+                            .and_then(|req| {
+                                let bytes = match req.fmt.as_str() {
+                                    "svg" => req.data.into_bytes(),
+                                    "png" => {
+                                        use base64::Engine as _;
+                                        base64::engine::general_purpose::STANDARD
+                                            .decode(req.data.as_bytes())
+                                            .map_err(|err| format!("the picture is not base64: {err}"))?
+                                    }
+                                    other => return Err(format!("a capture cannot be {other}")),
+                                };
+                                let hash = super::capture::store(&bytes, &req.fmt)
+                                    .ok_or("cannot store the capture")?;
+                                let capture = crate::tool::serve::annotations::AnnotationCapture {
+                                    time: tinymist_project::iso_now(),
+                                    fmt: req.fmt,
+                                    hash: hash.clone(),
+                                    width: req.width,
+                                    height: req.height,
+                                    markup: req.markup,
+                                };
+                                annot.add_capture(&req.uuid, capture).map(|()| hash)
+                            }),
                         "/dev/annotate" => serde_json::from_slice::<crate::tool::serve::AnnotateRequest>(&body)
                             .map_err(|e| e.to_string())
                             .and_then(|mut req| {

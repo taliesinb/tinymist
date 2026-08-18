@@ -1711,6 +1711,7 @@
     const marked = [];
     const aboutDocument = [];
     takenBlocks.clear();
+    framed = [];
     for (const pin of list) {
       if (pin.location && pin.location.type === "document") {
         aboutDocument.push(pin);
@@ -1724,6 +1725,7 @@
       // until the server's own copy of it arrives. It would otherwise vanish
       // for as long as that takes.
       if (pin.state) holdGeometry(pin, geom);
+      if (drawable(pin, geom)) framed.push(pin);
       const on = (geom.block && geom.block.el) || geom.el;
       if (on) {
         let kinds = takenBlocks.get(on);
@@ -1740,7 +1742,10 @@
     drawEdgeChips(host, placeChips(marked));
     drawDocumentChips(host, aboutDocument);
     for (const el of [...host.children]) {
-      if (!el.dataset.seen && !el.classList.contains(HOVER_CLASS)) el.remove();
+      // A stroke being drawn belongs to the pointer rather than to the
+      // annotations, and outlives a redraw the way a hover mark does.
+      if (el.classList.contains(HOVER_CLASS) || el.classList.contains("tm-sketch")) continue;
+      if (!el.dataset.seen) el.remove();
     }
   };
 
@@ -2280,6 +2285,9 @@
         const held = draftId();
         local.push({
           uuid: held,
+          // Which draft this was written as, so that anything drawn on it
+          // while it was a draft is filed under the annotation it becomes.
+          drawnAs: draftUuid,
           state: "pending",
           letter,
           color,
@@ -2376,6 +2384,10 @@
         pin.waiting = res.uuid;
         dropDraft(pin.draft);
         keepHeld();
+        // What was drawn on it before it was sent, now that there is an
+        // annotation to file the marks under.
+        sendMarks(pin.uuid, res.uuid);
+        if (pin.drawnAs) sendMarks(pin.drawnAs, res.uuid);
         return refresh();
       }
       // No connection is about the page and will fix itself; a refusal is
@@ -2600,10 +2612,17 @@
     // Shift rather than control: on macOS a control-click is a secondary click,
     // and the browser answers it with its own menu.
     if (ev.shiftKey) {
+      // Inside the frame of an annotation about a picture, shift means the pen:
+      // the frame is already an annotation, and what a reader wants there is to
+      // point at part of the picture rather than to make another one.
+      const pen = penAt(ev.clientX, ev.clientY);
+      penCursor(pen);
+      if (pen) return clearHover();
       const spot = positionAt(ev.clientX, ev.clientY);
       if (!spot) return clearHover();
       return spot.edge ? previewEdge(spot.edge) : previewPoint(spot.gap.box);
     }
+    penCursor(false);
     if (ev.altKey) {
       const region = regionUnder(ev.clientX, ev.clientY);
       return region ? previewRegion(region) : clearHover();
@@ -2726,17 +2745,397 @@
     return new DOMRect(middle, box.top, 0, box.height);
   };
 
+  // -------------------------------------------------------------- the pen
+  // An annotation about a picture usually means something about a part of it:
+  // this line, that corner, the label in the middle. Holding shift inside the
+  // frame of such an annotation turns the pointer into a pen, and dragging
+  // draws on the picture.
+  //
+  // What is drawn is stored as a capture of the annotation: a picture of what
+  // was annotated with the marks over it, which is what an agent is handed
+  // when it asks what the annotation is about. The page takes the picture
+  // itself, because the thing the reader drew on is a laid-out page and the
+  // server has only the source it was made from.
+  const PEN_W = 5;
+  const PEN_INK = "#e8442f";
+  // The locations that are pictures. A heading or a paragraph is text that an
+  // agent reads in the source, and a drawing over it would say nothing the
+  // source does not.
+  const PEN_KINDS = ["svg", "image", "math", "math.block"];
+  // A region counts as a picture when it holds one, which is how a figure of a
+  // diagram comes to be drawable.
+  const PICTURE_INSIDE = "img,svg,math,canvas,video";
+
+  // The annotations whose frames a pen may draw in, refreshed as the page is
+  // drawn. The geometry is measured again at the moment it is needed, since
+  // the page scrolls between.
+  let framed = [];
+  const drawable = (pin, geom) => {
+    const kind = pin.location && pin.location.type;
+    if (!kind || !geom) return false;
+    const el = (geom.block && geom.block.el) || geom.el;
+    if (!el) return false;
+    if (PEN_KINDS.includes(kind)) return true;
+    return !!(el.matches(PICTURE_INSIDE) || el.querySelector(PICTURE_INSIDE));
+  };
+
+  // The union of what an annotation is drawn over: the frame a pen draws in.
+  const frameBox = (geom) => {
+    const boxes = geom.boxes.filter((b) => b.width > 0 && b.height > 0);
+    if (!boxes.length) return null;
+    const left = Math.min(...boxes.map((b) => b.left));
+    const top = Math.min(...boxes.map((b) => b.top));
+    const right = Math.max(...boxes.map((b) => b.right));
+    const bottom = Math.max(...boxes.map((b) => b.bottom));
+    return new DOMRect(left, top, right - left, bottom - top);
+  };
+
+  // The framed annotation under a point, if the point is in one. The smallest
+  // wins: a diagram inside a figure is the thing being pointed at.
+  const penAt = (x, y) => {
+    let found = null;
+    for (const pin of framed) {
+      const geom = geometryOf(pin);
+      if (!geom) continue;
+      const box = frameBox(geom);
+      if (!box) continue;
+      if (x < box.left || x > box.right || y < box.top || y > box.bottom) continue;
+      const el = (geom.block && geom.block.el) || geom.el;
+      const area = box.width * box.height;
+      if (!found || area < found.area) found = { pin, geom, box, el, area };
+    }
+    return found;
+  };
+
+  let sketch = null;
+  const penCursor = (on) => {
+    document.documentElement.classList.toggle("tm-pen", !!on);
+  };
+
+  // The path as it is being drawn, over the frame and clipped to it.
+  const drawSketch = (sk) => {
+    const host = marksHost();
+    let el = host.querySelector(".tm-sketch");
+    if (!el) {
+      el = document.createElement("div");
+      el.className = "tm-sketch";
+      el.innerHTML =
+        `<svg><path fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+      host.appendChild(el);
+    }
+    el.dataset.seen = "1";
+    place(el, sk.box.left, sk.box.top, sk.box.width, sk.box.height);
+    const path = el.querySelector("path");
+    path.setAttribute("stroke", sk.color);
+    path.setAttribute("stroke-width", PEN_W);
+    path.setAttribute("d", pathData(sk.points));
+  };
+  const clearSketch = () => {
+    const el = document.getElementById(MARKS_ID);
+    const drawn = el && el.querySelector(".tm-sketch");
+    if (drawn) drawn.remove();
+  };
+
+  // A stroke as an SVG path: straight segments between the points the pointer
+  // reported, which at the rate a mouse reports them is a curve.
+  const pathData = (points) =>
+    points.map((p, i) => `${i ? "L" : "M"}${round(p.x)} ${round(p.y)}`).join(" ");
+  const round = (n) => Math.round(n * 10) / 10;
+
+  // What the reader drew, in the coordinates of the picture it was drawn on,
+  // clipped to the frame. `at` maps a point from the viewport into those
+  // coordinates, and `unit` is what one pixel measures there.
+  const markupOf = (points, at, unit, clip) => {
+    const drawn = pathData(points.map(at));
+    const id = `tm-clip-${Math.random().toString(36).slice(2, 8)}`;
+    const rect =
+      `<rect x="${round(clip.x)}" y="${round(clip.y)}" ` +
+      `width="${round(clip.width)}" height="${round(clip.height)}"/>`;
+    return (
+      `<clipPath id="${id}">${rect}</clipPath>` +
+      `<g clip-path="url(#${id})"><path d="${drawn}" fill="none" stroke="${PEN_INK}" ` +
+      `stroke-width="${round(PEN_W * unit)}" stroke-linecap="round" stroke-linejoin="round"/></g>`
+    );
+  };
+
+  // ------------------------------------------------------- taking a picture
+  // Three ways, in order of how faithful they are. A drawing is already SVG
+  // and is copied as it stands. A picture file is drawn onto a canvas, which
+  // is what it is. Anything else — an equation, a table, a figure of several
+  // things — is laid out by the browser and has to be rasterised: the element
+  // is copied into an SVG `foreignObject`, which the browser will draw as an
+  // image, and that image is drawn onto a canvas.
+  const soleChild = (el, selector) => {
+    if (el.matches(selector)) return el;
+    const found = el.querySelectorAll(selector);
+    return found.length === 1 ? found[0] : null;
+  };
+
+  const svgPicture = (el) => {
+    const svg = soleChild(el, "svg");
+    if (!svg) return null;
+    const copy = svg.cloneNode(true);
+    copy.setAttribute("xmlns", "http://www.w3.org/2000/svg");
+    if (!copy.getAttribute("xmlns:xlink")) {
+      copy.setAttribute("xmlns:xlink", "http://www.w3.org/1999/xlink");
+    }
+    const box = svg.getBoundingClientRect();
+    // Into the drawing's own units, which is what its marks have to be in for
+    // the server to put them inside it.
+    const ctm = svg.getScreenCTM();
+    if (!ctm) return null;
+    const inverse = ctm.inverse();
+    const at = (p) => {
+      const point = new DOMPoint(p.x, p.y).matrixTransform(inverse);
+      return { x: point.x, y: point.y };
+    };
+    const corner = at({ x: box.left, y: box.top });
+    const far = at({ x: box.right, y: box.bottom });
+    return {
+      fmt: "svg",
+      data: new XMLSerializer().serializeToString(copy),
+      width: Math.round(box.width),
+      height: Math.round(box.height),
+      at,
+      // One pixel, in the drawing's units.
+      unit: 1 / (ctm.a || 1),
+      clip: new DOMRect(corner.x, corner.y, far.x - corner.x, far.y - corner.y),
+    };
+  };
+
+  // A canvas holding the element as it is on the page, at the screen's own
+  // resolution. Marks over one of these are in CSS pixels from its corner.
+  const rasterPicture = (canvas, box) => ({
+    fmt: "png",
+    data: canvas.toDataURL("image/png").replace(/^data:[^,]*,/, ""),
+    width: Math.round(box.width),
+    height: Math.round(box.height),
+    at: (p) => ({ x: p.x - box.left, y: p.y - box.top }),
+    unit: 1,
+    clip: new DOMRect(0, 0, box.width, box.height),
+  });
+
+  const canvasFor = (box) => {
+    const ratio = Math.min(window.devicePixelRatio || 1, 3);
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.max(1, Math.round(box.width * ratio));
+    canvas.height = Math.max(1, Math.round(box.height * ratio));
+    const ctx = canvas.getContext("2d");
+    // A picture is read on a page, and the page has a colour; left transparent
+    // it would arrive as ink on nothing.
+    ctx.fillStyle = pageIsDark() ? "#111114" : "#ffffff";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.scale(canvas.width / box.width, canvas.height / box.height);
+    return { canvas, ctx };
+  };
+
+  const imagePicture = (el) => {
+    const img = soleChild(el, "img");
+    if (!img || !img.complete || !img.naturalWidth) return null;
+    const box = img.getBoundingClientRect();
+    const { canvas, ctx } = canvasFor(box);
+    try {
+      ctx.drawImage(img, 0, 0, box.width, box.height);
+      return rasterPicture(canvas, box);
+    } catch (err) {
+      return null;
+    }
+  };
+
+  // The document's own styles, as text, so that a copy of an element laid out
+  // on its own looks the way it does in place: what Typst emitted, and the
+  // stylesheet the server was told to inject. Not the annotator's own
+  // stylesheet, which is written for a page with an annotator on it and makes
+  // the copy come out blank.
+  //
+  // Read once, on the first rasterisation, so that a page nobody draws on pays
+  // nothing for this.
+  let sheets = null;
+  const styleText = async () => {
+    if (sheets !== null) return sheets;
+    const parts = [];
+    const own = document.getElementById("tinymist-typst-style");
+    if (own) parts.push(own.textContent || "");
+    for (const link of document.querySelectorAll('link[data-tm-injected="css"]')) {
+      try {
+        const said = await fetch(link.href);
+        if (said.ok) parts.push(await said.text());
+      } catch (err) {
+        /* a stylesheet that cannot be read is one the copy goes without */
+      }
+    }
+    sheets = parts.join("\n");
+    return sheets;
+  };
+
+  // Every picture the element holds, as data: an image inside a foreignObject
+  // is not loaded, since the browser draws it as an image of its own with no
+  // access to anything outside it.
+  const inlineImages = async (root) => {
+    const images = Array.from(root.querySelectorAll("img"));
+    for (const img of images) {
+      if (/^data:/.test(img.getAttribute("src") || "")) continue;
+      try {
+        const bytes = await (await fetch(img.src)).blob();
+        img.setAttribute(
+          "src",
+          await new Promise((done) => {
+            const reader = new FileReader();
+            reader.onload = () => done(reader.result);
+            reader.readAsDataURL(bytes);
+          }),
+        );
+      } catch (err) {
+        img.removeAttribute("src");
+      }
+    }
+  };
+
+  const rasterise = async (el) => {
+    const box = el.getBoundingClientRect();
+    const copy = el.cloneNode(true);
+    if (copy.namespaceURI === "http://www.w3.org/1998/Math/MathML") {
+      copy.setAttribute("xmlns", "http://www.w3.org/1998/Math/MathML");
+    }
+    await inlineImages(copy);
+    const holder = document.createElement("div");
+    holder.setAttribute("xmlns", "http://www.w3.org/1999/xhtml");
+    holder.id = DOC_ID;
+    holder.className = "tm-doc";
+    // The colours the element has on the page, said outright: they are set by
+    // the annotator's stylesheet, which the copy does not carry.
+    const shown = getComputedStyle(el);
+    holder.setAttribute(
+      "style",
+      `width:${box.width}px;height:${box.height}px;margin:0;` +
+        `color:${shown.color};background:${pageIsDark() ? "#111114" : "#ffffff"};` +
+        `font:${shown.font || `${shown.fontSize} ${shown.fontFamily}`}`,
+    );
+    holder.appendChild(copy);
+    const style = document.createElement("style");
+    style.textContent = await styleText();
+    const wrapper = document.createElement("div");
+    wrapper.setAttribute("xmlns", "http://www.w3.org/1999/xhtml");
+    wrapper.appendChild(style);
+    wrapper.appendChild(holder);
+    const inner = new XMLSerializer().serializeToString(wrapper);
+    const svg =
+      `<svg xmlns="http://www.w3.org/2000/svg" width="${Math.ceil(box.width)}" ` +
+      `height="${Math.ceil(box.height)}"><foreignObject width="100%" height="100%">` +
+      `${inner}</foreignObject></svg>`;
+    const img = new Image();
+    const drew = await new Promise((done) => {
+      img.onload = () => done(true);
+      img.onerror = () => done(false);
+      img.src = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(svg);
+    });
+    if (!drew) return null;
+    const { canvas, ctx } = canvasFor(box);
+    try {
+      ctx.drawImage(img, 0, 0, box.width, box.height);
+    } catch (err) {
+      return null;
+    }
+    return rasterPicture(canvas, box);
+  };
+
+  const pictureOf = async (el) =>
+    svgPicture(el) || imagePicture(el) || (await rasterise(el));
+
+  // ------------------------------------------------------ keeping the marks
+  // What was drawn on an annotation the server has not got yet, kept until it
+  // has: a draft has no id to file a capture under until it has been sent.
+  const heldMarks = new Map();
+  const keepMarks = (uuid, capture) => {
+    const held = heldMarks.get(uuid) || [];
+    held.push(capture);
+    heldMarks.set(uuid, held);
+  };
+  const sendMarks = (draftUuid, uuid) => {
+    const held = heldMarks.get(draftUuid);
+    if (!held || !held.length) return Promise.resolve();
+    heldMarks.delete(draftUuid);
+    return held
+      .reduce(
+        (queue, capture) => queue.then(() => post("/dev/annotate/capture", { ...capture, uuid })),
+        Promise.resolve(),
+      )
+      .then(() => refresh());
+  };
+
+  const finishSketch = async (sk) => {
+    if (sk.points.length < 2) return;
+    const picture = await pictureOf(sk.el);
+    if (!picture) {
+      showBanner("cannot take a picture of this to draw on", "warn");
+      return;
+    }
+    // The frame, in the picture's own coordinates: what is drawn is clipped to
+    // it, so a stroke that ran off the edge stops at the edge.
+    const near = picture.at({ x: sk.box.left, y: sk.box.top });
+    const far = picture.at({ x: sk.box.right, y: sk.box.bottom });
+    const clip = new DOMRect(
+      Math.min(near.x, far.x),
+      Math.min(near.y, far.y),
+      Math.abs(far.x - near.x),
+      Math.abs(far.y - near.y),
+    );
+    const capture = {
+      fmt: picture.fmt,
+      data: picture.data,
+      width: picture.width,
+      height: picture.height,
+      markup: markupOf(
+        sk.points.map((p) => ({ x: p.x + sk.box.left, y: p.y + sk.box.top })),
+        picture.at,
+        picture.unit,
+        clip,
+      ),
+    };
+    // An annotation the server has not got yet has no id to file a capture
+    // under, so what was drawn on it waits until it has one.
+    if (sk.pin.state || String(sk.pin.uuid).startsWith(DRAFT_ID)) {
+      keepMarks(sk.pin.uuid, capture);
+      showBanner("the marks go with the annotation when it is sent", "note");
+      return;
+    }
+    const res = await post("/dev/annotate/capture", { ...capture, uuid: sk.pin.uuid });
+    if (res && res.ok) {
+      showBanner(`marked ${sk.pin.letter || "an annotation"}`, "note");
+      refresh();
+    } else {
+      showBanner((res && res.error) || "the server would not take the marks", "warn");
+    }
+  };
+
   const onMouseDown = (ev) => {
     if (!annotating || ev.button !== 0 || onOverlay(ev)) return;
-    if (openUuid !== null || composeActive) return; // this click only dismisses
-    // Held down, shift drags from one place between blocks to another, which is
-    // the stretch of document between them.
+    // Held down, shift draws on a picture that is already annotated, or drags
+    // from one place between blocks to another, which is the stretch of
+    // document between them. Drawing is offered even while a window is open,
+    // since what is being written is often about the picture being drawn on.
     if (ev.shiftKey) {
+      const pen = penAt(ev.clientX, ev.clientY);
+      if (pen) {
+        ev.preventDefault();
+        ev.stopImmediatePropagation();
+        sketch = {
+          pin: pen.pin,
+          el: pen.el,
+          box: pen.box,
+          color: ownColor(pen.pin) || PEN_INK,
+          points: [{ x: ev.clientX - pen.box.left, y: ev.clientY - pen.box.top }],
+        };
+        clearHover();
+        return;
+      }
+      if (openUuid !== null || composeActive) return; // this click only dismisses
       const spot = positionAt(ev.clientX, ev.clientY);
       if (!spot || !spot.edge) return;
       vdrag = { from: { x: ev.clientX, y: ev.clientY }, start: spot.edge, moved: false };
       return;
     }
+    if (openUuid !== null || composeActive) return; // this click only dismisses
     const caret = caretAt(ev.clientX, ev.clientY);
     if (!caret) return;
     drag = { from: { x: ev.clientX, y: ev.clientY }, start: caret, moved: false };
@@ -2762,6 +3161,16 @@
   };
   const onMouseMove = (ev) => {
     if (!annotating) return;
+    if (sketch) {
+      const at = { x: ev.clientX - sketch.box.left, y: ev.clientY - sketch.box.top };
+      const last = sketch.points[sketch.points.length - 1];
+      // A mouse reports a position far more often than a stroke has corners.
+      if (Math.hypot(at.x - last.x, at.y - last.y) >= 2) {
+        sketch.points.push(at);
+        drawSketch(sketch);
+      }
+      return;
+    }
     if (vdrag) {
       if (!vdrag.moved && Math.hypot(ev.clientX - vdrag.from.x, ev.clientY - vdrag.from.y) < 4) {
         return;
@@ -2776,7 +3185,12 @@
     if (!drag) {
       if (openUuid !== null || composeActive || onOverlay(ev)) {
         hovering = null;
-        return clearHover();
+        clearHover();
+        // The pen still works while a window is open: drawing on the picture
+        // is part of writing the annotation about it, and the window is where
+        // the writing happens.
+        if (ev.shiftKey && !onOverlay(ev)) penCursor(penAt(ev.clientX, ev.clientY));
+        return;
       }
       hoverSoon(ev);
       return;
@@ -2806,6 +3220,16 @@
     );
   };
   const onMouseUp = (ev) => {
+    if (sketch) {
+      const drawn = sketch;
+      sketch = null;
+      clearSketch();
+      ev.preventDefault();
+      ev.stopImmediatePropagation();
+      swallowClick = true;
+      finishSketch(drawn);
+      return;
+    }
     if (vdrag) {
       const dragged = vdrag;
       vdrag = null;
@@ -3516,9 +3940,14 @@
     };
     document.addEventListener("keydown", modifier, true);
     document.addEventListener("keyup", modifier, true);
+    document.addEventListener("keyup", (e) => {
+      if (e.key === "Shift" && !sketch) penCursor(false);
+    }, true);
     document.addEventListener("keydown", (e) => {
-      if (e.key === "Escape" && drag) {
+      if (e.key === "Escape" && (drag || sketch)) {
         drag = null;
+        sketch = null;
+        clearSketch();
         clearHover();
       }
     });

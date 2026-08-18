@@ -77,6 +77,34 @@ pub fn with_markup(svg: &str, markup: &str) -> String {
     }
 }
 
+/// Draws a reader's marks over a capture that is already a picture.
+///
+/// A capture the page rasterised is PNG, so the marks cannot be put inside it
+/// the way they are put inside an SVG. They are rendered over it instead, at
+/// the size the picture was taken at, which is the size their coordinates are
+/// in.
+pub fn png_with_markup(png: &[u8], markup: &str, width: u32, height: u32) -> Result<Vec<u8>, String> {
+    let mut pixmap = resvg::tiny_skia::Pixmap::decode_png(png)
+        .map_err(|err| format!("cannot read the capture as PNG: {err}"))?;
+    let (w, h) = (width.max(1), height.max(1));
+    let svg = format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{w}\" height=\"{h}\" \
+         viewBox=\"0 0 {w} {h}\">{markup}</svg>"
+    );
+    let tree = resvg::usvg::Tree::from_str(&svg, &resvg::usvg::Options::default())
+        .map_err(|err| format!("cannot read the marks as SVG: {err}"))?;
+    // The picture was rasterised at whatever the reader's screen does, so it
+    // is not the size the marks are measured in; the marks are scaled to it.
+    let scale = resvg::tiny_skia::Transform::from_scale(
+        pixmap.width() as f32 / w as f32,
+        pixmap.height() as f32 / h as f32,
+    );
+    resvg::render(&tree, scale, &mut pixmap.as_mut());
+    pixmap
+        .encode_png()
+        .map_err(|err| format!("cannot encode the capture as PNG: {err}"))
+}
+
 /// How big a capture is rasterised, by default: half of its natural size,
 /// unless that is still over the ceiling below.
 const AUTO_SCALE: f32 = 0.5;

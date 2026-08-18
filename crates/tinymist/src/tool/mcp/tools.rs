@@ -765,21 +765,30 @@ async fn call_tool(site: &Arc<dyn DocumentSite>, name: &str, args: &Value) -> Re
                     chosen.hash
                 )
             })?;
-            if chosen.fmt != "svg" {
-                return Err(format!(
-                    "captures stored as {} cannot be rendered yet",
-                    chosen.fmt
-                ));
-            }
-            let svg = String::from_utf8(source).map_err(|_| "the capture is not text".to_owned())?;
             let with_markup = args.get("markup").and_then(Value::as_bool).unwrap_or(true);
             let markup = chosen.markup.as_deref().filter(|_| with_markup);
-            let drawn = match markup {
-                Some(markup) => capture::with_markup(&svg, markup),
-                None => svg,
-            };
             let scale = args.get("scale").and_then(Value::as_f64).map(|s| s as f32);
-            let png = capture::png(&drawn, scale)?;
+            // A capture the page rasterised is already a picture, so the marks
+            // are drawn over it rather than into it, and the size it was taken
+            // at is the size it is read at.
+            let png = match chosen.fmt.as_str() {
+                "png" => match markup {
+                    Some(markup) => {
+                        capture::png_with_markup(&source, markup, chosen.width, chosen.height)?
+                    }
+                    None => source,
+                },
+                "svg" => {
+                    let svg = String::from_utf8(source)
+                        .map_err(|_| "the capture is not text".to_owned())?;
+                    let drawn = match markup {
+                        Some(markup) => capture::with_markup(&svg, markup),
+                        None => svg,
+                    };
+                    capture::png(&drawn, scale)?
+                }
+                other => return Err(format!("captures stored as {other} cannot be rendered")),
+            };
             use base64::Engine as _;
             let data = base64::engine::general_purpose::STANDARD.encode(&png);
             Ok(json!({

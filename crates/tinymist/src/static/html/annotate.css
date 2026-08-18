@@ -614,3 +614,26 @@ html.tm-offline #tinymist-marks * {
   border-width: 0 1.5px 1.5px 0;
   transform: rotate(42deg);
 }
+
+/* The pen. Holding shift inside the frame of an annotation about a picture
+   means drawing on the picture, and the pointer says so: a pen held at an
+   angle, its nib on the point being drawn at. */
+html.tm-pen.tm-annotate .tm-doc,
+html.tm-pen.tm-annotate .tm-doc * {
+  cursor: url("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAQElEQVR42mNgIBNISMj8J1sjRZq/HnH6DzOEJINgmn/9+jVAmpGdPupsWmmGAbKcjZ7KyEqiL1z0B0AzxbkLCACHv3f4n3r+9AAAAABJRU5ErkJggg==") 1 14, crosshair;
+}
+
+/* A stroke as it is being drawn. Clipped by the frame it is drawn in, which is
+   what the box around it is: the marks belong to the picture, not to the page
+   around it. */
+#tinymist-marks .tm-sketch {
+  position: absolute;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+#tinymist-marks .tm-sketch svg {
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+}
