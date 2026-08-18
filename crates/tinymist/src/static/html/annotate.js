@@ -2617,16 +2617,20 @@
     //
     // Shift rather than control: on macOS a control-click is a secondary click,
     // and the browser answers it with its own menu.
-    // Held down, command means the pen, inside the frame of an annotation about
-    // a picture: the frame is already an annotation, and what a reader wants
-    // there is to point at part of the picture rather than to make another one.
+    // Held down, command means the pen. The pointer shows one wherever it is —
+    // in the stroke's colour over a picture, grey over everything else — so
+    // that where a drag would draw is something the reader can see rather than
+    // remember. Over a picture nothing is annotated on yet, the frame that
+    // would be made is shown as well.
     if (ev.metaKey) {
-      const pen = penAt(ev.clientX, ev.clientY);
-      penCursor(pen);
-      if (pen) return clearHover();
-    } else {
-      penCursor(false);
+      const target = penTarget(ev.clientX, ev.clientY);
+      penCursor(penColor(target));
+      if (target && !target.pin) {
+        return previewRegion({ el: target.el, kind: "block", depth: 0 });
+      }
+      return clearHover();
     }
+    penCursor(false);
     if (ev.shiftKey) {
       const spot = positionAt(ev.clientX, ev.clientY);
       if (!spot) return clearHover();
@@ -2767,6 +2771,8 @@
   // server has only the source it was made from.
   const PEN_W = 5;
   const PEN_INK = "#e8442f";
+  // What the pen looks like where there is nothing to draw on.
+  const PEN_GREY = "#8b8b93";
   // The locations that are pictures. A heading or a paragraph is text that an
   // agent reads in the source, and a drawing over it would say nothing the
   // source does not.
@@ -2816,9 +2822,100 @@
     return found;
   };
 
+  // The picture under a point, whether or not anything is annotated there.
+  // The innermost wins, since the elements nest: a drawing inside a figure
+  // inside a section.
+  const pictureUnder = (x, y) => {
+    let el = document.elementFromPoint(x, y);
+    while (el && el !== document.body) {
+      const entry = byUid.get(uidOf(el));
+      if (entry) {
+        const kind = blockKind(entry.el, entry.kind);
+        if (PEN_KINDS.includes(kind)) return { el: entry.el, uid: entry.uid, kind };
+      }
+      el = el.parentElement;
+    }
+    return null;
+  };
+
+  // The frame a picture is drawn in: the same box the annotation of it would
+  // be given, so that what is drawn before there is an annotation lands where
+  // it does afterwards.
+  const pictureBox = (el, kind) => {
+    const boxes = kind === "math.block" ? inkOf(el) : [el.getBoundingClientRect()];
+    return frameBox({ boxes });
+  };
+
+  // What a drag with the pen would draw on: the annotation whose frame the
+  // pointer is in, or the picture it is over, which has none yet.
+  const penTarget = (x, y) => {
+    const found = penAt(x, y);
+    if (found) return found;
+    const picture = pictureUnder(x, y);
+    if (!picture) return null;
+    const box = pictureBox(picture.el, picture.kind);
+    return box ? { pin: null, el: picture.el, box, kind: picture.kind, uid: picture.uid } : null;
+  };
+
+  // The colour a stroke would be drawn in: the annotation's own, or the one
+  // the annotation about to be made will be given.
+  const penColor = (target) =>
+    (target && target.pin && ownColor(target.pin)) || (target ? nextColor() : PEN_GREY);
+
   let sketch = null;
-  const penCursor = (on) => {
-    document.documentElement.classList.toggle("tm-pen", !!on);
+
+  // The pen the pointer becomes. Drawn rather than shipped as a file, because
+  // it is drawn in the colour the stroke would be: the reader can see, before
+  // pressing anything, both that a drag would draw and what it would draw.
+  // Grey says the same thing in the negative — here, nothing.
+  const pens = new Map();
+  const penBitmap = (color) => {
+    const held = pens.get(color);
+    if (held) return held;
+    const canvas = document.createElement("canvas");
+    canvas.width = 16;
+    canvas.height = 16;
+    const ink = canvas.getContext("2d");
+    ink.lineCap = "round";
+    // The barrel, outlined so that it reads on any background.
+    ink.strokeStyle = "#101014";
+    ink.lineWidth = 5;
+    ink.beginPath();
+    ink.moveTo(4, 12);
+    ink.lineTo(13, 3);
+    ink.stroke();
+    ink.strokeStyle = color;
+    ink.lineWidth = 2.6;
+    ink.beginPath();
+    ink.moveTo(4.5, 11.5);
+    ink.lineTo(12.5, 3.5);
+    ink.stroke();
+    // The nib, at the point being drawn at.
+    ink.fillStyle = "#101014";
+    ink.beginPath();
+    ink.moveTo(0.5, 15.5);
+    ink.lineTo(6, 12.5);
+    ink.lineTo(3.5, 10);
+    ink.closePath();
+    ink.fill();
+    ink.fillStyle = color;
+    ink.beginPath();
+    ink.moveTo(2.5, 13.5);
+    ink.lineTo(5, 12.2);
+    ink.lineTo(3.8, 11);
+    ink.closePath();
+    ink.fill();
+    const url = `url("${canvas.toDataURL("image/png")}") 1 15, crosshair`;
+    pens.set(color, url);
+    return url;
+  };
+
+  // Holding the key shows a pen wherever the pointer is: in the stroke's
+  // colour where a drag would draw, and in grey where it would not.
+  const penCursor = (color) => {
+    const root = document.documentElement;
+    root.classList.toggle("tm-pen", !!color);
+    if (color) root.style.setProperty("--tm-pen", penBitmap(color));
   };
 
   // The path as it is being drawn, over the frame and clipped to it.
@@ -3119,22 +3216,34 @@
 
   const onMouseDown = (ev) => {
     if (!annotating || ev.button !== 0 || onOverlay(ev)) return;
-    // Held down, command draws on a picture that is already annotated. It is
-    // offered even while a window is open, since what is being written is
-    // often about the picture being drawn on.
+    // Held down, command draws on a picture. Offered even while a window is
+    // open, since what is being written is often about the picture being drawn
+    // on, and offered on a picture nothing is annotated on yet: the annotation
+    // is made by the same press that starts the stroke, since a mark on a
+    // picture is a remark about it.
     if (ev.metaKey) {
-      const pen = penAt(ev.clientX, ev.clientY);
-      if (!pen) return;
+      const target = penTarget(ev.clientX, ev.clientY);
+      if (!target) return;
       ev.preventDefault();
       ev.stopImmediatePropagation();
+      let pin = target.pin;
+      if (!pin) {
+        compose(target.kind, nodeLocation(target.kind, target));
+        pin = local.find((held) => held.uuid === composing);
+        if (!pin) return;
+      }
       sketch = {
-        pin: pen.pin,
-        el: pen.el,
-        box: pen.box,
-        color: ownColor(pen.pin) || PEN_INK,
-        points: [{ x: ev.clientX - pen.box.left, y: ev.clientY - pen.box.top }],
+        pin,
+        el: target.el,
+        box: target.box,
+        color: ownColor(pin) || PEN_INK,
+        points: [{ x: ev.clientX - target.box.left, y: ev.clientY - target.box.top }],
       };
       clearHover();
+      // The annotation being drawn on is the one to be looking at. Opened
+      // where it is: scrolling to it would take the picture out from under the
+      // pointer that is drawing on it.
+      if (target.pin && openUuid !== pin.uuid) showAnnot(pin);
       return;
     }
     // Shift drags from one place between blocks to another, which is the
@@ -3201,7 +3310,9 @@
         // The pen still works while a window is open: drawing on the picture
         // is part of writing the annotation about it, and the window is where
         // the writing happens.
-        if (ev.metaKey && !onOverlay(ev)) penCursor(penAt(ev.clientX, ev.clientY));
+        if (ev.metaKey && !onOverlay(ev)) {
+          penCursor(penColor(penTarget(ev.clientX, ev.clientY)));
+        }
         return;
       }
       hoverSoon(ev);

@@ -615,12 +615,15 @@ html.tm-offline #tinymist-marks * {
   transform: rotate(42deg);
 }
 
-/* The pen. Holding command inside the frame of an annotation about a picture
-   means drawing on the picture, and the pointer says so: a pen held at an
-   angle, its nib on the point being drawn at. */
+/* The pen. Holding command means drawing on a picture, and the pointer says so
+   wherever it is: a pen held at an angle, its nib on the point being drawn at,
+   coloured where a drag would draw and grey where it would not. */
 html.tm-pen.tm-annotate .tm-doc,
-html.tm-pen.tm-annotate .tm-doc * {
-  cursor: url("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAQElEQVR42mNgIBNISMj8J1sjRZq/HnH6DzOEJINgmn/9+jVAmpGdPupsWmmGAbKcjZ7KyEqiL1z0B0AzxbkLCACHv3f4n3r+9AAAAABJRU5ErkJggg==") 1 14, crosshair;
+html.tm-pen.tm-annotate .tm-doc *,
+html.tm-pen.tm-annotate body {
+  /* Drawn by the script, in the colour the stroke would be: grey where a drag
+     would draw nothing. */
+  cursor: var(--tm-pen), crosshair;
 }
 
 /* A stroke as it is being drawn. Clipped by the frame it is drawn in, which is
