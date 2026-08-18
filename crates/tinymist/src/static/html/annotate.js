@@ -2445,11 +2445,33 @@
         return refresh();
       }
       const draft = rest[0];
-      return post("/dev/annotate", draft).then((res) => {
-        if (res && res.ok) dropDraft(draft);
-        else if (online) keepDraft(draft, res && res.error, true);
-        // Offline again: leave the rest for the next connection.
-        return online ? next(rest.slice(1)) : ((sending = false), undefined);
+      const onwards = (rest) =>
+        online ? next(rest.slice(1)) : ((sending = false), undefined);
+      const place = (where) => post("/dev/annotate", { ...draft, location: where });
+      return place(draft.location).then((res) => {
+        if (res && res.ok) {
+          dropDraft(draft);
+          return onwards(rest);
+        }
+        // Offline: leave the rest for the next connection.
+        if (!online) {
+          sending = false;
+          return;
+        }
+        // The server has refused the place. A server that has restarted holds
+        // none of the renderings its drafts were written against, so the place
+        // can never be found again and asking on every visit only produces the
+        // same refusal. The words are what matter: they go on the document,
+        // where the snapshot says what they were about.
+        return place({ type: "document" }).then((moved) => {
+          if (moved && moved.ok) {
+            dropDraft(draft);
+            showBanner("Kept as a note on the document: " + (res.error || "the place is gone"));
+          } else {
+            keepDraft(draft, (moved && moved.error) || res.error, true);
+          }
+          return onwards(rest);
+        });
       });
     };
     next(held);
