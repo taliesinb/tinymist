@@ -352,16 +352,12 @@ pub async fn make_http_server(
                         // asks for them — so it can be an asset like the
                         // annotator's own script and stylesheet.
                         //
-                        // Its stylesheet is named at the mount rather than
-                        // beside the page: the same page is served at every
-                        // depth, and a relative name at `/a/report/` would ask
-                        // for a stylesheet inside a directory. A document's own
-                        // page keeps the relative name, since there the tail
-                        // after the document *is* the endpoint.
-                        let prefix = crate::tool::webapp::public_prefix(role);
-                        let page = super::listing_html()
-                            .replace("href=\"api/", &format!("href=\"{prefix}api/"))
-                            .replace("src=\"api/", &format!("src=\"{prefix}api/"));
+                        // Its stylesheet is named from the root, which is what
+                        // the head does for every page: the same listing is
+                        // served at every depth, and a relative name at
+                        // `/a/report/` would ask for a stylesheet inside a
+                        // directory.
+                        let page = super::listing_html();
                         let body = crate::tool::webapp::mode_head(&page, &identity, port, true);
                         return Ok(hyper::Response::builder()
                             .header(hyper::header::CONTENT_TYPE, "text/html; charset=utf-8")

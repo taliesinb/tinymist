@@ -367,3 +367,36 @@ pub fn web_manifest(path: &str, port: u16, identity: &WebAppIdentity) -> Option<
 "##
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A page's own script and stylesheet, named from the root the endpoints
+    /// are at rather than from the page: the same page is served at every
+    /// depth, and a relative name below the mount asks a document for them.
+    ///
+    /// One test rather than two, because the base is one value for the whole
+    /// process and two tests would race for it.
+    #[test]
+    fn a_page_names_the_endpoints_from_the_root() {
+        let identity = WebAppIdentity::new(IconRole::Annotate);
+        let page = "<html><head><link rel=\"stylesheet\" href=\"api/html/annotate.css\">\
+                    </head><body><script src=\"api/html/annotate.js\"></script></body></html>";
+
+        set_public_base("");
+        let plain = mode_head(page, &identity, 3000, true);
+        assert!(plain.contains("href=\"/api/html/annotate.css\""), "{plain}");
+        assert!(plain.contains("src=\"/api/html/annotate.js\""), "{plain}");
+        assert!(plain.contains("<meta name=\"tm-mount\" content=\"/a/\">"), "{plain}");
+
+        // Published under a path, which `tailscale serve` strips before the
+        // request arrives: the page must ask for it, the server must not see it.
+        set_public_base("/hgxz");
+        let shared = mode_head(page, &identity, 3000, true);
+        assert!(shared.contains("href=\"/hgxz/api/html/annotate.css\""), "{shared}");
+        assert!(shared.contains("src=\"/hgxz/api/html/annotate.js\""), "{shared}");
+        assert!(shared.contains("<meta name=\"tm-mount\" content=\"/hgxz/a/\">"), "{shared}");
+        set_public_base("");
+    }
+}
