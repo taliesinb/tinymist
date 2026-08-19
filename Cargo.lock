@@ -6876,6 +6876,7 @@ dependencies = [
  "tinymist-assets 0.15.4-rc1 (registry+https://github.com/rust-lang/crates.io-index)",
  "tinymist-debug",
  "tinymist-l10n",
+ "tinymist-netlify",
  "tinymist-preview",
  "tinymist-project",
  "tinymist-query",
@@ -7007,6 +7008,14 @@ dependencies = [
  "tinymist-std",
  "typst",
  "typst-library",
+]
+
+[[package]]
+name = "tinymist-netlify"
+version = "0.15.4-rc1"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

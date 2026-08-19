@@ -26,6 +26,8 @@ mod cmd {
     pub mod server;
     #[cfg(feature = "serve")]
     pub mod mcp;
+    #[cfg(feature = "netlify")]
+    pub mod netlify;
     #[cfg(feature = "serve")]
     pub mod serve;
     pub mod query;
@@ -118,6 +120,10 @@ enum Commands {
     /// Answer agents, at one address, about every document being served
     #[cfg(feature = "serve")]
     Mcp(crate::mcp::McpArgs),
+    /// Put what a static site on Netlify needs to serve patches and annotations
+    #[cfg(feature = "netlify")]
+    #[clap(subcommand)]
+    Netlify(crate::netlify::NetlifyCommands),
     /// Preview a document as pages, for an editor to follow
     #[cfg(feature = "preview")]
     Preview(tinymist::tool::preview::PreviewCliArgs),
@@ -188,6 +194,8 @@ fn main() -> Result<()> {
         Commands::Completion(..) | Commands::Probe | Commands::Procs(..) | Commands::Annos(..) => {
             false
         }
+        #[cfg(feature = "netlify")]
+        Commands::Netlify(..) => false,
         #[cfg(feature = "export")]
         Commands::Compile(..) => false,
         Commands::Lint(..) => false,
@@ -277,6 +285,8 @@ fn main() -> Result<()> {
         Commands::OpenPreview(args) => crate::open_preview::open_preview_main(args),
         #[cfg(feature = "serve")]
         Commands::Serve(args) => crate::serve::serve_main(args),
+        #[cfg(feature = "netlify")]
+        Commands::Netlify(cmd) => crate::netlify::netlify_main(cmd),
         #[cfg(feature = "serve")]
         Commands::Mcp(args) => crate::mcp::mcp_main(args),
         #[cfg(feature = "export")]

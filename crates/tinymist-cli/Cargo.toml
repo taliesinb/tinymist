@@ -68,6 +68,7 @@ sync-ls = { workspace = true, features = ["lsp", "server", "system"] }
 tinymist = { workspace = true, default-features = false, features = ["system"] }
 tinymist-annos.workspace = true
 tinymist-tailscale = { workspace = true, optional = true }
+tinymist-netlify = { workspace = true, optional = true }
 tinymist-assets = { workspace = true }
 tinymist-debug.workspace = true
 tinymist-l10n.workspace = true
@@ -102,6 +103,11 @@ dapts.workspace = true
 # Publishing a served document on a tailnet, which means running the
 # `tailscale` command. On by default and inert unless asked for.
 tailscale = ["dep:tinymist-tailscale"]
+
+# Serving patched pages and annotations from a static site on Netlify. Off
+# while it is being built: nothing else depends on it, and a site that does not
+# use it should not carry it.
+netlify = ["dep:tinymist-netlify"]
 
 default = [
     "cli",
