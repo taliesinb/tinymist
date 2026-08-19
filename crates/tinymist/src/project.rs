@@ -1027,11 +1027,22 @@ impl CompileHandler<LspCompilerFeat, ProjectInsStateExt> for CompileHandlerImpl 
                     // compiled, so that a page referring to it can be understood
                     // later.
                     if let Some((_, map)) = rendering {
+                        // What each of the document's files said, in the order
+                        // the map numbers them: an annotation on a heading in
+                        // an included file is placed against that file.
                         let world = art.world();
-                        let text = typst::World::source(world, typst::World::main(world))
-                            .map(|source| source.text().to_owned())
-                            .unwrap_or_default();
-                        crate::tool::serve::renders::record(path, map, text);
+                        let texts = map
+                            .files
+                            .iter()
+                            .map(|file| {
+                                std::fs::read_to_string(&file.path).unwrap_or_else(|_| {
+                                    typst::World::source(world, typst::World::main(world))
+                                        .map(|source| source.text().to_owned())
+                                        .unwrap_or_default()
+                                })
+                            })
+                            .collect();
+                        crate::tool::serve::renders::record(path, map, texts);
                     }
                     body.and_then(|body| cache.write_body(path, &body))
                 }

@@ -27,9 +27,12 @@ pub const KEEP: usize = 16;
 pub struct StoredRender {
     /// The map of the rendering.
     pub map: RenderMap,
-    /// The document's text at the time, used to translate positions taken
-    /// against this rendering into the document as it is now.
-    pub text: String,
+    /// The text of every file the rendering drew on, in the order the map
+    /// numbers them, used to translate positions taken against this rendering
+    /// into the files as they are now. A position in an included file is
+    /// translated against that file, not against the document that includes
+    /// it.
+    pub texts: Vec<String>,
     /// When it was stored, ISO 8601 UTC. Written by the caller, which knows the
     /// clock.
     #[serde(default)]
@@ -89,7 +92,7 @@ impl Store {
             return Err("a rendering with no id cannot be stored".into());
         };
         if let Some(known) = self.get(&render.map.render) {
-            if known.map == render.map && known.text == render.text {
+            if known.map == render.map && known.texts == render.texts {
                 return Ok(());
             }
         }
@@ -155,16 +158,27 @@ pub enum Resolved {
     Unknown,
 }
 
-/// Translates a position from a rendering into the document as it is now.
+/// Translates a position in one of a document's files from a rendering into
+/// that file as it is now.
 ///
-/// `current` is the document's text as it stands. The rendering supplies the
-/// text it was made from, which is compared with `current` to derive the
+/// `current` is the file's text as it stands, and `file` is its number in the
+/// rendering's map: the document itself is 0. The rendering supplies the text
+/// it was made from, which is compared with `current` to derive the
 /// translation.
-pub fn resolve_offset(store: &Store, render: &str, offset: usize, current: &str) -> Resolved {
+pub fn resolve_offset(
+    store: &Store,
+    render: &str,
+    file: usize,
+    offset: usize,
+    current: &str,
+) -> Resolved {
     let Some(stored) = store.get(render) else {
         return Resolved::Unknown;
     };
-    match Rebase::between(&stored.text, current).at(offset) {
+    let Some(was) = stored.texts.get(file) else {
+        return Resolved::Unknown;
+    };
+    match Rebase::between(was, current).at(offset) {
         Shift::At(offset) => Resolved::At(offset),
         Shift::Lost => Resolved::Lost,
     }

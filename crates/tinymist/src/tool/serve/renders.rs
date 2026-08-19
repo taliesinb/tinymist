@@ -36,11 +36,15 @@ pub fn latest() -> Option<std::sync::Arc<RenderMap>> {
 }
 
 /// Records a rendering of a document.
-pub fn record(document: &Path, map: RenderMap, text: String) {
+///
+/// `texts` is what each of the document's files said at the time, in the order
+/// the map numbers them: a position taken against this rendering is translated
+/// against the file it came from, which may be one the document includes.
+pub fn record(document: &Path, map: RenderMap, texts: Vec<String>) {
     *LATEST.write() = Some(std::sync::Arc::new(map.clone()));
     let stored = StoredRender {
         map,
-        text,
+        texts,
         stored: tinymist_project::iso_now(),
     };
     if let Err(err) = store_for(document).put(&stored) {

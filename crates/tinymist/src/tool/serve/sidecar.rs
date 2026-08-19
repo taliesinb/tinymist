@@ -102,7 +102,7 @@ fn card(rec: &AnnotationRecord, annot: &Arc<dyn AnnotationServer>) -> String {
                     width = capture.width,
                     height = capture.height,
                     time = escape(&capture.time),
-                    drawn = if scribbled.contains(&capture.name()) {
+                    drawn = if scribbled.contains(&capture.id.as_str()) {
                         " · scribbled on"
                     } else {
                         ""

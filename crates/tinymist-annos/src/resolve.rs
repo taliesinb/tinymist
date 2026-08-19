@@ -64,29 +64,52 @@ pub enum Failure {
 pub struct Context<'a> {
     /// The map of the rendering the location refers to.
     pub map: &'a RenderMap,
-    /// The document's text at the time of that rendering.
-    pub was: &'a str,
-    /// The document as it is now.
-    pub source: &'a Source,
+    /// The files of the document, in the order the rendering numbers them:
+    /// the document itself first, then what it includes and imports. An anchor
+    /// is written into the file that holds the element it marks, which may be
+    /// an included file.
+    pub files: &'a [FileText<'a>],
     /// A value used to derive ids for new anchors.
     pub seed: u64,
 }
 
-impl Context<'_> {
-    /// The offset in the current document that a source offset in the rendering
+/// One of a document's files: what it says now, and what it said when the
+/// rendering was made.
+#[derive(Debug, Clone, Copy)]
+pub struct FileText<'a> {
+    /// The file as it is now.
+    pub source: &'a Source,
+    /// Its text at the time of the rendering, for translating a position taken
+    /// against that rendering into the file as it stands.
+    pub was: &'a str,
+}
+
+impl<'a> Context<'a> {
+    /// One of the document's files, by the number the rendering gave it.
+    fn file(&self, file: usize) -> Result<FileText<'a>, Failure> {
+        self.files.get(file).copied().ok_or(Failure::Unwritable)
+    }
+
+    /// The same, for the numbering the rendering uses.
+    fn at_index(&self, file: crate::render_map::FileIndex) -> Result<FileText<'a>, Failure> {
+        self.file(file as usize)
+    }
+
+    /// The offset in a file as it stands that an offset in the rendering
     /// corresponds to.
-    fn migrate(&self, offset: usize) -> Result<usize, Failure> {
-        if self.was == self.source.text() {
+    fn migrate(&self, file: usize, offset: usize) -> Result<usize, Failure> {
+        let held = self.file(file)?;
+        if held.was == held.source.text() {
             return Ok(offset);
         }
-        match Rebase::between(self.was, self.source.text()).at(offset) {
+        match Rebase::between(held.was, held.source.text()).at(offset) {
             Shift::At(offset) => Ok(offset),
             Shift::Lost => Err(Failure::Lost),
         }
     }
 
-    /// Where a node's text position sits in the current document.
-    fn offset_of_char(&self, uid: &str, char_at: usize) -> Result<usize, Failure> {
+    /// Where a node's text position sits now: which file, and where in it.
+    fn offset_of_char(&self, uid: &str, char_at: usize) -> Result<(usize, usize), Failure> {
         let node = self
             .map
             .node(uid)
@@ -94,17 +117,12 @@ impl Context<'_> {
         let (file, offset) = node
             .source_of(char_at)
             .ok_or_else(|| Failure::NoSource(uid.to_owned()))?;
-        if file != 0 {
-            // Only the document being annotated can take anchors; content from
-            // an included file is addressable but not yet writable.
-            return Err(Failure::NoSource(uid.to_owned()));
-        }
-        self.migrate(offset)
+        let file = file as usize;
+        Ok((file, self.migrate(file, offset)?))
     }
 
-    /// Where a node ends in the current document, which is where a label
-    /// attaching to it goes.
-    fn offset_after_node(&self, uid: &str) -> Result<usize, Failure> {
+    /// Where a node ends now, which is where a label attaching to it goes.
+    fn offset_after_node(&self, uid: &str) -> Result<(usize, usize), Failure> {
         let node = self
             .map
             .node(uid)
@@ -112,10 +130,8 @@ impl Context<'_> {
         let range = node
             .range
             .ok_or_else(|| Failure::NoSource(uid.to_owned()))?;
-        if range.file != 0 {
-            return Err(Failure::NoSource(uid.to_owned()));
-        }
-        self.migrate(range.end)
+        let file = range.file as usize;
+        Ok((file, self.migrate(file, range.end)?))
     }
 
     /// Whether a node is a block, which a vertical position requires.
@@ -140,9 +156,15 @@ struct Anchored {
     coarsened: bool,
 }
 
-fn anchor_at(ctx: &Context, offset: usize, used: &mut Vec<Edit>) -> Result<Anchored, Failure> {
+fn anchor_at(
+    ctx: &Context,
+    file: usize,
+    offset: usize,
+    used: &mut Vec<Edit>,
+) -> Result<Anchored, Failure> {
+    let held = ctx.file(file)?;
     // Snap to a position where a label is valid.
-    let (at, coarsened) = match anchor::place(ctx.source, offset) {
+    let (at, coarsened) = match anchor::place(held.source, offset) {
         Ok(at) => (at, false),
         Err(Refusal::Coarsen(range)) => (range.end, true),
         Err(Refusal::NotMarkup) => return Err(Failure::Unwritable),
@@ -150,7 +172,7 @@ fn anchor_at(ctx: &Context, offset: usize, used: &mut Vec<Edit>) -> Result<Ancho
 
     // An anchor already at this position is shared rather than duplicated: a
     // Typst element carries at most one label.
-    if let Some(anchor) = anchor::at_position(ctx.source, at) {
+    if let Some(anchor) = anchor::at_position(held.source, at) {
         return Ok(Anchored {
             label: anchor.name(),
             at,
@@ -159,7 +181,7 @@ fn anchor_at(ctx: &Context, offset: usize, used: &mut Vec<Edit>) -> Result<Ancho
     }
     // An anchor written earlier in this same conversion, for a span whose ends
     // resolve to the same place.
-    if let Some(edit) = used.iter().find(|edit| edit.at == at) {
+    if let Some(edit) = used.iter().find(|edit| edit.file == file && edit.at == at) {
         let label = edit
             .text
             .trim_start_matches('<')
@@ -172,14 +194,33 @@ fn anchor_at(ctx: &Context, offset: usize, used: &mut Vec<Edit>) -> Result<Ancho
         });
     }
 
-    let id = anchor::fresh_id(ctx.source, ctx.seed.wrapping_add(at as u64));
-    let edit = anchor::insert(&id, at);
+    // The id must be unique across the whole document, not just within this
+    // file: a label is looked up by searching every file, so two files using
+    // the same id would be ambiguous.
+    let id = fresh_id_across(ctx, ctx.seed.wrapping_add(at as u64));
+    let edit = anchor::insert(&id, file, at);
     used.push(edit.clone());
     Ok(Anchored {
         label: crate::anchor_label(&id),
         at,
         coarsened,
     })
+}
+
+/// An id no file of the document is using.
+fn fresh_id_across(ctx: &Context, seed: u64) -> String {
+    let mut seed = seed;
+    loop {
+        let id = anchor::fresh_id(ctx.files.first().map(|held| held.source).unwrap(), seed);
+        let taken = ctx
+            .files
+            .iter()
+            .any(|held| anchor::find(held.source, &id).is_some());
+        if !taken {
+            return id;
+        }
+        seed = seed.wrapping_add(1);
+    }
 }
 
 /// Converts a location.
@@ -189,8 +230,8 @@ pub fn resolve(ctx: &Context, location: &HtmlLocation) -> Result<Resolution, Fai
 
     // A word or a horizontal position resolves to an anchor at an offset.
     let mut text_anchor = |uid: &str, char_at: usize| -> Result<String, Failure> {
-        let offset = ctx.offset_of_char(uid, char_at)?;
-        let anchored = anchor_at(ctx, offset, &mut edits)?;
+        let (file, offset) = ctx.offset_of_char(uid, char_at)?;
+        let anchored = anchor_at(ctx, file, offset, &mut edits)?;
         coarsened |= anchored.coarsened;
         Ok(anchored.label)
     };
@@ -205,9 +246,9 @@ pub fn resolve(ctx: &Context, location: &HtmlLocation) -> Result<Resolution, Fai
                          uid: &str,
                          char_at: usize|
      -> Result<(String, HSide, bool), Failure> {
-        let offset = ctx.offset_of_char(uid, char_at)?;
-        let anchored = anchor_at(ctx, offset, edits)?;
-        let text = ctx.source.text();
+        let (file, offset) = ctx.offset_of_char(uid, char_at)?;
+        let anchored = anchor_at(ctx, file, offset, edits)?;
+        let text = ctx.file(file)?.source.text();
         let jumped = text[offset..anchored.at].chars().any(|ch| !ch.is_whitespace());
         // One word, and only one: a position that was in front of a word is to
         // the left of the anchor written after it. An anchor that had to travel
@@ -269,8 +310,8 @@ pub fn resolve(ctx: &Context, location: &HtmlLocation) -> Result<Resolution, Fai
             if !ctx.is_block(&reference.node)? {
                 return Err(Failure::WrongKind(reference.node.clone()));
             }
-            let offset = ctx.offset_after_node(&reference.node)?;
-            let anchored = anchor_at(ctx, offset, &mut edits)?;
+            let (file, offset) = ctx.offset_after_node(&reference.node)?;
+            let anchored = anchor_at(ctx, file, offset, &mut edits)?;
             coarsened |= anchored.coarsened;
             Location::PosV {
                 reference: TypstNodeCursorRef {
@@ -285,10 +326,10 @@ pub fn resolve(ctx: &Context, location: &HtmlLocation) -> Result<Resolution, Fai
                     return Err(Failure::WrongKind(uid.clone()));
                 }
             }
-            let from = ctx.offset_after_node(&begin.node)?;
-            let to = ctx.offset_after_node(&end.node)?;
-            let from = anchor_at(ctx, from, &mut edits)?;
-            let to = anchor_at(ctx, to, &mut edits)?;
+            let (from_file, from) = ctx.offset_after_node(&begin.node)?;
+            let (to_file, to) = ctx.offset_after_node(&end.node)?;
+            let from = anchor_at(ctx, from_file, from, &mut edits)?;
+            let to = anchor_at(ctx, to_file, to, &mut edits)?;
             coarsened |= from.coarsened || to.coarsened;
             Location::SpanV {
                 begin: TypstNodeCursorRef {
@@ -332,8 +373,8 @@ pub fn resolve(ctx: &Context, location: &HtmlLocation) -> Result<Resolution, Fai
                 }
                 _ => unreachable!("every location kind is handled"),
             };
-            let offset = ctx.offset_after_node(uid)?;
-            let anchored = anchor_at(ctx, offset, &mut edits)?;
+            let (file, offset) = ctx.offset_after_node(uid)?;
+            let anchored = anchor_at(ctx, file, offset, &mut edits)?;
             coarsened |= anchored.coarsened;
             rebuild(TypstNodeRef {
                 label: anchored.label,
@@ -510,20 +551,27 @@ pub fn project(ctx: &Context, location: &TypstLocation) -> Result<HtmlLocation, 
 }
 
 impl Context<'_> {
-    /// Where an anchor sits in the document.
-    fn anchor_offset(&self, label: &str) -> Result<usize, Failure> {
+    /// Where an anchor sits: which of the document's files, and where in it.
+    ///
+    /// Every file is searched, because the label may have been written into an
+    /// included file.
+    fn anchor_offset(&self, label: &str) -> Result<(usize, usize), Failure> {
         let id = crate::anchor_id(label).unwrap_or(label);
-        anchor::find(self.source, id)
-            .map(|anchor| anchor.at())
+        self.files
+            .iter()
+            .enumerate()
+            .find_map(|(index, held)| {
+                anchor::find(held.source, id).map(|anchor| (index, anchor.at()))
+            })
             .ok_or_else(|| Failure::NoSuchNode(label.to_owned()))
     }
 
     /// Where an anchor sits in the rendering: the run it is in, and how many
     /// characters into that run.
     fn rendered_position(&self, label: &str) -> Result<(&str, usize), Failure> {
-        let offset = self.anchor_offset(label)?;
+        let (file, offset) = self.anchor_offset(label)?;
         self.map
-            .text_at(0, offset)
+            .text_at(file as crate::render_map::FileIndex, offset)
             .ok_or_else(|| Failure::NoSource(label.to_owned()))
     }
 
@@ -534,8 +582,8 @@ impl Context<'_> {
     /// the run before it, so the whitespace is stepped back over before the run
     /// is looked up.
     fn rendered_word(&self, label: &str) -> Result<(&str, usize), Failure> {
-        let mut at = self.anchor_offset(label)?;
-        let text = self.source.text();
+        let (file, mut at) = self.anchor_offset(label)?;
+        let text = self.file(file)?.source.text();
         while let Some(prev) = text[..at].chars().next_back() {
             if !prev.is_whitespace() {
                 break;
@@ -543,7 +591,7 @@ impl Context<'_> {
             at -= prev.len_utf8();
         }
         self.map
-            .text_at(0, at)
+            .text_at(file as crate::render_map::FileIndex, at)
             .ok_or_else(|| Failure::NoSource(label.to_owned()))
     }
 
@@ -558,9 +606,9 @@ impl Context<'_> {
         label: &str,
         kinds: &[crate::render_map::NodeKind],
     ) -> Result<&str, Failure> {
-        let offset = self.anchor_offset(label)?;
+        let (file, offset) = self.anchor_offset(label)?;
         self.map
-            .node_containing(0, offset, kinds)
+            .node_containing(file as crate::render_map::FileIndex, offset, kinds)
             .ok_or(())
             .or_else(|()| self.rendered_node(label, kinds).map_err(|_| ()))
             .map_err(|()| Failure::NoSource(label.to_owned()))
@@ -577,11 +625,11 @@ impl Context<'_> {
         label: &str,
         kinds: &[crate::render_map::NodeKind],
     ) -> Result<&str, Failure> {
-        let offset = self.anchor_offset(label)?;
-        let text = self.source.text();
+        let (file, offset) = self.anchor_offset(label)?;
+        let text = self.file(file)?.source.text();
         let mut at = offset;
         loop {
-            if let Some(uid) = self.map.node_ending_at(0, at, kinds) {
+            if let Some(uid) = self.map.node_ending_at(file as crate::render_map::FileIndex, at, kinds) {
                 return Ok(uid);
             }
             let Some(prev) = text[..at].chars().next_back() else {
@@ -603,10 +651,13 @@ impl Context<'_> {
         };
         // The run's text is not held in the map, so the word is read from the
         // source instead, through the segment the position falls in.
-        let Some((_, offset)) = node.source_of(at) else {
+        let Some((file, offset)) = node.source_of(at) else {
             return (at, None);
         };
-        let text = self.source.text();
+        let Ok(held) = self.at_index(file) else {
+            return (at, None);
+        };
+        let text = held.source.text();
         // A label may be written with a space before it, which is not part of
         // the word it names.
         let mut end = offset;

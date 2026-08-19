@@ -217,10 +217,9 @@ mod guard_tests {
         assert_eq!(Sidecar::parse("  ").expect("empty").annotations.len(), 0);
     }
 
-    /// A capture written before captures had ids is still one a scribble can
-    /// name, and the annotations around it still load.
+    /// A sidecar reads back as it was written, captures and all.
     #[test]
-    fn a_capture_without_an_id_keeps_its_name() {
+    fn a_capture_is_read_back_by_its_id() {
         let held = concat!(
             r#"{"_": "note", "version": 1, "annotations": [{"#,
             r#""uuid": "u1", "letter": "a","#,
@@ -228,11 +227,11 @@ mod guard_tests {
             r#""type": "comment", "color": "white", "author": "tali","#,
             r#""time": "2026-01-01T00:00:00Z", "mtime": "2026-01-01T00:00:00Z","#,
             r#""claimed": false, "resolved": false, "content": "said","#,
-            r#""captures": [{"time": "2026-01-01T00:00:00Z", "fmt": "svg","#,
+            r#""captures": [{"id": "c1", "time": "2026-01-01T00:00:00Z", "fmt": "svg","#,
             r#""hash": "abc123", "width": 10, "height": 10}]}]}"#,
         );
-        let sidecar = Sidecar::parse(held).expect("an older sidecar still reads");
+        let sidecar = Sidecar::parse(held).expect("a sidecar reads");
         let capture = &sidecar.annotations[0].captures[0];
-        assert_eq!(capture.name(), "abc123");
+        assert_eq!(capture.id, "c1");
     }
 }

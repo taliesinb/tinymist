@@ -3388,14 +3388,18 @@
     };
     const corner = at({ x: box.left, y: box.top });
     const far = at({ x: box.right, y: box.bottom });
-    // Without the ids the exporter hangs on every element: they change
-    // whenever anything above them in the document does, and a picture is what
-    // it looks like. The server strips the same ones, so a drawing nobody has
-    // touched is the same capture whoever took it.
+    // Take off the bookkeeping the exporter puts on every element. Those
+    // attributes change whenever anything above the drawing in the document
+    // does, so a drawing nobody has touched would otherwise be a different
+    // capture after every edit. `plain_svg` on the server takes off the same
+    // ones, so a capture taken here and one taken there are the same bytes.
+    // The `id` goes too when it is a rendering number; the glyph ids the
+    // drawing defines and refers to are named after their contents and stay.
     for (const el of [copy, ...copy.querySelectorAll("*")]) {
       for (const name of ["data-uid", "data-typst-src", "data-typst-text", "data-typst-atom"]) {
         el.removeAttribute(name);
       }
+      if (/^n\d+$/.test(el.getAttribute("id") || "")) el.removeAttribute("id");
     }
     return {
       fmt: "svg",

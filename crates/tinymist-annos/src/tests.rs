@@ -593,26 +593,29 @@ fn a_stored_rendering_translates_positions_after_a_restart() {
             }],
             nodes: Default::default(),
         },
-        text: was.into(),
+        texts: vec![was.into()],
         stored: "2026-08-16T09:10:00Z".into(),
     };
     store.put(&stored).expect("stores");
     // Storing the same rendering again is not an error.
     store.put(&stored).expect("stores again");
     assert_eq!(store.held().len(), 1);
-    assert_eq!(store.get("abc123").map(|held| held.text), Some(was.into()));
+    assert_eq!(
+        store.get("abc123").map(|held| held.texts),
+        Some(vec![was.to_owned()])
+    );
 
     // A position taken against the stored rendering, read against the file as
     // it is now.
     assert_eq!(
-        resolve_offset(&store, "abc123", 6, now),
+        resolve_offset(&store, "abc123", 0, 6, now),
         Resolved::At(6 + "INSERTED\n".len())
     );
     // A rendering nobody kept.
-    assert_eq!(resolve_offset(&store, "ffffff", 6, now), Resolved::Unknown);
+    assert_eq!(resolve_offset(&store, "ffffff", 0, 6, now), Resolved::Unknown);
     // A position in text that has since gone.
     assert_eq!(
-        resolve_offset(&store, "abc123", 8, "alpha\ngamma\n"),
+        resolve_offset(&store, "abc123", 0, 8, "alpha\ngamma\n"),
         Resolved::Lost
     );
     let _ = std::fs::remove_dir_all(&dir);
@@ -633,7 +636,7 @@ fn a_store_keeps_only_so_many_renderings() {
                 files: vec![],
                 nodes: Default::default(),
             },
-            text: format!("version {n}"),
+            texts: vec![format!("version {n}")],
             stored: String::new(),
         };
         store.put(&stored).expect("stores");
@@ -701,8 +704,7 @@ fn a_word_resolves_to_a_new_anchor_after_it() {
 
     let ctx = crate::resolve::Context {
         map: &map,
-        was: text,
-        source: &source,
+        files: &[crate::resolve::FileText { source: &source, was: text }],
         seed: 7,
     };
     let asked = Location::Word {
@@ -723,7 +725,7 @@ fn a_word_resolves_to_a_new_anchor_after_it() {
     };
     assert_eq!(out.edits[0].text, format!("<{}>", reference.label));
     assert!(reference.label.starts_with("anno."));
-    let written = crate::anchor::apply(text, &out.edits);
+    let written = crate::anchor::apply(0, text, &out.edits);
     assert!(written.starts_with("The monoid<anno."), "{written}");
 }
 
@@ -736,8 +738,7 @@ fn a_second_annotation_on_the_same_word_shares_the_anchor() {
 
     let ctx = crate::resolve::Context {
         map: &map,
-        was: text,
-        source: &source,
+        files: &[crate::resolve::FileText { source: &source, was: text }],
         seed: 7,
     };
     let out = crate::resolve::resolve(
@@ -768,8 +769,7 @@ fn a_position_inside_a_word_snaps_to_the_end_of_it() {
     run_node(&mut map, "n1", NodeKind::Text, 0, text.len() - 1);
     let ctx = crate::resolve::Context {
         map: &map,
-        was: text,
-        source: &source,
+        files: &[crate::resolve::FileText { source: &source, was: text }],
         seed: 1,
     };
     let out = crate::resolve::resolve(
@@ -802,8 +802,7 @@ fn a_position_in_a_call_is_answered_with_the_call() {
     run_node(&mut map, "n1", NodeKind::Text, 13, 6);
     let ctx = crate::resolve::Context {
         map: &map,
-        was: text,
-        source: &source,
+        files: &[crate::resolve::FileText { source: &source, was: text }],
         seed: 3,
     };
     let out = crate::resolve::resolve(
@@ -831,8 +830,7 @@ fn a_span_across_two_places_writes_two_anchors() {
     run_node(&mut map, "n1", NodeKind::Text, 0, text.len() - 1);
     let ctx = crate::resolve::Context {
         map: &map,
-        was: text,
-        source: &source,
+        files: &[crate::resolve::FileText { source: &source, was: text }],
         seed: 5,
     };
     let out = crate::resolve::resolve(
@@ -863,7 +861,7 @@ fn a_span_across_two_places_writes_two_anchors() {
     // written, so that anchor sits at the position itself.
     assert_eq!(begin.side, HSide::Left);
     assert_eq!(end.side, HSide::Right);
-    let written = crate::anchor::apply(text, &out.edits);
+    let written = crate::anchor::apply(0, text, &out.edits);
     assert!(written.contains("beta<anno."), "{written}");
 }
 
@@ -876,8 +874,7 @@ fn a_position_is_translated_when_the_document_has_moved_on() {
     run_node(&mut map, "n1", NodeKind::Text, 0, was.len() - 1);
     let ctx = crate::resolve::Context {
         map: &map,
-        was,
-        source: &source,
+        files: &[crate::resolve::FileText { source: &source, was }],
         seed: 9,
     };
     let out = crate::resolve::resolve(
@@ -894,7 +891,7 @@ fn a_position_is_translated_when_the_document_has_moved_on() {
     .expect("resolves");
     // The word is now eighteen characters further into the file.
     assert_eq!(out.edits[0].at, 10 + "A new first line.\n".len());
-    let written = crate::anchor::apply(now, &out.edits);
+    let written = crate::anchor::apply(0, now, &out.edits);
     assert!(written.contains("The monoid<anno."), "{written}");
 }
 
@@ -907,8 +904,7 @@ fn a_position_in_deleted_text_does_not_resolve() {
     run_node(&mut map, "n1", NodeKind::Text, 0, was.len() - 1);
     let ctx = crate::resolve::Context {
         map: &map,
-        was,
-        source: &source,
+        files: &[crate::resolve::FileText { source: &source, was }],
         seed: 9,
     };
     let out = crate::resolve::resolve(
@@ -934,8 +930,7 @@ fn a_vertical_position_needs_a_block() {
     run_node(&mut map, "n2", NodeKind::Block, 0, 15);
     let ctx = crate::resolve::Context {
         map: &map,
-        was: text,
-        source: &source,
+        files: &[crate::resolve::FileText { source: &source, was: text }],
         seed: 2,
     };
     let against_text = crate::resolve::resolve(
@@ -974,8 +969,7 @@ fn an_unknown_node_is_reported_as_such() {
     let (source, map) = fixture(text);
     let ctx = crate::resolve::Context {
         map: &map,
-        was: text,
-        source: &source,
+        files: &[crate::resolve::FileText { source: &source, was: text }],
         seed: 2,
     };
     let out = crate::resolve::resolve(
@@ -1000,8 +994,7 @@ fn a_location_makes_the_round_trip() {
 
     let ctx = crate::resolve::Context {
         map: &map,
-        was: text,
-        source: &source,
+        files: &[crate::resolve::FileText { source: &source, was: text }],
         seed: 0,
     };
     let stored: TypstLocation = Location::Word {
@@ -1053,8 +1046,7 @@ fn a_drawing_projects_to_the_element_it_follows() {
     );
     let ctx = crate::resolve::Context {
         map: &map,
-        was: text,
-        source: &source,
+        files: &[crate::resolve::FileText { source: &source, was: text }],
         seed: 0,
     };
     let shown = crate::resolve::project(
@@ -1078,8 +1070,7 @@ fn an_anchor_the_document_no_longer_has_does_not_project() {
     let (source, map) = fixture(text);
     let ctx = crate::resolve::Context {
         map: &map,
-        was: text,
-        source: &source,
+        files: &[crate::resolve::FileText { source: &source, was: text }],
         seed: 0,
     };
     let out = crate::resolve::project(

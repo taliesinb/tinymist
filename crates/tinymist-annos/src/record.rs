@@ -94,10 +94,7 @@ pub struct Reply {
 /// the drawing an annotation was about may have been redrawn since.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Capture {
-    /// What a scribble drawn on it refers to. Written since captures had
-    /// scribbles to refer to them by; one from before that is named by its
-    /// hash, which is what it was identified by then.
-    #[serde(default)]
+    /// What a scribble drawn on it refers to.
     pub id: String,
     /// When it was taken, ISO 8601 UTC.
     pub time: String,
@@ -211,14 +208,6 @@ impl Mark {
         match self {
             Self::Path { color, .. } | Self::Point { color, .. } => color,
         }
-    }
-}
-
-impl Capture {
-    /// What a scribble names it by: its own id, or its hash for one written
-    /// before captures had ids.
-    pub fn name(&self) -> &str {
-        if self.id.is_empty() { &self.hash } else { &self.id }
     }
 }
 

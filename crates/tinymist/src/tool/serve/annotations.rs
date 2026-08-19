@@ -197,7 +197,7 @@ pub fn keep_scribble(
             && capture.height == new.picture.height
     });
     let capture = match held {
-        Some(capture) => capture.name().to_owned(),
+        Some(capture) => capture.id.clone(),
         None => {
             let id = fresh_uuid(&hash);
             record.captures.push(tinymist_annos::Capture {
@@ -218,6 +218,44 @@ pub fn keep_scribble(
     })
 }
 
+
+/// One of a document's files, as it stands and as it was.
+pub struct DocumentFile {
+    /// Where it is.
+    pub path: std::path::PathBuf,
+    /// What it says now.
+    pub source: typst::syntax::Source,
+    /// What it said when the rendering was made.
+    pub was: String,
+}
+
+/// Every file a rendering drew on, read from disk.
+///
+/// In the order the map numbers them, so that a file index in a location or an
+/// edit means the same thing here as it does there. A file that cannot be read
+/// now is given the text it had, which keeps the numbering and fails only the
+/// annotations that are actually in it.
+pub fn document_files(
+    stored: &tinymist_annos::store::StoredRender,
+) -> Result<Vec<DocumentFile>, String> {
+    let was = &stored.texts;
+    Ok(stored
+        .map
+        .files
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            let path = std::path::PathBuf::from(&entry.path);
+            let before = was.get(index).cloned().unwrap_or_default();
+            let text = std::fs::read_to_string(&path).unwrap_or_else(|_| before.clone());
+            DocumentFile {
+                path,
+                source: typst::syntax::Source::detached(text),
+                was: before,
+            }
+        })
+        .collect())
+}
 
 pub trait AnnotationServer: Send + Sync {
     /// Creates an annotation at a clicked position. Returns the new uuid.
@@ -629,13 +667,33 @@ fn heading_path(source: &typst::syntax::Source, at: usize) -> Vec<String> {
     path.into_iter().map(|(_, title)| title).collect()
 }
 
+/// Every file the compile read, the document first, each with its text.
+///
+/// An anchor may be written into a file the document includes, so anything
+/// that looks for one looks in all of them. Files that are not Typst source,
+/// and files that cannot be read, are left out. The list has no repeats.
+pub fn compiled_files(art: &LspCompiledArtifact) -> Vec<(PathBuf, typst::syntax::Source)> {
+    let world = art.world();
+    let mut out: Vec<(PathBuf, typst::syntax::Source)> = vec![];
+    for id in std::iter::once(world.main()).chain(art.depended_files().iter().copied()) {
+        let Ok(source) = world.source(id) else { continue };
+        let Ok(path) = world.path_for_id(id).and_then(|path| path.to_err()) else {
+            continue;
+        };
+        if out.iter().any(|(seen, _)| *seen == path) {
+            continue;
+        }
+        out.push((path, source));
+    }
+    out
+}
+
 /// The block an annotation is anchored in.
 pub fn block_of(
     art: &LspCompiledArtifact,
     uuid: &str,
     context: bool,
 ) -> Result<SourceBlock, String> {
-    let world = art.world();
     // Which anchor the annotation points at. A span has two; the block is the
     // one the first end sits in.
     let sidecar = sidecar_path(art).ok_or("cannot determine the sidecar path")?;
@@ -650,21 +708,13 @@ pub fn block_of(
         .ok_or_else(|| format!("annotation {uuid} names no anchor"))?;
     let id = tinymist_annos::anchor_id(&label).unwrap_or(&label).to_owned();
 
-    // The document first, then whatever else the compile read: an anchor in an
-    // included file belongs to that file, and is edited there.
-    let files = std::iter::once(world.main()).chain(art.depended_files().iter().copied());
-    let hit = files.into_iter().find_map(|file| {
-        let source = world.source(file).ok()?;
-        let found = anchor::find(&source, &id)?;
-        let at = found.at();
-        Some((file, source, at))
+    // Searched across every file, since the anchor may be in one the document
+    // includes. The block is then read and rewritten in that file.
+    let hit = compiled_files(art).into_iter().find_map(|(path, source)| {
+        let at = anchor::find(&source, &id)?.at();
+        Some((path, source, at))
     });
-    let (file, source, at) = hit.ok_or_else(|| format!("no anchor {label} in the document"))?;
-    let path = world
-        .path_for_id(file)
-        .map_err(|err| err.to_string())?
-        .to_err()
-        .map_err(|err| err.to_string())?;
+    let (path, source, at) = hit.ok_or_else(|| format!("no anchor {label} in the document"))?;
     let range = block_range(&source, at);
     let text = source.text()[range.clone()].to_owned();
     let file_name = path.display().to_string();
@@ -981,27 +1031,37 @@ impl crate::tool::serve::AnnotationServer for DiskAnnotationServer {
         if matches!(req.location, tinymist_annos::HtmlLocation::Document) {
             return self.annotate_document(&req);
         }
-        let (document, sidecar_path, stored) = self.context(&req.render)?;
-        let text = std::fs::read_to_string(&document)
-            .map_err(|err| format!("cannot read {}: {err}", document.display()))?;
-        let source = typst::syntax::Source::detached(text.clone());
+        let (_document, sidecar_path, stored) = self.context(&req.render)?;
+        // Every file of the document, as each stands now, since the anchor may
+        // have to be written into an included file.
+        let files = document_files(&stored)?;
+        let held: Vec<tinymist_annos::resolve::FileText> = files
+            .iter()
+            .map(|file| tinymist_annos::resolve::FileText {
+                source: &file.source,
+                was: &file.was,
+            })
+            .collect();
 
-        // Where it points, in the document as it stands: the rendering the page
-        // was looking at may be older than the file.
+        // Resolve against the files as they stand, since they may have been
+        // edited since the rendering the page is looking at was made.
         let ctx = tinymist_annos::resolve::Context {
             map: &stored.map,
-            was: &stored.text,
-            source: &source,
+            files: &held,
             seed: self.compile_revision(),
         };
         let resolution = tinymist_annos::resolve::resolve(&ctx, &req.location)
             .map_err(|err| describe(&err))?;
 
-        // The anchor goes into the document, if the place did not have one.
-        let written = anchor::apply(&text, &resolution.edits);
-        if !resolution.edits.is_empty() {
-            std::fs::write(&document, &written)
-                .map_err(|err| format!("cannot write {}: {err}", document.display()))?;
+        // The anchor goes into whichever file the place is in, if it did not
+        // have one already.
+        for (index, file) in files.iter().enumerate() {
+            if !resolution.edits.iter().any(|edit| edit.file == index) {
+                continue;
+            }
+            let written = anchor::apply(index, file.source.text(), &resolution.edits);
+            std::fs::write(&file.path, &written)
+                .map_err(|err| format!("cannot write {}: {err}", file.path.display()))?;
         }
 
         let now = tinymist_project::iso_now();
@@ -1237,9 +1297,12 @@ impl crate::tool::serve::AnnotationServer for DiskAnnotationServer {
         let now = super::renders::latest().ok_or("nothing has been rendered yet")?;
         let now_text = std::fs::read_to_string(&document)
             .map_err(|err| format!("cannot read {}: {err}", document.display()))?;
+        // Only the document's own text is compared. An unsent annotation is
+        // one the reader is still writing, and the page it is on is a page of
+        // the document being served.
         let ctx = tinymist_annos::relocate::Between {
             was: &was.map,
-            was_text: &was.text,
+            was_text: was.texts.first().map(String::as_str).unwrap_or_default(),
             now: &now,
             now_text: &now_text,
         };
@@ -1293,18 +1356,31 @@ impl crate::tool::serve::AnnotationServer for DiskAnnotationServer {
         let art = self.art()?;
         let document = document_path(&art).ok_or("cannot determine the document path")?;
         let sidecar_path = tinymist_annos::sidecar_path(&document);
-        let text = std::fs::read_to_string(&document)
-            .map_err(|err| format!("cannot read {}: {err}", document.display()))?;
-        let source = typst::syntax::Source::detached(text);
         let sidecar = read_sidecar(&sidecar_path);
-        let anchors = tinymist_annos::anchor::anchors_in(&source);
-        let names: Vec<String> = anchors.iter().map(|anchor| anchor.name()).collect();
+        // Every file the compile read, not the document alone: an annotation
+        // on a heading in an included file is anchored in that file, and
+        // reading the document alone would report it as an annotation whose
+        // anchor is gone.
+        let files = compiled_files(&art);
+        let mut names: Vec<String> = vec![];
+        let mut per_file = vec![];
+        for (path, source) in &files {
+            let found = tinymist_annos::anchor::anchors_in(source);
+            per_file.push(serde_json::json!({
+                "file": path.display().to_string(),
+                "anchors": found.len(),
+            }));
+            names.extend(found.iter().map(|anchor| anchor.name()));
+        }
         let report = tinymist_annos::audit::audit(names.iter().map(String::as_str), &sidecar);
         let dangling = tinymist_annos::audit::dangling(&sidecar, &report);
         Ok(serde_json::json!({
             "document": document.display().to_string(),
+            // Each file the document is made of, with how many anchors it
+            // holds. The document itself is first.
+            "files": per_file,
             "annotations": sidecar.annotations.len(),
-            "anchors": anchors.len(),
+            "anchors": names.len(),
             // Anchors nothing points at any more: the next collection removes
             // them, and they are not a problem.
             "unusedAnchors": report.unused,

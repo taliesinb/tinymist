@@ -153,9 +153,10 @@ fn tools() -> Vec<Tool> {
             description: "Returns the piece of Typst source an annotation points into: the \
                           smallest thing that can be rewritten whole, such as a paragraph, a \
                           list item, a heading or a figure. The reply has the block's id (needed \
-                          to rewrite it), the headings above it, and every anchor inside it with \
-                          its offset, which a rewrite must preserve. Works even when the \
-                          document does not compile. An annotation about the document, or one \
+                          to rewrite it), the file it is in, the headings above it, and every \
+                          anchor inside it with its offset, which a rewrite must preserve. The \
+                          block may be in a file the document includes; the reply says which \
+                          file. Works even when the document does not compile. An annotation about the document, or one \
                           whose anchor is gone, has no block; the reply says so and gives the \
                           text it was written against. Examples: {\"uuid\": \"g\"}; {\"uuid\": \
                           \"g\", \"context\": true} to see the blocks either side as well.",
@@ -172,8 +173,8 @@ fn tools() -> Vec<Tool> {
         Tool {
             name: "replace_annotated_block",
             title: "Replace a block",
-            description: "Rewrites the block an annotation is in, waits for the document to \
-                          compile, and reports whether it did. Refused if the block has changed \
+            description: "Rewrites the block an annotation is in, in whichever file that block \
+                          is in, waits for the document to compile, and reports whether it did. Refused if the block has changed \
                           since you read it (read it again), if the new text drops an anchor \
                           without saying so, or if it invents one. The reply includes the block \
                           as it now stands, with a fresh id. Examples: {\"uuid\": \"g\", \
@@ -297,7 +298,9 @@ fn tools() -> Vec<Tool> {
                           many annotations and anchors there are, anchors nothing points at any \
                           more, and annotations whose anchor is gone. The last of these are the \
                           ones the reader cannot see in place; they are about the document until \
-                          an anchor comes back. Example: {}",
+                          an anchor comes back. Every file the document is made of is counted, \
+                          not the document alone, and the reply lists each file with the number \
+                          of anchors in it. Example: {}",
             schema: || {
                 schema(
                     json!({ "document": optional_string("Which document, when the server holds several.") }),
@@ -780,7 +783,7 @@ async fn call_tool(site: &Arc<dyn DocumentSite>, name: &str, args: &Value) -> Re
                 std::iter::once(&record.scribble)
                     .chain(record.discussion.iter().map(|reply| &reply.scribble))
                     .flatten()
-                    .filter(|scribble| scribble.capture == chosen.name())
+                    .filter(|scribble| scribble.capture == chosen.id)
                     .flat_map(|scribble| scribble.shapes.clone())
                     .collect()
             } else {

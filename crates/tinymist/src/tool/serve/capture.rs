@@ -51,22 +51,23 @@ pub fn path_of(hash: &str, fmt: &str) -> Option<PathBuf> {
 
 /// A drawing without the rendering's bookkeeping on it.
 ///
-/// The exporter labels every element with an id and the source range it came
-/// from, and those change whenever anything above them in the document does. A
+/// The exporter numbers every element and records the source range it came
+/// from, and both change whenever anything above them in the document does. A
 /// picture is what it looks like, so a drawing that is the same drawing should
 /// hash to the same bytes however many times the document has been rebuilt
 /// around it — otherwise every edit anywhere leaves another copy of every
 /// drawing in the store and another entry in every annotation.
+///
+/// Taken out: `data-uid`, the `data-typst-*` attributes, and the element's
+/// `id` when it is a rendering number. The glyph ids the drawing defines and
+/// refers to are named after their contents, not their position, so they stay.
 pub fn plain_svg(svg: &str) -> String {
     let mut out = String::with_capacity(svg.len());
     let mut rest = svg;
-    while let Some(at) = rest.find(" data-") {
-        let after = &rest[at + " data-".len()..];
-        let named = after
-            .split_once('=')
-            .filter(|(name, _)| matches!(*name, "uid" | "typst-src" | "typst-text" | "typst-atom"));
-        let Some((_, value)) = named else {
-            out.push_str(&rest[..at + " data-".len()]);
+    while let Some(at) = rest.find(|c| c == ' ') {
+        let after = &rest[at + 1..];
+        let Some((name, value)) = after.split_once('=') else {
+            out.push_str(&rest[..at + 1]);
             rest = after;
             continue;
         };
@@ -76,11 +77,33 @@ pub fn plain_svg(svg: &str) -> String {
         let Some(end) = value[1..].find(quote) else {
             break;
         };
+        let text = &value[1..1 + end];
+        if !bookkeeping(name, text) {
+            out.push_str(&rest[..at + 1]);
+            rest = after;
+            continue;
+        }
         out.push_str(&rest[..at]);
         rest = &value[1 + end + 1..];
     }
     out.push_str(rest);
     out
+}
+
+/// Whether an attribute is the rendering's rather than the drawing's.
+fn bookkeeping(name: &str, value: &str) -> bool {
+    matches!(
+        name,
+        "data-uid" | "data-typst-src" | "data-typst-text" | "data-typst-atom"
+    ) || (name == "id" && is_uid(value))
+}
+
+/// Whether an id is one the rendering handed out: `n` and a number.
+fn is_uid(value: &str) -> bool {
+    match value.strip_prefix('n') {
+        Some(digits) => !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()),
+        None => false,
+    }
 }
 
 /// Stores a capture, returning its hash. Writing is skipped when the file is
@@ -331,4 +354,34 @@ pub fn png(svg: &str, scale: Option<f32>) -> Result<Vec<u8>, String> {
     pixmap
         .encode_png()
         .map_err(|err| format!("cannot encode the capture as PNG: {err}"))
+}
+
+#[cfg(test)]
+mod plain_tests {
+    use super::plain_svg;
+
+    #[test]
+    fn the_renderings_bookkeeping_comes_off() {
+        let svg = r##"<svg id="n751" data-uid="n751" width="10"><g data-typst-src="1:2:3"><use href="#gAB"/></g></svg>"##;
+        assert_eq!(
+            plain_svg(svg),
+            r##"<svg width="10"><g><use href="#gAB"/></g></svg>"##
+        );
+    }
+
+    #[test]
+    fn the_same_drawing_at_two_positions_is_one_picture() {
+        let here = plain_svg(r#"<svg id="n751" width="10"><circle r="4"/></svg>"#);
+        let there = plain_svg(r#"<svg id="n749" width="10"><circle r="4"/></svg>"#);
+        assert_eq!(here, there);
+    }
+
+    #[test]
+    fn the_drawings_own_ids_stay() {
+        let svg = r#"<svg id="n1"><symbol id="gAB"><path d="M0 0"/></symbol></svg>"#;
+        assert_eq!(
+            plain_svg(svg),
+            r#"<svg><symbol id="gAB"><path d="M0 0"/></symbol></svg>"#
+        );
+    }
 }

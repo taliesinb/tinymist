@@ -95,18 +95,31 @@ pub fn html_pins(art: &LspCompiledArtifact) -> Vec<HtmlPin> {
     if records.is_empty() {
         return vec![];
     }
-    let world = art.world();
-    let Ok(source) = world.source(world.main()) else {
-        return vec![];
-    };
     let Some(map) = super::renders::latest() else {
         return vec![];
     };
-    let text = source.text().to_owned();
+    // Read every file of the document, since an anchor may be in an included
+    // file rather than in the document itself. Each is read as it stands on
+    // disk.
+    let sources: Vec<typst::syntax::Source> = map
+        .files
+        .iter()
+        .map(|file| {
+            typst::syntax::Source::detached(
+                std::fs::read_to_string(&file.path).unwrap_or_default(),
+            )
+        })
+        .collect();
+    let held: Vec<tinymist_annos::resolve::FileText> = sources
+        .iter()
+        .map(|source| tinymist_annos::resolve::FileText {
+            source,
+            was: source.text(),
+        })
+        .collect();
     let ctx = tinymist_annos::resolve::Context {
         map: &map,
-        was: &text,
-        source: &source,
+        files: &held,
         seed: 0,
     };
     records.iter().map(|rec| pin_for(rec, &ctx)).collect()
@@ -148,7 +161,7 @@ fn pin_for(rec: &AnnotationRecord, ctx: &tinymist_annos::resolve::Context) -> Ht
                 std::iter::once(&rec.scribble)
                     .chain(rec.discussion.iter().map(|reply| &reply.scribble))
                     .flatten()
-                    .filter(|scribble| scribble.capture == capture.name())
+                    .filter(|scribble| scribble.capture == capture.id)
                     .map(|scribble| HtmlScribble {
                         id: scribble.id.clone(),
                         fmt: capture.fmt.clone(),

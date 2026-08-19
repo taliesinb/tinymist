@@ -275,15 +275,20 @@ fn expression_around(text: &str, node: &LinkedNode) -> Range<usize> {
 /// A change to make to a document.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Edit {
-    /// Where the text goes.
+    /// Which of the document's files it goes in, as the rendering numbers
+    /// them: the document itself is 0, and the rest are what it includes and
+    /// imports.
+    pub file: usize,
+    /// Where the text goes in that file.
     pub at: usize,
     /// What to insert.
     pub text: String,
 }
 
-/// The edit that writes an anchor at a position.
-pub fn insert(id: &str, at: usize) -> Edit {
+/// The edit that writes an anchor at a position in one of the document's files.
+pub fn insert(id: &str, file: usize, at: usize) -> Edit {
     Edit {
+        file,
         at,
         text: format!("<{ANCHOR_PREFIX}{id}>"),
     }
@@ -295,8 +300,8 @@ pub fn remove(anchor: &Anchor) -> (Range<usize>, String) {
 }
 
 /// Applies edits to a text, last first so that earlier offsets stay valid.
-pub fn apply(text: &str, edits: &[Edit]) -> String {
-    let mut edits = edits.to_vec();
+pub fn apply(file: usize, text: &str, edits: &[Edit]) -> String {
+    let mut edits: Vec<Edit> = edits.iter().filter(|edit| edit.file == file).cloned().collect();
     edits.sort_by_key(|edit| edit.at);
     let mut out = String::with_capacity(text.len() + edits.iter().map(|e| e.text.len()).sum::<usize>());
     let mut at = 0;
