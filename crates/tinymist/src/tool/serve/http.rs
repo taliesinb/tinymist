@@ -856,6 +856,12 @@ pub async fn make_http_server(
                                         "style": frag.style,
                                         "body": frag.body,
                                         "map": map,
+                                        // What the document says about being
+                                        // generated, so the page can say that
+                                        // annotating it would not last.
+                                        "generated": annot
+                                            .as_ref()
+                                            .and_then(|annot| annot.generated()),
                                     })
                                 }
                                 Err(err) => serde_json::json!({

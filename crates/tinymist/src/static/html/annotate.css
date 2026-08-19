@@ -768,3 +768,33 @@ html.tm-pen #tinymist-marks .tm-hit {
 #tinymist-annot-box .tm-pen-waiting:hover .tm-tip {
   display: block;
 }
+
+/* A document that is generated cannot be annotated: an anchor written into it
+   lasts until whatever generates it runs again. The panel says so for as long
+   as the page is open, in a red that is not the compile error's — a compile
+   error is something to fix, this is how things are. */
+.tm-status.tm-status-refused {
+  background: #4a1114;
+  color: #ffd7d7;
+  cursor: default;
+}
+
+.tm-status .tm-status-refusal {
+  font: 600 12px/1.5 system-ui, sans-serif;
+}
+
+.tm-status .tm-status-refusal + div {
+  margin-top: 6px;
+}
+
+/* What the document says about itself, in its own words. */
+.tm-status .tm-status-because {
+  font: 11px/1.45 ui-monospace, monospace;
+  font-weight: 400;
+  opacity: 0.75;
+}
+
+/* Nothing offers to be annotated when annotating is refused. */
+.tm-generated #tinymist-doc {
+  cursor: auto;
+}
