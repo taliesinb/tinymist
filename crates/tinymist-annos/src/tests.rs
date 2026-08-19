@@ -3,16 +3,11 @@ use crate::record::*;
 use crate::sidecar::*;
 
 fn word(label: &str) -> TypstWordRef {
-    TypstWordRef {
-        label: label.into(),
-    }
+    TypstWordRef::after(label)
 }
 
 fn cursor(label: &str, side: HSide) -> TypstTextCursorRef {
-    TypstTextCursorRef {
-        label: label.into(),
-        side,
-    }
+    TypstTextCursorRef::beside(label, side)
 }
 
 fn node(label: &str) -> TypstNodeRef {
@@ -723,8 +718,8 @@ fn a_word_resolves_to_a_new_anchor_after_it() {
     let Location::Word { reference } = &out.location else {
         panic!("wrong variant")
     };
-    assert_eq!(out.edits[0].text, format!("<{}>", reference.label));
-    assert!(reference.label.starts_with("anno."));
+    assert_eq!(out.edits[0].text, format!("<{}>", reference.label()));
+    assert!(reference.label().starts_with("anno."));
     let written = crate::anchor::apply(0, text, &out.edits);
     assert!(written.starts_with("The monoid<anno."), "{written}");
 }
@@ -758,7 +753,7 @@ fn a_second_annotation_on_the_same_word_shares_the_anchor() {
     let Location::Word { reference } = &out.location else {
         panic!("wrong variant")
     };
-    assert_eq!(reference.label, "anno.A1B2");
+    assert_eq!(reference.label(), "anno.A1B2");
 }
 
 #[test]
@@ -790,7 +785,10 @@ fn a_position_inside_a_word_snaps_to_the_end_of_it() {
         panic!("wrong variant")
     };
     // The position is to the right of the label, which sits after the word.
-    assert_eq!(reference.side, HSide::Right);
+    assert!(matches!(
+        reference,
+        TypstTextCursorRef::Beside { side: HSide::Right, .. }
+    ));
 }
 
 #[test]
@@ -855,12 +853,12 @@ fn a_span_across_two_places_writes_two_anchors() {
     let Location::SpanH { begin, end } = &out.location else {
         panic!("wrong variant")
     };
-    assert_ne!(begin.label, end.label);
+    assert_ne!(begin.label(), end.label());
     // The span begins in front of a word, so its anchor went after that word
     // and the position is to the anchor's left; it ends where a label may be
     // written, so that anchor sits at the position itself.
-    assert_eq!(begin.side, HSide::Left);
-    assert_eq!(end.side, HSide::Right);
+    assert!(matches!(begin, TypstTextCursorRef::Beside { side: HSide::Left, .. }));
+    assert!(matches!(end, TypstTextCursorRef::Beside { side: HSide::Right, .. }));
     let written = crate::anchor::apply(0, text, &out.edits);
     assert!(written.contains("beta<anno."), "{written}");
 }
@@ -998,9 +996,7 @@ fn a_location_makes_the_round_trip() {
         seed: 0,
     };
     let stored: TypstLocation = Location::Word {
-        reference: TypstWordRef {
-            label: "anno.A1B2".into(),
-        },
+        reference: TypstWordRef::after("anno.A1B2"),
     };
     let shown = crate::resolve::project(&ctx, &stored).expect("projects");
     let Location::Word { reference } = &shown else {
@@ -1076,9 +1072,7 @@ fn an_anchor_the_document_no_longer_has_does_not_project() {
     let out = crate::resolve::project(
         &ctx,
         &Location::Word {
-            reference: TypstWordRef {
-                label: "anno.A1B2".into(),
-            },
+            reference: TypstWordRef::after("anno.A1B2"),
         },
     );
     assert_eq!(out, Err(crate::resolve::Failure::NoSuchNode("anno.A1B2".into())));
@@ -1120,5 +1114,114 @@ fn a_position_beside_an_anchor_shares_it() {
     let Location::PosH { reference } = &out.location else {
         panic!("wrong variant")
     };
-    assert_eq!(reference.label, "anno.174F");
+    assert_eq!(reference.label(), "anno.174F");
+}
+
+/// A label inside a heading ends it, so the anchor goes at the heading's end
+/// and marks the whole heading. Which word was annotated is not lost with it:
+/// the reference says what the word is and what the heading says either side of
+/// it, so the word can be found again by reading.
+#[test]
+fn a_word_in_a_heading_is_named_by_what_is_written_around_it() {
+    use crate::render_map::NodeKind;
+    let text = "= The board, with this row added\n\nA paragraph.\n";
+    let (source, mut map) = fixture(text);
+    // The heading's text run: "The board, with this row added".
+    run_node(&mut map, "n1", NodeKind::Text, 2, 30);
+    let ctx = crate::resolve::Context {
+        map: &map,
+        files: &[crate::resolve::FileText { source: &source, was: text }],
+        seed: 11,
+    };
+    let out = crate::resolve::resolve(
+        &ctx,
+        &Location::Word {
+            reference: HtmlWordRef {
+                // "board", the second word.
+                node: "n1".into(),
+                beg: 4,
+                end: 9,
+                w: Some("board".into()),
+            },
+        },
+    )
+    .expect("resolves");
+    assert!(out.coarsened);
+    // The anchor sits at the end of the heading's text, not after "board".
+    let written = crate::anchor::apply(0, text, &out.edits);
+    assert!(
+        written.starts_with("= The board, with this row added<anno."),
+        "{written}"
+    );
+    let Location::Word {
+        reference: TypstWordRef::Within { word, to_right, .. },
+    } = &out.location
+    else {
+        panic!("expected a word within, got {:?}", out.location)
+    };
+    assert_eq!(word, "board");
+    assert_eq!(to_right.text, ", with t");
+    assert!(to_right.cut);
+}
+
+/// And found again: the annotation is drawn on the word it was made about, not
+/// on the heading and not on the heading's last word.
+#[test]
+fn a_word_in_a_heading_is_read_back_out_of_it() {
+    use crate::render_map::NodeKind;
+    let text = "= The board, with this row added<anno.7F1A>\n";
+    let (source, mut map) = fixture(text);
+    // The heading's text run, which the label follows.
+    run_node(&mut map, "n1", NodeKind::Text, 2, 30);
+    map.nodes.get_mut("n1").unwrap().kind = NodeKind::Text;
+    let ctx = crate::resolve::Context {
+        map: &map,
+        files: &[crate::resolve::FileText { source: &source, was: text }],
+        seed: 1,
+    };
+    let stored: TypstLocation = Location::Word {
+        reference: TypstWordRef::Within {
+            label: "anno.7F1A".into(),
+            word: "board".into(),
+            to_left: crate::location::Nearby::to_left("= The "),
+            to_right: crate::location::Nearby::to_right(", with this row added"),
+        },
+    };
+    let shown = crate::resolve::project(&ctx, &stored).expect("projects");
+    let Location::Word { reference } = shown else {
+        panic!("wrong variant")
+    };
+    assert_eq!(reference.node, "n1");
+    assert_eq!(reference.w.as_deref(), Some("board"));
+    // Characters 4..9 of the run, which is where "board" is.
+    assert_eq!((reference.beg, reference.end), (4, 9));
+}
+
+/// A word outside a heading is still a word: coarsening is not the rule, it is
+/// what happens when a label cannot go where it was asked for.
+#[test]
+fn a_word_in_a_paragraph_stays_a_word() {
+    use crate::render_map::NodeKind;
+    let text = "The board, with this row added.\n";
+    let (source, mut map) = fixture(text);
+    run_node(&mut map, "n1", NodeKind::Text, 0, text.len() - 1);
+    let ctx = crate::resolve::Context {
+        map: &map,
+        files: &[crate::resolve::FileText { source: &source, was: text }],
+        seed: 11,
+    };
+    let out = crate::resolve::resolve(
+        &ctx,
+        &Location::Word {
+            reference: HtmlWordRef {
+                node: "n1".into(),
+                beg: 4,
+                end: 9,
+                w: Some("board".into()),
+            },
+        },
+    )
+    .expect("resolves");
+    assert!(!out.coarsened);
+    assert!(matches!(out.location, Location::Word { .. }));
 }

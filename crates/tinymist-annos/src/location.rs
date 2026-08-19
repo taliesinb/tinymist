@@ -159,29 +159,137 @@ pub struct TypstNodeCursorRef {
     pub side: VSide,
 }
 
-/// A labelled word.
+/// A word in the document.
+///
+/// Usually the word a label is written after. Where a label may not be
+/// written — inside a heading, inside a call's arguments — the label marks the
+/// whole of the enclosing thing instead, and the word is named by what it says
+/// and by the text around it, to be found again by reading.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename = "word")]
-pub struct TypstWordRef {
-    /// The label, without its angle brackets.
-    #[serde(rename = "ref")]
-    pub label: String,
+#[serde(tag = "type")]
+pub enum TypstWordRef {
+    /// The word a label is written after.
+    #[serde(rename = "word")]
+    After {
+        /// The label, without its angle brackets.
+        #[serde(rename = "ref")]
+        label: String,
+    },
+    /// A word inside the thing a label marks.
+    #[serde(rename = "word_in")]
+    Within {
+        /// The label of the thing the word is inside.
+        #[serde(rename = "ref")]
+        label: String,
+        /// The word itself.
+        word: String,
+        /// What the thing says between its start and the word.
+        to_left: Nearby,
+        /// What it says between the word and its end.
+        to_right: Nearby,
+    },
 }
 
-/// A position beside a labelled thing.
+/// A position in the document.
 ///
 /// A label cannot stand between two characters — it attaches to the thing
 /// before it — so a position in the source is a label and the side of it the
 /// position lies on. This is where the browser's exactness is spent: an
-/// arbitrary point becomes a point beside something.
+/// arbitrary point becomes a point beside something. Where a label may not be
+/// written at the position at all, the label marks the enclosing thing and the
+/// position is named by the text either side of it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename = "text_cursor")]
-pub struct TypstTextCursorRef {
-    /// The label, without its angle brackets.
-    #[serde(rename = "ref")]
-    pub label: String,
-    /// Which side of it.
-    pub side: HSide,
+#[serde(tag = "type")]
+pub enum TypstTextCursorRef {
+    /// A position on one side of a label.
+    #[serde(rename = "text_cursor")]
+    Beside {
+        /// The label, without its angle brackets.
+        #[serde(rename = "ref")]
+        label: String,
+        /// Which side of it.
+        side: HSide,
+    },
+    /// A position inside the thing a label marks.
+    #[serde(rename = "text_cursor_in")]
+    Within {
+        /// The label of the thing the position is inside.
+        #[serde(rename = "ref")]
+        label: String,
+        /// What the thing says before the position.
+        to_left: Nearby,
+        /// What it says after it.
+        to_right: Nearby,
+    },
+}
+
+/// Text kept to say where in something a place is: what is written on one side
+/// of it, from that side's end.
+///
+/// Truncated at [`CONTEXT_CHARS`] when the thing is longer than that, and
+/// marked as truncated so that a reader looking for the place knows the text is
+/// a run rather than the whole of that side.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Nearby {
+    /// The text, nearest the place last for `to_left` and first for
+    /// `to_right`.
+    pub text: String,
+    /// Whether more was left out.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cut: bool,
+}
+
+impl Nearby {
+    /// The text on one side of a place, from the place outwards, keeping at
+    /// most [`CONTEXT_CHARS`] of it.
+    pub fn to_left(text: &str) -> Self {
+        let kept: String = text.chars().rev().take(CONTEXT_CHARS).collect();
+        Self {
+            text: kept.chars().rev().collect(),
+            cut: text.chars().count() > CONTEXT_CHARS,
+        }
+    }
+
+    /// The same, on the other side.
+    pub fn to_right(text: &str) -> Self {
+        Self {
+            text: text.chars().take(CONTEXT_CHARS).collect(),
+            cut: text.chars().count() > CONTEXT_CHARS,
+        }
+    }
+}
+
+impl TypstWordRef {
+    /// A word a label is written after.
+    pub fn after(label: impl Into<String>) -> Self {
+        Self::After {
+            label: label.into(),
+        }
+    }
+
+    /// The label, whichever way the word is named.
+    pub fn label(&self) -> &str {
+        match self {
+            Self::After { label } | Self::Within { label, .. } => label,
+        }
+    }
+}
+
+impl TypstTextCursorRef {
+    /// A position beside a label.
+    pub fn beside(label: impl Into<String>, side: HSide) -> Self {
+        Self::Beside {
+            label: label.into(),
+            side,
+        }
+    }
+
+    /// The label, whichever way the position is named.
+    pub fn label(&self) -> &str {
+        match self {
+            Self::Beside { label, .. } | Self::Within { label, .. } => label,
+        }
+    }
 }
 
 /// What an annotation is about.
@@ -388,10 +496,10 @@ impl TypstLocation {
         match self {
             Self::Word { reference }
             | Self::Line { reference }
-            | Self::Sentence { reference } => vec![reference.label.as_str()],
-            Self::PosH { reference } => vec![reference.label.as_str()],
+            | Self::Sentence { reference } => vec![reference.label()],
+            Self::PosH { reference } => vec![reference.label()],
             Self::PosV { reference } => vec![reference.label.as_str()],
-            Self::SpanH { begin, end } => vec![begin.label.as_str(), end.label.as_str()],
+            Self::SpanH { begin, end } => vec![begin.label(), end.label()],
             Self::SpanV { begin, end } => vec![begin.label.as_str(), end.label.as_str()],
             Self::Raw { reference }
             | Self::Para { reference }

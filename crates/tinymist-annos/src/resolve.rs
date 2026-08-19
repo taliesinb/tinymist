@@ -20,7 +20,7 @@ use typst_syntax::Source;
 
 use crate::anchor::{self, Edit, Refusal};
 use crate::location::{
-    HSide, HtmlLocation, Location, TypstLocation, TypstNodeCursorRef, TypstNodeRef,
+    HSide, HtmlLocation, Location, Nearby, TypstLocation, TypstNodeCursorRef, TypstNodeRef,
     TypstTextCursorRef, TypstWordRef,
 };
 use crate::migrate::{Rebase, Shift};
@@ -152,8 +152,16 @@ struct Anchored {
     /// so an anchor for a position inside a word goes after that word.
     at: usize,
     /// Set when the anchor could not go where it was asked for and marks an
-    /// enclosing expression instead.
-    coarsened: bool,
+    /// enclosing thing instead: the source range of that thing. A place inside
+    /// it is then named by what the thing says around that place.
+    marks: Option<std::ops::Range<usize>>,
+}
+
+impl Anchored {
+    /// Whether the anchor marks more than what was asked about.
+    fn coarsened(&self) -> bool {
+        self.marks.is_some()
+    }
 }
 
 fn anchor_at(
@@ -164,9 +172,9 @@ fn anchor_at(
 ) -> Result<Anchored, Failure> {
     let held = ctx.file(file)?;
     // Snap to a position where a label is valid.
-    let (at, coarsened) = match anchor::place(held.source, offset) {
-        Ok(at) => (at, false),
-        Err(Refusal::Coarsen(range)) => (range.end, true),
+    let (at, marks) = match anchor::place(held.source, offset) {
+        Ok(at) => (at, None),
+        Err(Refusal::Coarsen(range)) => (range.end, Some(range)),
         Err(Refusal::NotMarkup) => return Err(Failure::Unwritable),
     };
 
@@ -177,7 +185,7 @@ fn anchor_at(
         return Ok(Anchored {
             label: anchor.name(),
             at: anchor.at(),
-            coarsened,
+            marks,
         });
     }
     // An anchor written earlier in this same conversion, for a span whose ends
@@ -198,7 +206,7 @@ fn anchor_at(
         return Ok(Anchored {
             label,
             at: edit.at,
-            coarsened,
+            marks,
         });
     }
 
@@ -211,7 +219,7 @@ fn anchor_at(
     Ok(Anchored {
         label: crate::anchor_label(&id),
         at,
-        coarsened,
+        marks,
     })
 }
 
@@ -236,12 +244,26 @@ pub fn resolve(ctx: &Context, location: &HtmlLocation) -> Result<Resolution, Fai
     let mut edits = Vec::new();
     let mut coarsened = false;
 
-    // A word or a horizontal position resolves to an anchor at an offset.
-    let mut text_anchor = |uid: &str, char_at: usize| -> Result<String, Failure> {
+    // A word resolves to an anchor written after it. Where a label may not go
+    // there — inside a heading, inside a call's arguments — the anchor marks
+    // the enclosing thing, and the word is named by what it says and by the
+    // text either side of it within that thing, so that it can be found again
+    // by reading.
+    let mut word_anchor = |uid: &str, char_at: usize| -> Result<TypstWordRef, Failure> {
         let (file, offset) = ctx.offset_of_char(uid, char_at)?;
         let anchored = anchor_at(ctx, file, offset, &mut edits)?;
-        coarsened |= anchored.coarsened;
-        Ok(anchored.label)
+        coarsened |= anchored.coarsened();
+        let Some(within) = anchored.marks.clone() else {
+            return Ok(TypstWordRef::after(anchored.label));
+        };
+        let text = ctx.file(file)?.source.text();
+        let start = anchor::word_start(text, offset).max(within.start);
+        Ok(TypstWordRef::Within {
+            label: anchored.label,
+            word: text[start..offset].to_owned(),
+            to_left: Nearby::to_left(&text[within.start..start]),
+            to_right: Nearby::to_right(&text[offset..within.end]),
+        })
     };
 
     // A label may only be written where a label is valid, so an anchor for a
@@ -253,16 +275,28 @@ pub fn resolve(ctx: &Context, location: &HtmlLocation) -> Result<Resolution, Fai
                          edits: &mut Vec<Edit>,
                          uid: &str,
                          char_at: usize|
-     -> Result<(String, HSide, bool), Failure> {
+     -> Result<(TypstTextCursorRef, bool), Failure> {
         let (file, offset) = ctx.offset_of_char(uid, char_at)?;
         let anchored = anchor_at(ctx, file, offset, edits)?;
         let text = ctx.file(file)?.source.text();
+        // The position is not beside the anchor but somewhere inside what the
+        // anchor marks, so it is named by what is written either side of it.
+        if let Some(within) = anchored.marks.clone() {
+            return Ok((
+                TypstTextCursorRef::Within {
+                    label: anchored.label,
+                    to_left: Nearby::to_left(&text[within.start..offset]),
+                    to_right: Nearby::to_right(&text[offset..within.end]),
+                },
+                true,
+            ));
+        }
         // An anchor behind the position: the position is after the element the
         // label attaches to, which is what a right side says. This is the
         // anchor a label here would collide with, shared rather than written
         // beside.
         if anchored.at <= offset {
-            return Ok((anchored.label, HSide::Right, anchored.coarsened));
+            return Ok((TypstTextCursorRef::beside(anchored.label, HSide::Right), false));
         }
         let jumped = text[offset..anchored.at].chars().any(|ch| !ch.is_whitespace());
         // One word, and only one: a position that was in front of a word is to
@@ -272,50 +306,32 @@ pub fn resolve(ctx: &Context, location: &HtmlLocation) -> Result<Resolution, Fai
         let whole = text[offset..anchored.at].split_whitespace().count() == 1
             && anchor::word_start(text, anchored.at) >= offset;
         let side = if jumped && whole { HSide::Left } else { HSide::Right };
-        Ok((anchored.label, side, anchored.coarsened))
+        Ok((TypstTextCursorRef::beside(anchored.label, side), false))
     };
 
     let location = match location {
-        Location::Word { reference } => {
-            // The label goes after the word, so the word is what it attaches to.
-            let label = text_anchor(&reference.node, reference.end)?;
-            Location::Word {
-                reference: TypstWordRef { label },
-            }
-        }
+        Location::Word { reference } => Location::Word {
+            reference: word_anchor(&reference.node, reference.end)?,
+        },
         Location::Line { reference } => Location::Line {
-            reference: TypstWordRef {
-                label: text_anchor(&reference.node, reference.end)?,
-            },
+            reference: word_anchor(&reference.node, reference.end)?,
         },
         Location::Sentence { reference } => Location::Sentence {
-            reference: TypstWordRef {
-                label: text_anchor(&reference.node, reference.end)?,
-            },
+            reference: word_anchor(&reference.node, reference.end)?,
         },
         Location::PosH { reference } => {
-            let (label, side, moved) =
+            let (cursor, moved) =
                 cursor_anchor(ctx, &mut edits, &reference.node, reference.pos)?;
             coarsened |= moved;
-            Location::PosH {
-                reference: TypstTextCursorRef { label, side },
-            }
+            Location::PosH { reference: cursor }
         }
         Location::SpanH { begin, end } => {
-            let (from, from_side, from_moved) =
-                cursor_anchor(ctx, &mut edits, &begin.node, begin.pos)?;
-            let (to, to_side, to_moved) =
-                cursor_anchor(ctx, &mut edits, &end.node, end.pos)?;
+            let (from, from_moved) = cursor_anchor(ctx, &mut edits, &begin.node, begin.pos)?;
+            let (to, to_moved) = cursor_anchor(ctx, &mut edits, &end.node, end.pos)?;
             coarsened |= from_moved || to_moved;
             Location::SpanH {
-                begin: TypstTextCursorRef {
-                    label: from,
-                    side: from_side,
-                },
-                end: TypstTextCursorRef {
-                    label: to,
-                    side: to_side,
-                },
+                begin: from,
+                end: to,
             }
         }
         // About the document rather than anywhere in it: no anchor to write,
@@ -327,7 +343,7 @@ pub fn resolve(ctx: &Context, location: &HtmlLocation) -> Result<Resolution, Fai
             }
             let (file, offset) = ctx.offset_after_node(&reference.node)?;
             let anchored = anchor_at(ctx, file, offset, &mut edits)?;
-            coarsened |= anchored.coarsened;
+            coarsened |= anchored.coarsened();
             Location::PosV {
                 reference: TypstNodeCursorRef {
                     label: anchored.label,
@@ -345,7 +361,7 @@ pub fn resolve(ctx: &Context, location: &HtmlLocation) -> Result<Resolution, Fai
             let (to_file, to) = ctx.offset_after_node(&end.node)?;
             let from = anchor_at(ctx, from_file, from, &mut edits)?;
             let to = anchor_at(ctx, to_file, to, &mut edits)?;
-            coarsened |= from.coarsened || to.coarsened;
+            coarsened |= from.coarsened() || to.coarsened();
             Location::SpanV {
                 begin: TypstNodeCursorRef {
                     label: from.label,
@@ -390,7 +406,7 @@ pub fn resolve(ctx: &Context, location: &HtmlLocation) -> Result<Resolution, Fai
             };
             let (file, offset) = ctx.offset_after_node(uid)?;
             let anchored = anchor_at(ctx, file, offset, &mut edits)?;
-            coarsened |= anchored.coarsened;
+            coarsened |= anchored.coarsened();
             rebuild(TypstNodeRef {
                 label: anchored.label,
             })
@@ -402,6 +418,65 @@ pub fn resolve(ctx: &Context, location: &HtmlLocation) -> Result<Resolution, Fai
         edits,
         coarsened,
     })
+}
+
+/// Where in a text a place named by its surroundings is.
+///
+/// `word` is what is written at the place, empty for a position between two
+/// characters. `to_left` and `to_right` are what was written either side of it
+/// when the annotation was made, nearest the place first for the right and last
+/// for the left.
+///
+/// The text has usually changed since. So every candidate is scored by how far
+/// its surroundings agree with what was recorded — character by character
+/// outwards from the place — and the best-agreeing one is taken. A candidate
+/// that agrees on nothing at all still counts when nothing else does: the word
+/// is there, and one occurrence of it is better than none. Ties go to the
+/// earliest, which is where the place was when the two were written.
+fn read_for(
+    text: &str,
+    word: &str,
+    to_left: &Nearby,
+    to_right: &Nearby,
+) -> Option<std::ops::Range<usize>> {
+    let agrees = |left: &str, right: &str| {
+        // Outwards from the place: what is nearest it is what identifies it.
+        let back = left
+            .chars()
+            .rev()
+            .zip(to_left.text.chars().rev())
+            .take_while(|(a, b)| a == b)
+            .count();
+        let forth = right
+            .chars()
+            .zip(to_right.text.chars())
+            .take_while(|(a, b)| a == b)
+            .count();
+        back + forth
+    };
+    let mut best: Option<(usize, std::ops::Range<usize>)> = None;
+    let mut consider = |at: usize, end: usize| {
+        let score = agrees(&text[..at], &text[end..]);
+        if best.as_ref().is_none_or(|(had, _)| score > *had) {
+            best = Some((score, at..end));
+        }
+    };
+    if word.is_empty() {
+        // Every position between two characters, and both ends.
+        for at in 0..=text.len() {
+            if text.is_char_boundary(at) {
+                consider(at, at);
+            }
+        }
+    } else {
+        let mut from = 0;
+        while let Some(rel) = text[from..].find(word) {
+            let at = from + rel;
+            consider(at, at + word.len());
+            from = at + word.chars().next().map_or(1, char::len_utf8);
+        }
+    }
+    best.map(|(_, range)| range)
 }
 
 /// Converts a location in the document into one against a rendering.
@@ -422,26 +497,93 @@ pub fn project(ctx: &Context, location: &TypstLocation) -> Result<HtmlLocation, 
         NodeKind::Svg,
         NodeKind::Image,
     ];
-    let word_ref = |label: &str| -> Result<crate::location::HtmlWordRef, Failure> {
-        let (uid, at) = ctx.rendered_word(label)?;
-        // The label follows the word, so the word ends where the label begins.
-        let (beg, w) = ctx.word_before(uid, at);
+    let word_ref = |reference: &TypstWordRef| -> Result<crate::location::HtmlWordRef, Failure> {
+        let (label, word, to_left, to_right) = match reference {
+            TypstWordRef::After { label } => {
+                let (uid, at) = ctx.rendered_word(label)?;
+                // The label follows the word, so the word ends where the label
+                // begins.
+                let (beg, w) = ctx.word_before(uid, at);
+                return Ok(crate::location::HtmlWordRef {
+                    node: uid.to_owned(),
+                    beg,
+                    end: at - (at - beg - w.as_ref().map_or(0, |word| word.chars().count())),
+                    w,
+                });
+            }
+            TypstWordRef::Within {
+                label,
+                word,
+                to_left,
+                to_right,
+            } => (label, word, to_left, to_right),
+        };
+        // The word is somewhere inside what the label marks, and is found by
+        // reading: the occurrence of it whose surroundings match what was
+        // recorded.
+        let (file, within) = ctx.marked_range(label)?;
+        let held = ctx.at_index(file as crate::render_map::FileIndex)?;
+        let text = held.source.text();
+        let found = read_for(&text[within.clone()], word, to_left, to_right)
+            .ok_or_else(|| Failure::NoSource(label.to_owned()))?;
+        let (start, end) = (within.start + found.start, within.start + found.end);
+        let (uid, beg) = ctx
+            .map
+            .text_at(file as crate::render_map::FileIndex, start)
+            .ok_or_else(|| Failure::NoSource(label.to_owned()))?;
+        let (again, at) = ctx
+            .map
+            .text_at(file as crate::render_map::FileIndex, end)
+            .ok_or_else(|| Failure::NoSource(label.to_owned()))?;
+        // A word split across two runs is a word the rendering does not have.
+        if again != uid {
+            return Err(Failure::NoSource(label.to_owned()));
+        }
         Ok(crate::location::HtmlWordRef {
             node: uid.to_owned(),
             beg,
-            end: at - (at - beg - w.as_ref().map_or(0, |word| word.chars().count())),
-            w,
+            end: at,
+            w: Some(text[start..end].to_owned()),
         })
     };
     let cursor_ref = |cursor: &TypstTextCursorRef| -> Result<crate::location::HtmlTextCursorRef, Failure> {
-        let (uid, at) = ctx.rendered_position(&cursor.label)?;
-        // A position to the label's left is in front of the word the label
-        // attaches to, which is where it was asked for before the label was
-        // moved to somewhere a label may be written.
-        let pos = match cursor.side {
-            HSide::Right => at,
-            HSide::Left => ctx.word_before(uid, at).0,
+        let (label, to_left, to_right) = match cursor {
+            TypstTextCursorRef::Beside { label, side } => {
+                let (uid, at) = ctx.rendered_position(label)?;
+                // A position to the label's left is in front of the word the
+                // label attaches to, which is where it was asked for before the
+                // label was moved to somewhere a label may be written.
+                let pos = match side {
+                    HSide::Right => at,
+                    HSide::Left => ctx.word_before(uid, at).0,
+                };
+                return Ok(crate::location::HtmlTextCursorRef {
+                    node: uid.to_owned(),
+                    pos,
+                    l: None,
+                    r: None,
+                });
+            }
+            TypstTextCursorRef::Within {
+                label,
+                to_left,
+                to_right,
+            } => (label, to_left, to_right),
         };
+        // A position inside what the label marks, found by reading: the place
+        // whose surroundings match what was recorded.
+        let (file, within) = ctx.marked_range(label)?;
+        let held = ctx.at_index(file as crate::render_map::FileIndex)?;
+        let text = held.source.text();
+        let found = read_for(&text[within.clone()], "", to_left, to_right)
+            .ok_or_else(|| Failure::NoSource(label.to_owned()))?;
+        let (uid, pos) = ctx
+            .map
+            .text_at(
+                file as crate::render_map::FileIndex,
+                within.start + found.start,
+            )
+            .ok_or_else(|| Failure::NoSource(label.to_owned()))?;
         Ok(crate::location::HtmlTextCursorRef {
             node: uid.to_owned(),
             pos,
@@ -507,13 +649,13 @@ pub fn project(ctx: &Context, location: &TypstLocation) -> Result<HtmlLocation, 
 
     Ok(match location {
         Location::Word { reference } => Location::Word {
-            reference: word_ref(&reference.label)?,
+            reference: word_ref(reference)?,
         },
         Location::Line { reference } => Location::Line {
-            reference: word_ref(&reference.label)?,
+            reference: word_ref(reference)?,
         },
         Location::Sentence { reference } => Location::Sentence {
-            reference: word_ref(&reference.label)?,
+            reference: word_ref(reference)?,
         },
         Location::PosH { reference } => Location::PosH {
             reference: cursor_ref(reference)?,
@@ -588,6 +730,19 @@ impl Context<'_> {
         self.map
             .text_at(file as crate::render_map::FileIndex, offset)
             .ok_or_else(|| Failure::NoSource(label.to_owned()))
+    }
+
+    /// The file and source range of the thing an anchor marks.
+    ///
+    /// For an anchor that had to be coarsened this is what the label was
+    /// written after: the heading, the call. A place inside it is named by what
+    /// it says around that place, and this is the text that is read.
+    fn marked_range(&self, label: &str) -> Result<(usize, std::ops::Range<usize>), Failure> {
+        let (file, offset) = self.anchor_offset(label)?;
+        let held = self.file(file)?;
+        let range = anchor::marked_range(held.source, offset)
+            .ok_or_else(|| Failure::NoSource(label.to_owned()))?;
+        Ok((file, range))
     }
 
     /// The run holding the word an anchor names.

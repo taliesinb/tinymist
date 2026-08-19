@@ -283,6 +283,26 @@ fn expression_around(text: &str, node: &LinkedNode) -> Range<usize> {
     range
 }
 
+/// The extent of the thing an anchor written at a position marks.
+///
+/// The label sits at the end of it: a heading whose text ends there, or a call
+/// whose expression does. This reads the thing back out, so that a place inside
+/// it — a word in the heading, a position between two of its words — can be
+/// named by what the thing says around that place.
+///
+/// `None` when the label is not at the end of anything that encloses it, which
+/// is the ordinary case of a label written after a word.
+pub fn marked_range(source: &Source, at: usize) -> Option<Range<usize>> {
+    let text = source.text();
+    let root = LinkedNode::new(source.root());
+    let leaf = root.leaf_at(at.saturating_sub(1), typst_syntax::Side::After)?;
+    if let Some(heading) = enclosing_heading(text, &leaf) {
+        return Some(heading);
+    }
+    let expression = expression_around(text, &leaf);
+    (expression.end <= at && expression.start < expression.end).then_some(expression)
+}
+
 /// A change to make to a document.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Edit {
