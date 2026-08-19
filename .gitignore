@@ -17,3 +17,4 @@ editors/lapce/out/
 refs/
 .playwright-mcp/
 .gradle
+upstream-bugs/*
