@@ -40,8 +40,11 @@ pub fn netlify_main(cmd: NetlifyCommands) -> tinymist_std::Result<()> {
                 println!("{}", path.display());
             }
             println!();
+            println!("`netlify/functions` and `netlify/edge-functions` are read from the");
+            println!("repository; `netlify/patch.js` has to be in the published directory.");
+            println!();
             println!("Add the script to every page:");
-            println!("  <script src=\"/_talimist/patch.js\" defer></script>");
+            println!("  <script src=\"/netlify/patch.js\" defer></script>");
             println!("  <meta name=\"tm-page\" content=\"THE PAGE'S CONTENT HASH\">");
             println!();
             println!("Then deploy. The functions answer at:");

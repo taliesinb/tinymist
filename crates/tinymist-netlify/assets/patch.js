@@ -6,8 +6,8 @@
 // the new one and swaps it in. A reader who never annotates and never lands on
 // a rebuilt page pays one cached request for this and nothing else.
 (() => {
-  const MANIFEST = "/_talimist/patchset.json";
-  const PAGE = "/_talimist/page/";
+  const MANIFEST = "/netlify/patchset.json";
+  const PAGE = "/netlify/page/";
   // What this page is, as the site names it, and what version of it this is.
   const said = (name) => {
     const meta = document.querySelector(`meta[name="${name}"]`);

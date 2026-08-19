@@ -62,4 +62,4 @@ export default async (request: Request, _context: Context) => {
   return new Response("GET to read, PUT to write\n", { status: 405 });
 };
 
-export const config = { path: "/_talimist/annotations" };
+export const config = { path: "/netlify/annotations" };

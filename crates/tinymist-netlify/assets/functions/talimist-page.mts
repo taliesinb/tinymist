@@ -24,4 +24,4 @@ export default async (request: Request, _context: Context) => {
   });
 };
 
-export const config = { path: "/_talimist/page/:hash" };
+export const config = { path: "/netlify/page/:hash" };

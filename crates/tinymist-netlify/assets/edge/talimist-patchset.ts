@@ -33,4 +33,4 @@ export default async () => {
   });
 };
 
-export const config = { path: "/_talimist/patchset.json" };
+export const config = { path: "/netlify/patchset.json" };

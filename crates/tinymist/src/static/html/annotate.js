@@ -1132,18 +1132,14 @@
             // Faint while it is waiting to be sent, solid once the server has
             // it: the same thing said quietly and then said.
             const waiting = dotted ? ` opacity="${DRAFT_INK}"` : "";
-            // A cross, which is what a hand makes when it means "here": a dot
-            // is easily read as part of the picture, and two strokes are not.
+            // A ring around the place, which is where the server draws one
+            // too: a dot or a cross sits on the thing the reader meant, and a
+            // ring goes round it.
             if (one.type === "point") {
               const spot = paint.at(one.x, one.y);
-              const reach = width;
-              const cross =
-                `M${round(spot.x - reach)} ${round(spot.y - reach)} ` +
-                `L${round(spot.x + reach)} ${round(spot.y + reach)} ` +
-                `M${round(spot.x - reach)} ${round(spot.y + reach)} ` +
-                `L${round(spot.x + reach)} ${round(spot.y - reach)}`;
-              return `<path d="${cross}" fill="none" stroke="${color}" ` +
-                `stroke-width="${round(width * 0.55)}" stroke-linecap="round"${waiting}/>`;
+              return `<circle cx="${round(spot.x)}" cy="${round(spot.y)}" r="${round(width)}" ` +
+                `fill="none" stroke="${color}" ` +
+                `stroke-width="${round(Math.max(width * 0.55 - 1.5, 1))}"${waiting}/>`;
             }
             const points = coordsOf(one.coords).map(([x, y]) => paint.at(x, y));
             if (points.length < 2) return "";

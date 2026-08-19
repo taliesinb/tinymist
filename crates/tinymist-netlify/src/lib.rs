@@ -35,14 +35,16 @@ use serde::{Deserialize, Serialize};
 /// The blob store everything below lives in.
 pub const STORE: &str = "talimist";
 
-/// Where a page asks what has changed since the deploy.
-pub const MANIFEST_ROUTE: &str = "/_talimist/patchset.json";
+/// Where a page asks what has changed since the deploy. Under `/netlify/`,
+/// since none of this is a fact about the document: it is what serving one
+/// from a place that deploys whole sites costs.
+pub const MANIFEST_ROUTE: &str = "/netlify/patchset.json";
 
 /// Where a page asks for one of those changed pages, by its hash.
-pub const PAGE_ROUTE: &str = "/_talimist/page";
+pub const PAGE_ROUTE: &str = "/netlify/page";
 
 /// Where a page reads and writes its annotations.
-pub const ANNOS_ROUTE: &str = "/_talimist/annotations";
+pub const ANNOS_ROUTE: &str = "/netlify/annotations";
 
 /// What has changed since the site was last deployed.
 ///
@@ -157,13 +159,20 @@ pub fn assets() -> Vec<Asset> {
             text: include_str!("../assets/functions/talimist-annotations.mts"),
         },
         Asset {
-            path: "_talimist/patch.js",
+            path: "netlify/patch.js",
             text: include_str!("../assets/patch.js"),
         },
     ]
 }
 
 /// Writes those files into a site.
+///
+/// The two directories mean different things to Netlify, and both are named
+/// `netlify`: `netlify/functions` and `netlify/edge-functions` are read at
+/// deploy time from the repository and never served, while `netlify/patch.js`
+/// is an ordinary file that has to end up in whatever directory the site
+/// publishes. Give this the repository's root when they are the same place,
+/// and run it twice when they are not.
 ///
 /// Returns what was written. Overwrites: these files are this crate's to say
 /// what is in, and a site that has edited them will lose the edit, which is
