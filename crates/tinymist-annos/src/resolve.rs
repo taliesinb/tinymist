@@ -170,18 +170,26 @@ fn anchor_at(
         Err(Refusal::NotMarkup) => return Err(Failure::Unwritable),
     };
 
-    // An anchor already at this position is shared rather than duplicated: a
-    // Typst element carries at most one label.
-    if let Some(anchor) = anchor::at_position(held.source, at) {
+    // An anchor a label here would collide with is shared rather than
+    // duplicated: a Typst element carries at most one label, and whitespace
+    // does not separate a label from the one beside it.
+    if let Some(anchor) = anchor::colliding(held.source, at) {
         return Ok(Anchored {
             label: anchor.name(),
-            at,
+            at: anchor.at(),
             coarsened,
         });
     }
     // An anchor written earlier in this same conversion, for a span whose ends
-    // resolve to the same place.
-    if let Some(edit) = used.iter().find(|edit| edit.file == file && edit.at == at) {
+    // resolve to the same place or to one only whitespace away from it.
+    let text = held.source.text();
+    let touching = |edit: &&Edit| {
+        edit.file == file && {
+            let (from, to) = (edit.at.min(at), edit.at.max(at));
+            text.get(from..to).is_some_and(|between| between.chars().all(char::is_whitespace))
+        }
+    };
+    if let Some(edit) = used.iter().find(touching) {
         let label = edit
             .text
             .trim_start_matches('<')
@@ -189,7 +197,7 @@ fn anchor_at(
             .to_owned();
         return Ok(Anchored {
             label,
-            at,
+            at: edit.at,
             coarsened,
         });
     }
@@ -249,6 +257,13 @@ pub fn resolve(ctx: &Context, location: &HtmlLocation) -> Result<Resolution, Fai
         let (file, offset) = ctx.offset_of_char(uid, char_at)?;
         let anchored = anchor_at(ctx, file, offset, edits)?;
         let text = ctx.file(file)?.source.text();
+        // An anchor behind the position: the position is after the element the
+        // label attaches to, which is what a right side says. This is the
+        // anchor a label here would collide with, shared rather than written
+        // beside.
+        if anchored.at <= offset {
+            return Ok((anchored.label, HSide::Right, anchored.coarsened));
+        }
         let jumped = text[offset..anchored.at].chars().any(|ch| !ch.is_whitespace());
         // One word, and only one: a position that was in front of a word is to
         // the left of the anchor written after it. An anchor that had to travel

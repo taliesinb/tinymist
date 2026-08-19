@@ -1083,3 +1083,42 @@ fn an_anchor_the_document_no_longer_has_does_not_project() {
     );
     assert_eq!(out, Err(crate::resolve::Failure::NoSuchNode("anno.A1B2".into())));
 }
+
+/// Two labels written next to each other attach to the same element, and Typst
+/// keeps only the last: "only the last label is used, the rest are ignored".
+/// The annotation using the other one then has nothing in the rendering and
+/// shows as an orphan, so a position beside an anchor shares it rather than
+/// writing a second label next to it.
+#[test]
+fn a_position_beside_an_anchor_shares_it() {
+    use crate::render_map::NodeKind;
+    //                       0..23                  23..34      34..
+    let text = "It does not place here.<anno.174F> Scored under it.\n";
+    let (source, mut map) = fixture(text);
+    // The run after the anchor: " Scored under it."
+    run_node(&mut map, "n2", NodeKind::Text, 34, 17);
+    let ctx = crate::resolve::Context {
+        map: &map,
+        files: &[crate::resolve::FileText { source: &source, was: text }],
+        seed: 3,
+    };
+    // The cursor sits before "Scored", which one space separates from the
+    // anchor ending the sentence before it.
+    let out = crate::resolve::resolve(
+        &ctx,
+        &Location::PosH {
+            reference: HtmlTextCursorRef {
+                node: "n2".into(),
+                pos: 1,
+                l: None,
+                r: None,
+            },
+        },
+    )
+    .expect("resolves");
+    assert!(out.edits.is_empty(), "wrote {:?}", out.edits);
+    let Location::PosH { reference } = &out.location else {
+        panic!("wrong variant")
+    };
+    assert_eq!(reference.label, "anno.174F");
+}

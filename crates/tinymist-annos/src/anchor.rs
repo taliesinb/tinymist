@@ -84,14 +84,25 @@ pub fn find(source: &Source, id: &str) -> Option<Anchor> {
     anchors_in(source).into_iter().find(|anchor| anchor.id == id)
 }
 
-/// An anchor already at a position, if there is one.
+/// The anchor a label written at a position would collide with.
 ///
-/// Two annotations about the same word share an anchor rather than writing one
-/// each, since a Typst element carries at most one label.
-pub fn at_position(source: &Source, offset: usize) -> Option<Anchor> {
-    anchors_in(source)
-        .into_iter()
-        .find(|anchor| anchor.at() == offset)
+/// A label attaches to the element before it, and whitespace between the two
+/// does not separate them. Two labels written next to each other therefore
+/// attach to the same element, and Typst keeps only the last: "only the last
+/// label is used, the rest are ignored". The annotation using the other one
+/// then has no element in the rendering and shows as an orphan.
+///
+/// So a position that only whitespace separates from an anchor is that
+/// anchor's position, and the annotation shares it. This looks both ways: a
+/// label written before an existing one collides with it just as one written
+/// after does.
+pub fn colliding(source: &Source, offset: usize) -> Option<Anchor> {
+    let text = source.text();
+    let blank = |range: Range<usize>| text[range].chars().all(char::is_whitespace);
+    anchors_in(source).into_iter().find(|anchor| {
+        (anchor.label.end <= offset && blank(anchor.label.end..offset))
+            || (offset <= anchor.label.start && blank(offset..anchor.label.start))
+    })
 }
 
 /// Why a position cannot take an anchor.
@@ -331,4 +342,39 @@ pub fn fresh_id(source: &Source, seed: u64) -> String {
         }
     }
     format!("{:04X}", taken.len() as u16)
+}
+
+#[cfg(test)]
+mod collision_tests {
+    use super::{colliding, Anchor};
+    use typst_syntax::Source;
+
+    fn found(text: &str, offset: usize) -> Option<Anchor> {
+        colliding(&Source::detached(text.to_owned()), offset)
+    }
+
+    #[test]
+    fn a_position_a_space_after_an_anchor_is_that_anchors_position() {
+        let text = "Here.<anno.174F> Scored under it.";
+        assert_eq!(found(text, 17).map(|a| a.id), Some("174F".into()));
+    }
+
+    #[test]
+    fn a_position_just_before_an_anchor_is_too() {
+        let text = "The monoid<anno.A1B2> is here.";
+        assert_eq!(found(text, 10).map(|a| a.id), Some("A1B2".into()));
+    }
+
+    #[test]
+    fn a_position_with_a_word_in_between_is_not() {
+        let text = "The monoid<anno.A1B2> is here.";
+        // After "is", which the anchor does not reach across.
+        assert_eq!(found(text, 24), None);
+    }
+
+    #[test]
+    fn a_line_break_does_not_separate_two_labels_either() {
+        let text = "A paragraph.<anno.C0DE>\nMore of it.";
+        assert_eq!(found(text, 24).map(|a| a.id), Some("C0DE".into()));
+    }
 }
