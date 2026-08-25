@@ -23,6 +23,7 @@ pub mod capture;
 pub mod clients;
 pub mod pins;
 pub mod renders;
+pub mod export;
 pub mod http;
 pub mod sidecar;
 pub mod snippet;

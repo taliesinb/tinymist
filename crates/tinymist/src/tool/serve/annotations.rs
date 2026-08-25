@@ -294,6 +294,11 @@ pub trait AnnotationServer: Send + Sync {
         Err("this server cannot report its status".into())
     }
 
+    /// The file the document is, when the server knows.
+    fn document(&self) -> Option<PathBuf> {
+        None
+    }
+
     /// What the document says about being generated, when it says anything.
     ///
     /// A generated document is rewritten whole whenever whatever generates it
@@ -1379,10 +1384,12 @@ impl crate::tool::serve::AnnotationServer for DiskAnnotationServer {
             .collect())
     }
 
+    fn document(&self) -> Option<PathBuf> {
+        document_path(&self.art().ok()?)
+    }
+
     fn generated(&self) -> Option<String> {
-        let art = self.art().ok()?;
-        let document = document_path(&art)?;
-        generated_note(&std::fs::read_to_string(document).ok()?)
+        generated_note(&std::fs::read_to_string(self.document()?).ok()?)
     }
 
     fn status(&self) -> Result<serde_json::Value, String> {

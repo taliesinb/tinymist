@@ -373,6 +373,41 @@ pub async fn make_http_server(
                             ))))
                             .unwrap());
                     }
+                    // `?fmt=` asks for the document rather than for a page to
+                    // read it in. Answered before the redirect below, so that
+                    // an address without its trailing slash still answers with
+                    // a file rather than sending a command-line client round a
+                    // corner it may not follow.
+                    if let Some(asked) = super::export::query_value(req.uri().query(), "fmt") {
+                        let document = annot.as_ref().and_then(|annot| annot.document());
+                        let made = super::export::Format::parse(&asked).and_then(|format| {
+                            let document = document.ok_or("cannot determine the document path\n")?;
+                            // The rendering the page would have been given, so
+                            // that a standalone file and the page agree.
+                            let rendered = html
+                                .as_ref()
+                                .and_then(|html| html.document().ok());
+                            super::export::export(format, &document, rendered.as_deref())
+                        });
+                        return Ok(match made {
+                            Ok(export) => hyper::Response::builder()
+                                .header(hyper::header::CONTENT_TYPE, export.mime)
+                                .header(hyper::header::CACHE_CONTROL, "no-store")
+                                // Named, not offered as a download: a browser
+                                // shows it and a save gives it this name.
+                                .header(
+                                    hyper::header::CONTENT_DISPOSITION,
+                                    format!("inline; filename=\"{}\"", export.filename),
+                                )
+                                .body(Body::new(Full::<Bytes>::from(export.bytes)))
+                                .unwrap(),
+                            Err(said) => hyper::Response::builder()
+                                .status(hyper::StatusCode::BAD_REQUEST)
+                                .header(hyper::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+                                .body(Body::new(Full::<Bytes>::from(said)))
+                                .unwrap(),
+                        });
+                    }
                     // Every endpoint a page uses sits under the page's own URL,
                     // which is only a base to resolve them against if it ends
                     // in a slash.
@@ -1200,7 +1235,7 @@ fn mime_of(path: &std::path::Path) -> &'static str {
 /// `plus_is_space` is the difference between the two places this is used: in a
 /// query a `+` stands for a space, and in a path it is a plus, which is a
 /// character a file name may have.
-fn unescape(value: &str, plus_is_space: bool) -> String {
+pub(super) fn unescape(value: &str, plus_is_space: bool) -> String {
     let bytes = value.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut at = 0;
