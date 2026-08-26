@@ -261,6 +261,13 @@ cmark-writer = { path = "crates/cmark-writer", version = "0.9.0", features = [
 ] }
 cmark-writer-macros = { path = "crates/cmark-writer-macros", version = "0.9.0" }
 
+[profile.dev]
+# Enough debug information to name the frames in a backtrace, and not the rest
+# of it. A full debug build of this workspace writes hundreds of megabytes per
+# test binary, cargo never collects the old ones, and the line tables are the
+# part anybody reads.
+debug = "line-tables-only"
+
 [profile.dev.package.insta]
 opt-level = 3
 
