@@ -21,6 +21,7 @@
 
 pub mod anchor;
 pub mod audit;
+pub mod fingerprint;
 pub mod location;
 pub mod migrate;
 pub mod record;
@@ -32,6 +33,7 @@ pub mod sidecar;
 
 pub use anchor::{anchors_in, anchors_in_text, Anchor, Edit, Refusal};
 pub use audit::{audit, dangling, Audit};
+pub use fingerprint::{Fields, Found, Name};
 pub use location::{
     HSide, Html, HtmlLocation, HtmlNodeCursorRef, HtmlNodeRef, HtmlTextCursorRef, HtmlWordRef,
     Location, Typst, TypstLocation, TypstNodeCursorRef, TypstNodeRef, TypstTextCursorRef,
